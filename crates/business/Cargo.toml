@@ -1,0 +1,33 @@
+[package]
+name = "wealthfolio-business"
+version.workspace = true
+edition.workspace = true
+description = "Unified business use cases shared by GUI, REST, CLI and MCP"
+license = "AGPL-3.0"
+
+[dependencies]
+tokio = { workspace = true }
+diesel = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+rust_decimal = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+utoipa = { version = "4", features = ["chrono", "uuid"] }
+
+wealthfolio-core = { path = "../core" }
+wealthfolio-spending = { path = "../spending" }
+wealthfolio-storage-sqlite = { path = "../storage-sqlite" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+diesel = { workspace = true }
+
+[lints]
+workspace = true

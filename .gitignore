@@ -1,0 +1,138 @@
+.DS_Store
+.agents/state/
+.agents/cache/
+.env
+.env.*
+!.env.example
+.local/
+
+# ===== Agent Skills =====
+# 只跟踪仓库自带的 agents-maintenance；其他项目级或本机安装的技能保持忽略。
+.agents/skills/*
+!.agents/skills/agents-maintenance/
+# Imported Wealthfolio build outputs
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+.pnpm-store/
+
+# Build outputs
+dist
+dist-ssr
+apps/frontend/public/__generated__/
+*.local
+build
+out
+
+# Testing
+coverage
+.nyc_output
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.web.example
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# TypeScript
+*.tsbuildinfo
+tsconfig.node.tsbuildinfo
+
+# Cache and temp files
+.cache
+.temp
+.tmp
+.eslintcache
+.stylelintcache
+
+# Database
+./db/*
+apps/db/*
+apps/tauri/db/*
+
+# Rust/Cargo
+target/
+**/*.rs.bk
+# Workspace members share the root Cargo.lock
+apps/server/Cargo.lock
+apps/tauri/Cargo.lock
+crates/core/Cargo.lock
+# addon-sdk is a pnpm workspace member; root pnpm-lock.yaml is authoritative
+packages/addon-sdk/package-lock.json
+
+# Tauri generated
+apps/tauri/gen/schemas/
+apps/tauri/gen/android/.gradle/
+apps/tauri/gen/android/build/
+apps/tauri/gen/android/buildSrc/.gradle/
+apps/tauri/gen/android/buildSrc/.kotlin/
+apps/tauri/gen/android/buildSrc/build/
+apps/tauri/gen/android/app/build/
+apps/tauri/gen/android/tauri.settings.gradle
+apps/tauri/gen/android/app/tauri.build.gradle.kts
+apps/tauri/gen/android/app/tauri.properties
+apps/tauri/gen/android/app/proguard-tauri.pro
+apps/tauri/gen/android/app/src/main/assets/tauri.conf.json
+apps/tauri/gen/android/app/src/main/**/generated/
+apps/tauri/gen/android/app/src/main/jniLibs/**/*.so
+apps/tauri/gen/android/local.properties
+apps/tauri/gen/android/key.properties
+apps/tauri/gen/android/keystore.properties
+apps/tauri/gen/android/.tauri/
+apps/tauri/gen/android/.cxx/
+apps/tauri/gen/android/.externalNativeBuild/
+apps/tauri/gen/android/captures/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Playwright
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+.playwright-report
+.playwright-mcp
+# AI tools
+.codex/
+.kiro/
+.conductor/
+# Anchored: an unanchored `db/` also matches source directories such as
+# crates/storage-sqlite/src/db/.
+/db/
+apps/db/
+apps/tauri/db/
+# Project task records are tracked.
+**/*.local.md
+wealthfolio.db

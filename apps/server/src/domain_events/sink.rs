@@ -1,0 +1,183 @@
+//! Web domain event sink implementation.
+//!
+//! Receives domain events and sends them to a background queue worker
+//! for debounced processing.
+
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
+
+use wealthfolio_core::{
+    assets::AssetServiceTrait,
+    events::{DomainEvent, DomainEventSink},
+};
+
+use super::queue_worker::{event_queue_worker, QueueWorkerDeps};
+use crate::events::EventBus;
+
+/// Domain event sink for the web server runtime.
+///
+/// Sends events to a background worker that debounces and processes them.
+///
+/// # Two-Phase Initialization
+///
+/// Due to circular dependencies (AccountService needs sink, sink needs services
+/// that depend on AccountService), this sink uses a two-phase initialization:
+///
+/// 1. Create the sink with `new()` - this just creates the channel
+/// 2. Call `start_worker()` after all services are created - this spawns the worker
+pub struct WebDomainEventSink {
+    tx: mpsc::UnboundedSender<DomainEvent>,
+    rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<DomainEvent>>>,
+}
+
+impl WebDomainEventSink {
+    /// Creates a new WebDomainEventSink.
+    ///
+    /// The sink is immediately ready to receive events, but they will be
+    /// buffered until `start_worker()` is called.
+    pub fn new() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        Self {
+            tx,
+            rx: std::sync::Mutex::new(Some(rx)),
+        }
+    }
+
+    fn take_receiver(&self) -> anyhow::Result<mpsc::UnboundedReceiver<DomainEvent>> {
+        self.rx
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Domain event receiver state is unavailable"))?
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Domain event worker has already started"))
+    }
+
+    /// Starts the background worker that processes events.
+    ///
+    /// This must be called after all services are created. Events received
+    /// before this call are buffered and will be processed once the worker starts.
+    ///
+    /// Returns an error if the receiver is unavailable or already in use.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_worker(
+        &self,
+        asset_service: Arc<dyn AssetServiceTrait + Send + Sync>,
+
+        event_bus: EventBus,
+
+        health_service: Arc<dyn wealthfolio_core::health::HealthServiceTrait + Send + Sync>,
+        portfolio_coordinator: Arc<wealthfolio_core::portfolio::coordinator::PortfolioCoordinator>,
+        fx_service: Arc<dyn wealthfolio_core::fx::FxServiceTrait + Send + Sync>,
+        spending_settings_service: Arc<wealthfolio_spending::settings::SpendingSettingsService>,
+        categorization_rules_service: Arc<
+            wealthfolio_spending::categorization_rules::CategorizationRulesService,
+        >,
+    ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+        let rx = self.take_receiver()?;
+
+        let deps = Arc::new(QueueWorkerDeps {
+            asset_service,
+
+            event_bus,
+
+            health_service,
+            portfolio_coordinator,
+            fx_service,
+            spending_settings_service,
+            categorization_rules_service,
+        });
+
+        // Spawn the background worker
+        Ok(tokio::spawn(event_queue_worker(rx, deps)))
+    }
+
+    /// Creates a WebDomainEventSink with just the sender.
+    ///
+    /// Use this when you want to manually control the worker lifecycle.
+    /// The caller is responsible for spawning the worker with the receiver.
+    #[cfg(test)]
+    pub fn with_sender(tx: mpsc::UnboundedSender<DomainEvent>) -> Self {
+        Self {
+            tx,
+            rx: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl Default for WebDomainEventSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DomainEventSink for WebDomainEventSink {
+    fn emit(&self, event: DomainEvent) {
+        // Send is non-blocking. If the channel is full or closed, we drop the event.
+        // This is intentional - domain events are best-effort.
+        if let Err(e) = self.tx.send(event) {
+            tracing::warn!("Failed to emit domain event: {}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn receiver_is_taken_once_and_poison_is_reported() {
+        let sink = WebDomainEventSink::new();
+        assert!(sink.take_receiver().is_ok());
+        assert!(sink.take_receiver().is_err());
+        let poisoned = WebDomainEventSink::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.rx.lock().unwrap();
+            panic!("interrupted worker startup");
+        }));
+        assert!(poisoned.take_receiver().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sink_sends_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = WebDomainEventSink::with_sender(tx);
+
+        sink.emit(DomainEvent::AssetsCreated {
+            asset_ids: vec!["AAPL".to_string()],
+        });
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            DomainEvent::AssetsCreated { asset_ids } => {
+                assert_eq!(asset_ids, vec!["AAPL".to_string()]);
+            }
+            _ => panic!("Expected AssetsCreated event"),
+        }
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sink_batch_sends_all_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = WebDomainEventSink::with_sender(tx);
+
+        sink.emit_batch(vec![
+            DomainEvent::AssetsCreated {
+                asset_ids: vec!["AAPL".to_string()],
+            },
+            DomainEvent::AssetsCreated {
+                asset_ids: vec!["MSFT".to_string()],
+            },
+        ]);
+
+        let event1 = rx.try_recv().unwrap();
+        let event2 = rx.try_recv().unwrap();
+
+        assert!(matches!(event1, DomainEvent::AssetsCreated { .. }));
+        assert!(matches!(event2, DomainEvent::AssetsCreated { .. }));
+        assert!(rx.try_recv().is_err());
+    }
+}

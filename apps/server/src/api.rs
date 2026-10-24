@@ -1,0 +1,369 @@
+use std::sync::Arc;
+
+use crate::{
+    auth,
+    config::Config,
+    main_lib::AppState,
+    models::{Account, AccountUpdate, NewAccount},
+};
+use axum::middleware;
+use axum::{
+    body::Body,
+    http::{
+        header::{HeaderName, HeaderValue},
+        Request,
+    },
+    middleware::Next,
+    response::Response,
+    routing::get,
+    Json, Router,
+};
+use tower_http::{
+    cors::{Any, CorsLayer},
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer},
+};
+use tracing::Level;
+use utoipa::OpenApi;
+
+mod accounts;
+mod activities;
+mod agent_access;
+
+mod allocation_targets;
+mod alternative_assets;
+mod assets;
+
+mod custom_providers;
+mod data_exports;
+mod database_backups;
+
+mod exchange_rates;
+
+mod health;
+mod holdings;
+
+mod market_data;
+mod net_worth;
+mod pending;
+mod performance;
+pub(crate) mod portable_backups;
+mod portfolio;
+mod portfolios;
+mod secrets;
+mod settings;
+pub mod shared;
+mod spending;
+
+mod taxonomies;
+
+#[utoipa::path(get, path = "/api/v1/healthz", responses((status = 200, description = "Health")))]
+pub async fn healthz() -> &'static str {
+    "ok"
+}
+
+#[utoipa::path(get, path = "/api/v1/readyz", responses((status = 200, description = "Ready")))]
+pub async fn readyz() -> &'static str {
+    "ok"
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(
+        healthz, readyz,
+        accounts::list_accounts, accounts::create_account, accounts::update_account, accounts::delete_account,
+        pending::list_pending, pending::create_pending, pending::update_pending,
+        pending::confirm_pending, pending::reject_pending,
+        pending::query_ordinary, pending::create_ordinary, pending::update_ordinary,
+    ),
+    components(schemas(
+        Account, NewAccount, AccountUpdate,
+        wealthfolio_business::PendingActivity,
+        wealthfolio_business::PendingActivityStatus,
+        wealthfolio_business::PendingCreate,
+        wealthfolio_business::PendingUpdate,
+        wealthfolio_business::PendingConfirmResult,
+        wealthfolio_business::CreateOrdinaryActivity,
+        wealthfolio_business::UpdateOrdinaryActivity,
+        wealthfolio_business::OrdinaryActivityResult,
+        wealthfolio_business::OrdinaryActivityQuery,
+        wealthfolio_business::OrdinaryActivityPage,
+        wealthfolio_business::OrdinaryActivityRow,
+        pending::ConfirmBody,
+    )),
+    tags((name="wealthfolio"))
+)]
+pub struct ApiDoc;
+
+// Allow the application's inline theme initializer by its exact hash.
+const SERVER_CSP: &str = "default-src 'self'; script-src 'self' 'sha256-OUUXM+aKkYdqwM38Z84FhgHpIYOk/e5Dz9UaAnwYXk8=' blob:; style-src 'self' 'unsafe-inline' blob:; img-src 'self' data: blob: https:; font-src 'self' data: blob:; media-src 'self' data: blob:; connect-src 'self'; frame-src 'none'; child-src 'self' blob: about:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; worker-src 'self' blob:";
+
+pub async fn security_headers(request: Request<Body>, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        HeaderName::from_static("content-security-policy"),
+        HeaderValue::from_static(SERVER_CSP),
+    );
+    if !path.starts_with("/api/") && !path.starts_with("/mcp") {
+        headers.insert(
+            HeaderName::from_static("access-control-allow-origin"),
+            HeaderValue::from_static("*"),
+        );
+    }
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
+}
+
+pub(crate) fn cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
+    if config.cors_allow.iter().any(|o| o == "*") {
+        Ok(CorsLayer::new().allow_origin(Any))
+    } else {
+        let origins = config
+            .cors_allow
+            .iter()
+            .map(|origin| origin.parse::<HeaderValue>())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| anyhow::anyhow!("Invalid header value in WF_CORS_ALLOW_ORIGINS"))?;
+        Ok(CorsLayer::new()
+            .allow_origin(origins)
+            .allow_credentials(true))
+    }
+}
+
+#[allow(deprecated)]
+pub fn app_router(state: Arc<AppState>, config: &Config) -> anyhow::Result<Router> {
+    let profiles = crate::profiles::WebProfiles::new(state.clone(), config)?;
+    app_router_with_profiles(
+        profiles,
+        auth::AuthState {
+            auth: state.auth.clone(),
+            oidc: state.oidc.clone(),
+            listen_scope: auth::listen_scope(config.listen_addr),
+        },
+        config,
+    )
+}
+
+pub async fn app_router_from_config(config: &Config) -> anyhow::Result<Router> {
+    let profiles = crate::profiles::WebProfiles::open(config).await?;
+    let auth = profiles.auth_state();
+    app_router_with_profiles(profiles, auth, config)
+}
+
+fn app_router_with_profiles(
+    profiles: Arc<crate::profiles::WebProfiles>,
+    auth_state: auth::AuthState,
+    config: &Config,
+) -> anyhow::Result<Router> {
+    let cors = cors_layer(config)?;
+
+    let openapi = ApiDoc::openapi();
+
+    // Compose all protected routes from individual modules
+    #[allow(unused_mut)]
+    let mut protected_api = Router::new()
+        .merge(accounts::router())
+        .merge(portfolios::router())
+        .merge(settings::router())
+        .merge(data_exports::router())
+        .merge(database_backups::router())
+        .merge(portfolio::router())
+        .merge(holdings::router())
+        .merge(performance::router())
+        .merge(activities::router())
+        .merge(exchange_rates::router())
+        .merge(market_data::router())
+        .merge(assets::router())
+        .merge(secrets::router())
+        .merge(taxonomies::router())
+        .merge(net_worth::router())
+        .merge(alternative_assets::router())
+        .merge(health::router())
+        .merge(custom_providers::router())
+        .merge(spending::router())
+        .merge(pending::router())
+        .merge(allocation_targets::router())
+        .merge(agent_access::router());
+
+    let protected_api = protected_api.route(
+        "/openapi.json",
+        get({
+            let openapi = openapi.clone();
+            move || async { Json(openapi) }
+        }),
+    );
+
+    let protected_api = protected_api
+        .layer(middleware::from_fn_with_state(
+            profiles.clone(),
+            crate::profiles::admit,
+        ))
+        .merge(crate::profiles::router(profiles.clone()))
+        .layer(middleware::from_fn_with_state(
+            auth_state.auth.clone(),
+            auth::require_backup_session,
+        ));
+
+    let api = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .merge(auth::router(auth_state))
+        .merge(protected_api)
+        .with_state(());
+
+    // Timeout wraps only the /api/v1 subtree: /mcp serves long-lived SSE
+    // streams that a request timeout would sever.
+    let mut router = Router::new()
+        .nest("/api/v1", api)
+        .layer(middleware::from_fn_with_state(
+            profiles.clone(),
+            crate::profiles::instance_logout,
+        ))
+        .with_state(())
+        .layer(middleware::from_fn({
+            let ordinary_timeout = config.request_timeout;
+            move |request: axum::extract::Request, next: middleware::Next| async move {
+                use axum::response::IntoResponse;
+                let timeout = request_timeout(request.uri().path(), ordinary_timeout);
+                tokio::time::timeout(timeout, next.run(request))
+                    .await
+                    .unwrap_or_else(|_| axum::http::StatusCode::REQUEST_TIMEOUT.into_response())
+            }
+        }));
+
+    if config.mcp_enabled {
+        router = router.route(
+            "/mcp",
+            axum::routing::any(crate::profiles::mcp).with_state(profiles),
+        );
+    }
+
+    Ok(router
+        .layer(cors)
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|request: &axum::http::Request<_>| {
+                    tracing::info_span!(
+                        "http_request",
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                    )
+                })
+                .on_request(DefaultOnRequest::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
+        ))
+}
+
+fn request_timeout(path: &str, ordinary: std::time::Duration) -> std::time::Duration {
+    // Accept either the outer URI or Axum's prefix-stripped nested route URI.
+    let path = path.strip_prefix("/api/v1").unwrap_or(path);
+    if path.starts_with("/utilities/database/backups/") && path.ends_with("/export") {
+        std::time::Duration::from_secs(1800)
+    } else {
+        ordinary
+    }
+}
+
+#[cfg(test)]
+mod request_timeout_tests {
+    use super::*;
+    #[test]
+    fn transfer_routes_include_preparation_time_without_changing_ordinary_routes() {
+        let ordinary = std::time::Duration::from_secs(300);
+        let transfer = std::time::Duration::from_secs(900);
+        {
+            let path = "/utilities/database/backups/report.db/export";
+            assert!(request_timeout(path, ordinary) > transfer);
+            assert_eq!(
+                request_timeout(path, ordinary),
+                request_timeout(&format!("/api/v1{path}"), ordinary)
+            );
+        }
+        for path in [
+            "/api/v1/accounts",
+            "/api/v1/activities/search",
+            "/api/v1/holdings/list",
+        ] {
+            assert_eq!(request_timeout(path, ordinary), ordinary);
+        }
+    }
+}
+
+#[cfg(test)]
+mod security_header_tests {
+    use super::*;
+    use axum::{routing::get, Router};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn application_csp_allows_inline_theme_initialization() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use sha2::{Digest, Sha256};
+
+        let html = include_str!("../../frontend/index.html");
+        let app = Router::new()
+            .route("/", get(move || async move { html }))
+            .layer(axum::middleware::from_fn(security_headers));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let csp = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let html = std::str::from_utf8(&body).unwrap();
+        let script = html
+            .split_once("<script>")
+            .expect("theme initialization script")
+            .1
+            .split_once("</script>")
+            .unwrap()
+            .0;
+        let hash = STANDARD.encode(Sha256::digest(script.as_bytes()));
+        let script_src = csp
+            .split(';')
+            .find(|directive| directive.trim_start().starts_with("script-src "))
+            .unwrap();
+        assert!(script_src
+            .split_whitespace()
+            .any(|source| source == format!("'sha256-{hash}'")));
+        assert!(!script_src.contains("'unsafe-inline'"));
+    }
+
+    #[tokio::test]
+    async fn application_response_blocks_frame_navigation() {
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(security_headers));
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("frame-src 'none'"));
+        assert!(csp.contains("style-src 'self' 'unsafe-inline' blob:"));
+        assert!(csp.contains("font-src 'self' data: blob:"));
+        assert!(csp.contains("media-src 'self' data: blob:"));
+    }
+}

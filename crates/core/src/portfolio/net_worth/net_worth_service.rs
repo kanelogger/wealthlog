@@ -1,0 +1,1222 @@
+//! Net worth calculation service implementation.
+
+use async_trait::async_trait;
+use chrono::NaiveDate;
+use log::{debug, warn};
+use rust_decimal::Decimal;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, RwLock};
+
+use super::net_worth_model::{
+    AssetCategory, AssetsSection, BreakdownItem, LiabilitiesSection, NetWorthHistoryPoint,
+    NetWorthResponse, StaleAssetInfo, ValuationInfo,
+};
+use super::net_worth_traits::NetWorthServiceTrait;
+use crate::accounts::{account_types, is_liability_account_type, AccountRepositoryTrait};
+use crate::assets::loan::LoanPayment;
+use crate::assets::{AlternativeAssetRepositoryTrait, Asset, AssetKind, AssetRepositoryTrait};
+use crate::constants::DECIMAL_PRECISION;
+use crate::errors::Result;
+use crate::fx::currency::normalize_amount;
+use crate::fx::FxServiceTrait;
+use crate::portfolio::snapshot::SnapshotServiceTrait;
+use crate::portfolio::valuation::{DailyAccountValuation, ValuationRepositoryTrait};
+use crate::quotes::QuoteServiceTrait;
+use crate::utils::time_utils::parse_user_timezone_or_default;
+
+/// Number of days after which a valuation is considered stale.
+const STALENESS_THRESHOLD_DAYS: i64 = 90;
+
+/// Service for calculating net worth.
+pub struct NetWorthService {
+    base_currency: Arc<RwLock<String>>,
+    account_repository: Arc<dyn AccountRepositoryTrait>,
+    asset_repository: Arc<dyn AssetRepositoryTrait>,
+    snapshot_service: Arc<dyn SnapshotServiceTrait>,
+    quote_service: Arc<dyn QuoteServiceTrait>,
+    valuation_repository: Arc<dyn ValuationRepositoryTrait>,
+    fx_service: Arc<dyn FxServiceTrait>,
+    /// Source of loan payments from accounts; without one, loans count no payments.
+    loan_payments: Option<LoanPaymentSource>,
+}
+
+/// Where loan payments are read, and the settings time zone that dates them.
+struct LoanPaymentSource {
+    repository: Arc<dyn AlternativeAssetRepositoryTrait>,
+    timezone: Arc<RwLock<String>>,
+}
+
+impl NetWorthService {
+    /// Creates a new NetWorthService instance.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        base_currency: Arc<RwLock<String>>,
+        account_repository: Arc<dyn AccountRepositoryTrait>,
+        asset_repository: Arc<dyn AssetRepositoryTrait>,
+        snapshot_service: Arc<dyn SnapshotServiceTrait>,
+        quote_service: Arc<dyn QuoteServiceTrait>,
+        valuation_repository: Arc<dyn ValuationRepositoryTrait>,
+        fx_service: Arc<dyn FxServiceTrait>,
+    ) -> Self {
+        Self {
+            base_currency,
+            account_repository,
+            asset_repository,
+            snapshot_service,
+            quote_service,
+            valuation_repository,
+            fx_service,
+            loan_payments: None,
+        }
+    }
+
+    /// Counts loan payments tagged on account withdrawals, dated in the settings
+    /// time zone, as holdings and the loan page do.
+    pub fn with_loan_payments(
+        mut self,
+        repository: Arc<dyn AlternativeAssetRepositoryTrait>,
+        timezone: Arc<RwLock<String>>,
+    ) -> Self {
+        self.loan_payments = Some(LoanPaymentSource {
+            repository,
+            timezone,
+        });
+        self
+    }
+
+    fn loan_payments(&self, assets: &[&Asset]) -> Result<HashMap<String, Vec<LoanPayment>>> {
+        let Some(source) = &self.loan_payments else {
+            return Ok(HashMap::new());
+        };
+        let loan_ids: Vec<String> = assets
+            .iter()
+            .filter(|asset| asset.kind == AssetKind::Liability)
+            .map(|asset| asset.id.clone())
+            .collect();
+        let timezone = parse_user_timezone_or_default(
+            &source
+                .timezone
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        Ok(source
+            .repository
+            .loan_payments(&loan_ids)?
+            .into_iter()
+            .map(|(loan_id, payments)| {
+                let dated = payments.iter().map(|p| p.dated(timezone)).collect();
+                (loan_id, dated)
+            })
+            .collect())
+    }
+
+    /// Determine the asset category based on account type.
+    fn categorize_by_account_type(account_type: &str) -> AssetCategory {
+        match account_type {
+            account_types::SECURITIES | account_types::CRYPTOCURRENCY => AssetCategory::Investment,
+            account_types::CASH => AssetCategory::Cash,
+            account_types::CREDIT_CARD => AssetCategory::Liability,
+            _ => AssetCategory::Investment,
+        }
+    }
+
+    /// Determine the asset category based on AssetKind.
+    fn categorize_by_asset_kind(kind: &AssetKind) -> AssetCategory {
+        match kind {
+            AssetKind::Investment | AssetKind::PrivateEquity => AssetCategory::Investment,
+            AssetKind::Property => AssetCategory::Property,
+            AssetKind::Vehicle => AssetCategory::Vehicle,
+            AssetKind::Collectible => AssetCategory::Collectible,
+            AssetKind::PreciousMetal => AssetCategory::PreciousMetal,
+            AssetKind::Liability => AssetCategory::Liability,
+            AssetKind::Fx => AssetCategory::Other, // Fx is not holdable
+            AssetKind::Other => AssetCategory::Other,
+        }
+    }
+
+    fn is_expired_option_asset(asset: &Asset, reference_date: NaiveDate) -> bool {
+        if !asset.is_option() {
+            return false;
+        }
+
+        let expiration = asset.option_spec().map(|spec| spec.expiration).or_else(|| {
+            [
+                asset.instrument_symbol.as_deref(),
+                asset.display_code.as_deref(),
+                Some(asset.id.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|symbol| {
+                crate::utils::occ_symbol::parse_occ_symbol(symbol)
+                    .ok()
+                    .map(|parsed| parsed.expiration)
+            })
+        });
+
+        matches!(expiration, Some(exp) if exp < reference_date)
+    }
+
+    /// Get the latest quote for an asset on or before the given date.
+    /// Returns (close_price, quote_currency, valuation_date) if found.
+    fn get_latest_quote_as_of(
+        &self,
+        asset_id: &str,
+        date: NaiveDate,
+    ) -> Option<(Decimal, String, NaiveDate)> {
+        // Get all quotes for this symbol and find the latest one <= date
+        let quotes = self.quote_service.get_historical_quotes(asset_id).ok()?;
+
+        quotes
+            .iter()
+            .filter(|q| q.timestamp.date_naive() <= date)
+            .max_by_key(|q| q.timestamp.date_naive())
+            .map(|q| (q.close, q.currency.clone(), q.timestamp.date_naive()))
+    }
+
+    /// Calculate market value for a position, converting to base currency.
+    fn calculate_market_value(
+        &self,
+        quantity: Decimal,
+        price: Decimal,
+        contract_multiplier: Decimal,
+        asset_currency: &str,
+        base_currency: &str,
+        date: NaiveDate,
+    ) -> Result<Decimal> {
+        let local_value = quantity * price * contract_multiplier;
+
+        if asset_currency == base_currency {
+            return Ok(local_value.round_dp(DECIMAL_PRECISION));
+        }
+
+        // Convert to base currency
+        let converted = self.fx_service.convert_currency_for_date(
+            local_value,
+            asset_currency,
+            base_currency,
+            date,
+        )?;
+
+        Ok(converted.round_dp(DECIMAL_PRECISION))
+    }
+
+    fn convert_cash_balance_to_base(
+        &self,
+        amount: Decimal,
+        currency: &str,
+        base_currency: &str,
+        date: NaiveDate,
+    ) -> Decimal {
+        if currency == base_currency {
+            return amount;
+        }
+
+        match self
+            .fx_service
+            .convert_currency_for_date(amount, currency, base_currency, date)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    "Failed to convert cash {} {} to {}: {}. Using unconverted.",
+                    amount, currency, base_currency, error
+                );
+                amount
+            }
+        }
+    }
+
+    /// Get display name for asset category.
+    fn category_display_name(category: AssetCategory) -> &'static str {
+        match category {
+            AssetCategory::Cash => "Cash",
+            AssetCategory::Investment => "Investments",
+            AssetCategory::Property => "Properties",
+            AssetCategory::Vehicle => "Vehicles",
+            AssetCategory::Collectible => "Collectibles",
+            AssetCategory::PreciousMetal => "Precious Metals",
+            AssetCategory::Liability => "Liabilities",
+            AssetCategory::Other => "Other Assets",
+        }
+    }
+
+    /// Get category key string for serialization.
+    fn category_key(category: AssetCategory) -> &'static str {
+        match category {
+            AssetCategory::Cash => "cash",
+            AssetCategory::Investment => "investments",
+            AssetCategory::Property => "properties",
+            AssetCategory::Vehicle => "vehicles",
+            AssetCategory::Collectible => "collectibles",
+            AssetCategory::PreciousMetal => "preciousMetals",
+            AssetCategory::Liability => "liabilities",
+            AssetCategory::Other => "otherAssets",
+        }
+    }
+
+    /// Build assets section from valuations.
+    fn build_assets_section(valuations: &[ValuationInfo]) -> AssetsSection {
+        // Aggregate by category, collecting individual items for drill-down.
+        let mut category_totals: HashMap<AssetCategory, Decimal> = HashMap::new();
+        let mut category_children: HashMap<AssetCategory, Vec<BreakdownItem>> = HashMap::new();
+
+        for val in valuations {
+            if val.category == AssetCategory::Liability {
+                continue;
+            }
+            *category_totals.entry(val.category).or_insert(Decimal::ZERO) += val.market_value_base;
+
+            // Skip per-item children for investments — they can be hundreds of
+            // holdings, and the dedicated allocation view handles that drill-down.
+            if val.category != AssetCategory::Investment {
+                category_children
+                    .entry(val.category)
+                    .or_default()
+                    .push(BreakdownItem {
+                        category: Self::category_key(val.category).to_string(),
+                        name: val.name.clone().unwrap_or_else(|| val.asset_id.clone()),
+                        value: val.market_value_base,
+                        asset_id: Some(val.asset_id.clone()),
+                        children: Vec::new(),
+                    });
+            }
+        }
+
+        // Build breakdown items - only include categories with non-zero values
+        let mut breakdown: Vec<BreakdownItem> = category_totals
+            .into_iter()
+            .filter(|(_, value)| !value.is_zero())
+            .map(|(category, value)| {
+                let mut children = category_children.remove(&category).unwrap_or_default();
+                children.sort_by_key(|c| std::cmp::Reverse(c.value));
+                BreakdownItem {
+                    category: Self::category_key(category).to_string(),
+                    name: Self::category_display_name(category).to_string(),
+                    value,
+                    asset_id: None,
+                    children,
+                }
+            })
+            .collect();
+
+        // Sort by value descending for better display
+        breakdown.sort_by_key(|b| std::cmp::Reverse(b.value));
+
+        // Calculate total
+        let total = breakdown.iter().map(|item| item.value).sum();
+
+        AssetsSection { total, breakdown }
+    }
+
+    /// Build liabilities section from valuations - includes individual liability items.
+    fn build_liabilities_section(valuations: &[ValuationInfo]) -> LiabilitiesSection {
+        // Get individual liabilities
+        let mut breakdown: Vec<BreakdownItem> = valuations
+            .iter()
+            .filter(|v| v.category == AssetCategory::Liability)
+            .map(|v| BreakdownItem {
+                category: "liability".to_string(),
+                name: v.name.clone().unwrap_or_else(|| v.asset_id.clone()),
+                value: v.market_value_base,
+                asset_id: Some(v.asset_id.clone()),
+                children: Vec::new(),
+            })
+            .collect();
+
+        // Sort by value descending
+        breakdown.sort_by_key(|b| std::cmp::Reverse(b.value));
+
+        // Calculate total
+        let total = breakdown.iter().map(|item| item.value).sum();
+
+        LiabilitiesSection { total, breakdown }
+    }
+
+    /// Calculate staleness info for valuations.
+    /// Cash-like balances and paid-off ($0) liabilities are excluded since they have
+    /// no market data to keep up to date.
+    fn calculate_staleness(
+        valuations: &[ValuationInfo],
+        reference_date: NaiveDate,
+    ) -> (Option<NaiveDate>, Vec<StaleAssetInfo>) {
+        // Exclude cash-like balances (no market data to update) and paid-off
+        // liabilities sitting at $0 (nothing to update). A zero value on a
+        // non-liability asset is more likely a data issue (e.g. a bad quote), so
+        // those are still surfaced as stale to prompt the user to refresh them.
+        let trackable_valuations: Vec<_> = valuations
+            .iter()
+            .filter(|v| {
+                !(v.is_cash_like
+                    || (v.category == AssetCategory::Liability && v.market_value_base.is_zero()))
+            })
+            .collect();
+
+        let oldest_date = trackable_valuations.iter().map(|v| v.valuation_date).min();
+
+        let stale_assets: Vec<StaleAssetInfo> = trackable_valuations
+            .iter()
+            .filter_map(|v| {
+                let days_stale = (reference_date - v.valuation_date).num_days();
+                if days_stale > STALENESS_THRESHOLD_DAYS {
+                    Some(StaleAssetInfo {
+                        asset_id: v.asset_id.clone(),
+                        name: v.name.clone(),
+                        valuation_date: v.valuation_date,
+                        days_stale,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        (oldest_date, stale_assets)
+    }
+
+    fn credit_card_liability_value(valuation: &DailyAccountValuation) -> Decimal {
+        let value = valuation.cash_balance_base.round_dp(DECIMAL_PRECISION);
+        if value < Decimal::ZERO {
+            value.abs()
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    fn credit_card_asset_value(valuation: &DailyAccountValuation) -> Decimal {
+        let value = valuation.cash_balance_base.round_dp(DECIMAL_PRECISION);
+        if value > Decimal::ZERO {
+            value
+        } else {
+            Decimal::ZERO
+        }
+    }
+}
+
+#[async_trait]
+impl NetWorthServiceTrait for NetWorthService {
+    async fn get_net_worth(&self, date: NaiveDate) -> Result<NetWorthResponse> {
+        let base_currency = self
+            .base_currency
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        debug!("Calculating net worth as of {} in {}", date, base_currency);
+
+        // Get all non-archived accounts (includes closed accounts for historical net worth)
+        let accounts = self.account_repository.list(None, Some(false), None)?;
+
+        // Get account IDs
+        let account_ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
+
+        // Latest snapshots for all accounts, read on the target date
+        let snapshots = self
+            .snapshot_service
+            .get_latest_snapshots_as_of(&account_ids, date)?;
+
+        // Build a map of account_id -> account for easy lookup
+        let account_map: HashMap<String, _> = accounts.iter().map(|a| (a.id.clone(), a)).collect();
+
+        // Get all assets for lookup
+        let all_assets = self.asset_repository.list()?;
+        let asset_map: HashMap<String, _> = all_assets.iter().map(|a| (a.id.clone(), a)).collect();
+        let stored_valuations_by_account: HashMap<String, DailyAccountValuation> = self
+            .valuation_repository
+            .get_valuations_on_date(&account_ids, date)?
+            .into_iter()
+            .map(|valuation| (valuation.account_id.clone(), valuation))
+            .collect();
+
+        let mut valuations: Vec<ValuationInfo> = Vec::new();
+
+        // Process each account's snapshot
+        for (account_id, snapshot) in &snapshots {
+            let account = match account_map.get(account_id) {
+                Some(acc) => acc,
+                None => {
+                    warn!("Account {} not found in account map", account_id);
+                    continue;
+                }
+            };
+
+            let account_category = Self::categorize_by_account_type(&account.account_type);
+            let is_liability_account = is_liability_account_type(&account.account_type);
+            let stored_account_valuation = if is_liability_account {
+                None
+            } else {
+                stored_valuations_by_account.get(account_id)
+            };
+
+            if let Some(account_valuation) = stored_account_valuation {
+                if !account_valuation.investment_market_value_base.is_zero() {
+                    valuations.push(ValuationInfo {
+                        asset_id: format!("INVESTMENTS:{}", account.id),
+                        name: Some(account.name.clone()),
+                        market_value_base: account_valuation
+                            .investment_market_value_base
+                            .round_dp(DECIMAL_PRECISION),
+                        valuation_date: account_valuation.valuation_date,
+                        category: AssetCategory::Investment,
+                        is_cash_like: false,
+                    });
+                }
+
+                // Round before the zero check: activity replay leaves residual
+                // balances around 1e-15 that are non-zero but display as $0.
+                let cash_base = account_valuation
+                    .cash_balance_base
+                    .round_dp(DECIMAL_PRECISION);
+                if !cash_base.is_zero() {
+                    valuations.push(ValuationInfo {
+                        asset_id: format!("CASH:{}", account.id),
+                        name: Some(account.name.clone()),
+                        market_value_base: cash_base,
+                        valuation_date: account_valuation.valuation_date,
+                        category: AssetCategory::Cash,
+                        is_cash_like: true,
+                    });
+                }
+            }
+
+            // Process positions (securities, alternative assets)
+            if is_liability_account {
+                if !snapshot.positions.is_empty() {
+                    warn!(
+                        "Ignoring {} position(s) on liability account {} while calculating net worth",
+                        snapshot.positions.len(),
+                        account.id
+                    );
+                }
+            } else if stored_account_valuation.is_none() {
+                for (asset_id, position) in &snapshot.positions {
+                    if position.quantity.is_zero() {
+                        continue;
+                    }
+
+                    // Get asset info to determine category more precisely
+                    let asset = asset_map.get(asset_id).copied();
+                    if let Some(asset) = asset {
+                        if Self::is_expired_option_asset(asset, date) {
+                            debug!(
+                                "Skipping expired option {} while calculating net worth as of {}.",
+                                asset_id, date
+                            );
+                            continue;
+                        }
+                    }
+
+                    let asset_name = asset.and_then(|a| {
+                        a.name
+                            .clone()
+                            .filter(|n| !n.is_empty())
+                            .or_else(|| a.display_code.clone())
+                    });
+
+                    // Determine category: prefer asset kind if available, fallback to account type
+                    let category = if let Some(asset) = asset {
+                        Self::categorize_by_asset_kind(&asset.kind)
+                    } else {
+                        account_category
+                    };
+
+                    // Get the latest quote for this asset as of the date
+                    let (price, quote_currency, valuation_date) = match self
+                        .get_latest_quote_as_of(asset_id, date)
+                    {
+                        Some((p, c, d)) => (p, c, d),
+                        None => {
+                            // No quote found, use cost basis as fallback
+                            if position.quantity > Decimal::ZERO {
+                                let implied_price = position.total_cost_basis / position.quantity;
+                                // Use snapshot date as valuation date; cost basis is in position.currency (major unit)
+                                (
+                                    implied_price,
+                                    position.currency.clone(),
+                                    snapshot.snapshot_date,
+                                )
+                            } else {
+                                warn!(
+                                    "No quote found for {} and cannot derive from cost basis",
+                                    asset_id
+                                );
+                                continue;
+                            }
+                        }
+                    };
+
+                    // Normalize minor-currency quotes (e.g. GBp → GBP, ZAc → ZAR) before valuation.
+                    let (normalized_price, normalized_currency) =
+                        normalize_amount(price, &quote_currency);
+
+                    // Calculate market value in base currency
+                    let market_value_base = match self.calculate_market_value(
+                        position.quantity,
+                        normalized_price,
+                        position.contract_multiplier,
+                        normalized_currency,
+                        &base_currency,
+                        date,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(
+                                "Failed to calculate market value for {}: {}. Using local value.",
+                                asset_id, e
+                            );
+                            position.quantity * price * position.contract_multiplier
+                        }
+                    };
+
+                    valuations.push(ValuationInfo {
+                        asset_id: asset_id.clone(),
+                        name: asset_name,
+                        market_value_base,
+                        valuation_date,
+                        category,
+                        is_cash_like: false,
+                    });
+                }
+            }
+
+            if is_liability_account {
+                // Rounded before the sign checks so residual dust does not emit a
+                // phantom $0 liability (or cash) row for the account.
+                let cash_base_total = snapshot
+                    .cash_balances
+                    .iter()
+                    .fold(Decimal::ZERO, |acc, (currency, &amount)| {
+                        if amount.is_zero() {
+                            acc
+                        } else {
+                            acc + self.convert_cash_balance_to_base(
+                                amount,
+                                currency,
+                                &base_currency,
+                                date,
+                            )
+                        }
+                    })
+                    .round_dp(DECIMAL_PRECISION);
+
+                if cash_base_total < Decimal::ZERO {
+                    valuations.push(ValuationInfo {
+                        asset_id: format!("CREDIT_CARD:{}", account.id),
+                        name: Some(account.name.clone()),
+                        market_value_base: cash_base_total.abs(),
+                        valuation_date: snapshot.snapshot_date,
+                        category: AssetCategory::Liability,
+                        is_cash_like: true,
+                    });
+                } else if cash_base_total > Decimal::ZERO {
+                    valuations.push(ValuationInfo {
+                        asset_id: format!("CASH:{}", account.id),
+                        name: Some(account.name.clone()),
+                        market_value_base: cash_base_total,
+                        valuation_date: snapshot.snapshot_date,
+                        category: AssetCategory::Cash,
+                        is_cash_like: true,
+                    });
+                }
+                continue;
+            }
+
+            // Process cash balances
+            if stored_account_valuation.is_some() {
+                continue;
+            }
+            for (currency, &amount) in &snapshot.cash_balances {
+                if amount.is_zero() {
+                    continue;
+                }
+
+                let cash_base = self
+                    .convert_cash_balance_to_base(amount, currency, &base_currency, date)
+                    .round_dp(DECIMAL_PRECISION);
+
+                // Long-closed accounts keep residual balances around 1e-15 that
+                // are non-zero yet round to nothing; skip them so the Cash
+                // drill-down does not fill up with $0 rows.
+                if cash_base.is_zero() {
+                    continue;
+                }
+
+                // Name by account (with currency suffix) so the Cash drill-down
+                // lists each account distinctly instead of repeating "Cash (USD)".
+                let (asset_id, name, market_value_base, category) = (
+                    format!("CASH:{}:{}", account.id, currency),
+                    Some(format!("{} ({})", account.name, currency)),
+                    cash_base,
+                    AssetCategory::Cash,
+                );
+
+                valuations.push(ValuationInfo {
+                    asset_id,
+                    name,
+                    market_value_base,
+                    valuation_date: snapshot.snapshot_date,
+                    category,
+                    is_cash_like: true,
+                });
+            }
+        }
+
+        // =====================================================================
+        // Process standalone alternative assets (not tied to accounts/snapshots)
+        // These are assets with is_alternative() kind that have direct quotes
+        // =====================================================================
+        let alternative_assets: Vec<_> = all_assets
+            .iter()
+            .filter(|a| a.kind.is_alternative())
+            .collect();
+
+        let mut loan_payments = self.loan_payments(&alternative_assets)?;
+        for asset in alternative_assets {
+            // Skip if this asset was already processed via a snapshot position
+            // (in case there's overlap)
+            if valuations.iter().any(|v| v.asset_id == asset.id) {
+                continue;
+            }
+
+            // Automatic loans can have historical estimates before their first
+            // recorded closing quote. Use the same dated calculation as history.
+            let calculated = if asset.kind == AssetKind::Liability
+                && asset
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m.get(crate::assets::loan::LOAN_PROJECTION_KEY).is_some())
+            {
+                let quotes = self.quote_service.get_historical_quotes(&asset.id)?;
+                crate::assets::loan::loan_value(
+                    asset.metadata.as_ref(),
+                    &quotes,
+                    &loan_payments.remove(&asset.id).unwrap_or_default(),
+                    date,
+                )
+                .map(|value| (value, asset.quote_ccy.clone(), date))
+            } else {
+                None
+            };
+            let Some((price, quote_currency, valuation_date)) =
+                calculated.or_else(|| self.get_latest_quote_as_of(&asset.id, date))
+            else {
+                continue;
+            };
+
+            // For alternative assets, quantity is always 1 (value-based model)
+            let quantity = Decimal::ONE;
+
+            // Normalize minor-currency quotes before valuation.
+            let (normalized_price, normalized_currency) = normalize_amount(price, &quote_currency);
+
+            // Calculate market value in base currency
+            let market_value_base = match self.calculate_market_value(
+                quantity,
+                normalized_price,
+                Decimal::ONE,
+                normalized_currency,
+                &base_currency,
+                date,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        "Failed to convert alternative asset {} value to base currency: {}. Using local value.",
+                        asset.id, e
+                    );
+                    price
+                }
+            };
+
+            let category = Self::categorize_by_asset_kind(&asset.kind);
+
+            valuations.push(ValuationInfo {
+                asset_id: asset.id.clone(),
+                name: asset
+                    .name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| asset.display_code.clone()),
+                market_value_base,
+                valuation_date,
+                category,
+                is_cash_like: false,
+            });
+        }
+
+        // Build assets and liabilities sections
+        let assets = Self::build_assets_section(&valuations);
+        let liabilities = Self::build_liabilities_section(&valuations);
+
+        // Calculate net worth
+        let net_worth = assets.total - liabilities.total;
+
+        // Calculate staleness
+        let (oldest_valuation_date, stale_assets) = Self::calculate_staleness(&valuations, date);
+
+        debug!(
+            "Net worth calculation complete: assets={}, liabilities={}, net_worth={}",
+            assets.total, liabilities.total, net_worth
+        );
+
+        Ok(NetWorthResponse {
+            date,
+            assets,
+            liabilities,
+            net_worth: net_worth.round_dp(DECIMAL_PRECISION),
+            currency: base_currency,
+            oldest_valuation_date,
+            stale_assets,
+        })
+    }
+
+    fn get_net_worth_history(
+        &self,
+        start_date: NaiveDate,
+        end_date: NaiveDate,
+    ) -> Result<Vec<NetWorthHistoryPoint>> {
+        let base_currency = self
+            .base_currency
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+
+        debug!(
+            "Calculating net worth history from {} to {} in {}",
+            start_date, end_date, base_currency
+        );
+
+        // =====================================================================
+        // 1. Load real-account valuations and aggregate base-currency portfolio state
+        // =====================================================================
+        #[derive(Clone)]
+        struct PortfolioState {
+            value: Decimal,
+            net_contribution: Decimal,
+            // Category split for breakdown: cash balances vs investment market value.
+            // Mirrors the point-in-time path (cash -> Cash, positions -> Investments).
+            cash: Decimal,
+            investments: Decimal,
+        }
+
+        let mut portfolio_by_date: BTreeMap<NaiveDate, PortfolioState> = BTreeMap::new();
+        let accounts = self.account_repository.list(None, Some(false), None)?;
+        for account in accounts {
+            // Liability accounts (e.g. credit cards) are tracked separately as
+            // liabilities/cash assets below; excluding them here avoids double-counting.
+            if is_liability_account_type(&account.account_type) {
+                continue;
+            }
+            let valuations = self.valuation_repository.get_historical_valuations(
+                &account.id,
+                Some(start_date),
+                Some(end_date),
+            )?;
+            for val in valuations {
+                let entry = portfolio_by_date
+                    .entry(val.valuation_date)
+                    .or_insert_with(|| PortfolioState {
+                        value: Decimal::ZERO,
+                        net_contribution: Decimal::ZERO,
+                        cash: Decimal::ZERO,
+                        investments: Decimal::ZERO,
+                    });
+                entry.value += val.total_value_base;
+                entry.net_contribution += val.net_contribution_base;
+                entry.cash += val.cash_balance_base;
+                entry.investments += val.investment_market_value_base;
+            }
+        }
+        let first_portfolio_date = portfolio_by_date.keys().next().copied();
+        let history_seed_date = first_portfolio_date.unwrap_or(start_date);
+
+        // =====================================================================
+        // 2. Load alternative assets and organize by type
+        // =====================================================================
+        let all_assets = self.asset_repository.list()?;
+        let alternative_assets: Vec<_> = all_assets
+            .iter()
+            .filter(|a| a.kind.is_alternative())
+            .collect();
+
+        // Separate assets from liabilities
+        let asset_symbols: HashSet<String> = alternative_assets
+            .iter()
+            .filter(|a| a.kind != AssetKind::Liability)
+            .map(|a| a.id.clone())
+            .collect();
+
+        let liability_symbols: HashSet<String> = alternative_assets
+            .iter()
+            .filter(|a| a.kind == AssetKind::Liability)
+            .map(|a| a.id.clone())
+            .collect();
+
+        // Build currency lookup for FX conversion
+        let asset_currency_map: HashMap<String, String> = alternative_assets
+            .iter()
+            .map(|a| (a.id.clone(), a.quote_ccy.clone()))
+            .collect();
+
+        // =====================================================================
+        // 3. Load quotes for alternative assets
+        // =====================================================================
+        let all_alt_symbols: HashSet<String> =
+            alternative_assets.iter().map(|a| a.id.clone()).collect();
+
+        // Get quotes in the date range
+        let quotes_vec = self.quote_service.get_quotes_in_range_filled(
+            &all_alt_symbols,
+            start_date,
+            end_date,
+        )?;
+
+        let mut loan_payments = self.loan_payments(&alternative_assets)?;
+        let mut loan_histories = Vec::new();
+        for asset in &alternative_assets {
+            if asset.kind == AssetKind::Liability
+                && asset
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|m| m.get(crate::assets::loan::LOAN_PROJECTION_KEY).is_some())
+            {
+                let quotes = self.quote_service.get_historical_quotes(&asset.id)?;
+                if let Some(calculation) = crate::assets::loan::calculate_loan(
+                    &crate::assets::loan::LoanCalculationRequest {
+                        metadata: asset.metadata.clone().unwrap_or_default(),
+                        balances: quotes
+                            .iter()
+                            .map(crate::assets::loan::LoanBalance::from)
+                            .collect(),
+                        as_of: end_date,
+                        payments: loan_payments.remove(&asset.id).unwrap_or_default(),
+                    },
+                ) {
+                    loan_histories.push((*asset, calculation));
+                }
+            }
+        }
+
+        // Organize quotes by date -> asset_id -> value (converted to base currency)
+        let mut quotes_by_date: BTreeMap<NaiveDate, HashMap<String, Decimal>> = BTreeMap::new();
+        for quote in &quotes_vec {
+            let date = quote.timestamp.date_naive();
+            let asset_currency = asset_currency_map
+                .get(&quote.asset_id)
+                .cloned()
+                .unwrap_or_else(|| base_currency.clone());
+
+            // Convert to base currency
+            let value_base = if asset_currency == base_currency {
+                quote.close
+            } else {
+                self.fx_service
+                    .convert_currency_for_date(quote.close, &asset_currency, &base_currency, date)
+                    .unwrap_or(quote.close)
+            };
+
+            quotes_by_date
+                .entry(date)
+                .or_default()
+                .insert(quote.asset_id.clone(), value_base);
+        }
+
+        // =====================================================================
+        // 4. Get initial values for forward-fill (quotes before the first emitted point)
+        // =====================================================================
+        let mut initial_asset_values: HashMap<String, Decimal> = HashMap::new();
+
+        for asset in &alternative_assets {
+            if let Some((price, quote_currency, _)) =
+                self.get_latest_quote_as_of(&asset.id, history_seed_date)
+            {
+                let (normalized_price, normalized_currency) =
+                    normalize_amount(price, &quote_currency);
+                let value_base = if normalized_currency == base_currency {
+                    normalized_price
+                } else {
+                    self.fx_service
+                        .convert_currency_for_date(
+                            normalized_price,
+                            normalized_currency,
+                            &base_currency,
+                            history_seed_date,
+                        )
+                        .unwrap_or(normalized_price)
+                };
+                initial_asset_values.insert(asset.id.clone(), value_base);
+            }
+        }
+
+        // =====================================================================
+        // 5. Load credit card liability valuations
+        // =====================================================================
+        let accounts = self.account_repository.list(None, Some(false), None)?;
+        let credit_card_account_ids: Vec<String> = accounts
+            .iter()
+            .filter(|account| is_liability_account_type(&account.account_type))
+            .map(|account| account.id.clone())
+            .collect();
+
+        let mut initial_credit_card_assets: HashMap<String, Decimal> = HashMap::new();
+        let mut initial_credit_card_liabilities: HashMap<String, Decimal> = HashMap::new();
+        let mut credit_card_assets_by_date: BTreeMap<NaiveDate, HashMap<String, Decimal>> =
+            BTreeMap::new();
+        let mut credit_card_liabilities_by_date: BTreeMap<NaiveDate, HashMap<String, Decimal>> =
+            BTreeMap::new();
+
+        for account_id in &credit_card_account_ids {
+            if let Some(initial_valuation) = self
+                .valuation_repository
+                .get_historical_valuations(account_id, None, Some(history_seed_date))?
+                .into_iter()
+                .max_by_key(|valuation| valuation.valuation_date)
+            {
+                initial_credit_card_assets.insert(
+                    account_id.clone(),
+                    Self::credit_card_asset_value(&initial_valuation),
+                );
+                initial_credit_card_liabilities.insert(
+                    account_id.clone(),
+                    Self::credit_card_liability_value(&initial_valuation),
+                );
+            }
+
+            for valuation in self.valuation_repository.get_historical_valuations(
+                account_id,
+                Some(start_date),
+                Some(end_date),
+            )? {
+                credit_card_assets_by_date
+                    .entry(valuation.valuation_date)
+                    .or_default()
+                    .insert(
+                        account_id.clone(),
+                        Self::credit_card_asset_value(&valuation),
+                    );
+                credit_card_liabilities_by_date
+                    .entry(valuation.valuation_date)
+                    .or_default()
+                    .insert(
+                        account_id.clone(),
+                        Self::credit_card_liability_value(&valuation),
+                    );
+            }
+        }
+
+        // =====================================================================
+        // 6. Determine date range (Rule 1: start from first portfolio date)
+        // =====================================================================
+        // Collect all dates with data
+        let mut all_dates: Vec<NaiveDate> = Vec::new();
+
+        if let Some(first_pf_date) = first_portfolio_date {
+            // Normal case: include portfolio dates
+            all_dates.extend(portfolio_by_date.keys().cloned());
+
+            // Add quote dates that are >= first portfolio date
+            for date in quotes_by_date.keys() {
+                if *date >= first_pf_date && !all_dates.contains(date) {
+                    all_dates.push(*date);
+                }
+            }
+
+            for date in credit_card_liabilities_by_date.keys() {
+                if *date >= first_pf_date && !all_dates.contains(date) {
+                    all_dates.push(*date);
+                }
+            }
+
+            for date in credit_card_assets_by_date.keys() {
+                if *date >= first_pf_date && !all_dates.contains(date) {
+                    all_dates.push(*date);
+                }
+            }
+        } else {
+            // Edge case: no portfolio data, only alternative assets/liabilities.
+            all_dates.extend(quotes_by_date.keys().cloned());
+            all_dates.extend(credit_card_assets_by_date.keys().cloned());
+            all_dates.extend(credit_card_liabilities_by_date.keys().cloned());
+
+            // Also add start_date if we have initial values but no quotes in range
+            if all_dates.is_empty()
+                && (!initial_asset_values.is_empty()
+                    || !initial_credit_card_assets.is_empty()
+                    || !initial_credit_card_liabilities.is_empty())
+            {
+                all_dates.push(start_date);
+            }
+        }
+
+        for (_, calculation) in &loan_histories {
+            all_dates.extend(
+                calculation
+                    .rows
+                    .iter()
+                    .map(|r| r.date)
+                    .filter(|d| *d >= history_seed_date && *d <= end_date),
+            );
+            all_dates.push(end_date);
+        }
+
+        all_dates.sort();
+        all_dates.dedup();
+
+        // =====================================================================
+        // 7. Build history with forward-fill (Rule 2)
+        // =====================================================================
+        // Map each alternative asset id to its breakdown category (e.g. Property, Vehicle).
+        let alt_category_map: HashMap<String, AssetCategory> = alternative_assets
+            .iter()
+            .map(|a| (a.id.clone(), Self::categorize_by_asset_kind(&a.kind)))
+            .collect();
+
+        // Current state for forward-fill
+        let mut current_portfolio = PortfolioState {
+            value: Decimal::ZERO,
+            net_contribution: Decimal::ZERO,
+            cash: Decimal::ZERO,
+            investments: Decimal::ZERO,
+        };
+        let mut portfolio_initialized = false;
+
+        let mut current_asset_values = initial_asset_values.clone();
+        let mut current_credit_card_assets = initial_credit_card_assets.clone();
+        let mut current_credit_card_liabilities = initial_credit_card_liabilities.clone();
+
+        let mut history: Vec<NetWorthHistoryPoint> = Vec::new();
+
+        for date in all_dates {
+            // Update portfolio state if we have data for this date
+            if let Some(pf) = portfolio_by_date.get(&date) {
+                current_portfolio = pf.clone();
+                portfolio_initialized = true;
+            }
+
+            // Update alternative asset values if we have quotes for this date
+            if let Some(quotes_on_date) = quotes_by_date.get(&date) {
+                for (symbol, value) in quotes_on_date {
+                    current_asset_values.insert(symbol.clone(), *value);
+                }
+            }
+
+            if let Some(liabilities_on_date) = credit_card_liabilities_by_date.get(&date) {
+                for (account_id, value) in liabilities_on_date {
+                    current_credit_card_liabilities.insert(account_id.clone(), *value);
+                }
+            }
+
+            if let Some(assets_on_date) = credit_card_assets_by_date.get(&date) {
+                for (account_id, value) in assets_on_date {
+                    current_credit_card_assets.insert(account_id.clone(), *value);
+                }
+            }
+
+            // Skip if portfolio not yet initialized (Rule 1)
+            // Exception: if there's no portfolio data at all, include dates with alt assets
+            if !portfolio_initialized && first_portfolio_date.is_some() {
+                continue;
+            }
+
+            for (asset, calculation) in &loan_histories {
+                if let Some(value) = calculation
+                    .rows
+                    .iter()
+                    .rev()
+                    .find(|r| r.date <= date)
+                    .and_then(|r| Decimal::from_f64_retain(r.balance))
+                    .map(|v| v.round_dp(2))
+                {
+                    let (value, currency) = normalize_amount(value, &asset.quote_ccy);
+                    let converted = if currency == base_currency {
+                        value
+                    } else {
+                        self.fx_service
+                            .convert_currency_for_date(value, currency, &base_currency, date)
+                            .unwrap_or(value)
+                    };
+                    current_asset_values.insert(asset.id.clone(), converted);
+                }
+            }
+
+            // Calculate totals
+            let mut alt_assets_value = Decimal::ZERO;
+            let mut liabilities_value = Decimal::ZERO;
+
+            for (symbol, value) in &current_asset_values {
+                if liability_symbols.contains(symbol) {
+                    liabilities_value += *value;
+                } else if asset_symbols.contains(symbol) {
+                    alt_assets_value += *value;
+                }
+            }
+
+            let credit_card_liabilities_value: Decimal =
+                current_credit_card_liabilities.values().sum();
+            let credit_card_assets_value: Decimal = current_credit_card_assets.values().sum();
+            let total_assets =
+                current_portfolio.value + alt_assets_value + credit_card_assets_value;
+            let total_liabilities = liabilities_value + credit_card_liabilities_value;
+            let net_worth = total_assets - total_liabilities;
+
+            // Build per-category / per-liability breakdown for this date. Asset
+            // categories are aggregated; liabilities are kept per-id so each
+            // liability row can be charted individually (keys match the
+            // point-in-time breakdown's category / asset_id).
+            let mut breakdown: BTreeMap<String, Decimal> = BTreeMap::new();
+            let cash_total = current_portfolio.cash + credit_card_assets_value;
+            if !cash_total.is_zero() {
+                breakdown.insert(
+                    Self::category_key(AssetCategory::Cash).to_string(),
+                    cash_total,
+                );
+            }
+            if !current_portfolio.investments.is_zero() {
+                breakdown.insert(
+                    Self::category_key(AssetCategory::Investment).to_string(),
+                    current_portfolio.investments,
+                );
+            }
+            for (symbol, value) in &current_asset_values {
+                if asset_symbols.contains(symbol) {
+                    if let Some(category) = alt_category_map.get(symbol) {
+                        *breakdown
+                            .entry(Self::category_key(*category).to_string())
+                            .or_insert(Decimal::ZERO) += *value;
+                    }
+                } else if liability_symbols.contains(symbol) {
+                    breakdown.insert(symbol.clone(), *value);
+                }
+            }
+            for (account_id, value) in &current_credit_card_liabilities {
+                if !value.is_zero() {
+                    breakdown.insert(format!("CREDIT_CARD:{}", account_id), *value);
+                }
+            }
+            for value in breakdown.values_mut() {
+                *value = value.round_dp(DECIMAL_PRECISION);
+            }
+
+            history.push(NetWorthHistoryPoint {
+                date,
+                portfolio_value: current_portfolio.value.round_dp(DECIMAL_PRECISION),
+                alternative_assets_value: alt_assets_value.round_dp(DECIMAL_PRECISION),
+                total_liabilities: total_liabilities.round_dp(DECIMAL_PRECISION),
+                total_assets: total_assets.round_dp(DECIMAL_PRECISION),
+                net_worth: net_worth.round_dp(DECIMAL_PRECISION),
+                net_contribution: current_portfolio
+                    .net_contribution
+                    .round_dp(DECIMAL_PRECISION),
+                breakdown,
+                currency: base_currency.clone(),
+            });
+        }
+
+        debug!(
+            "Net worth history calculated: {} data points",
+            history.len()
+        );
+
+        Ok(history)
+    }
+}

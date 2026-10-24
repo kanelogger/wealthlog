@@ -1,0 +1,209 @@
+import { ApplicationShell } from "@wealthfolio/ui";
+import { Icons } from "@wealthfolio/ui/components/ui/icons";
+import { Separator } from "@wealthfolio/ui/components/ui/separator";
+import { useMemo } from "react";
+import { useTranslation } from "react-i18next";
+import { Outlet, useLocation, useNavigate } from "react-router-dom";
+import { useIsCompactTableViewport, usePlatform } from "@/hooks/use-platform";
+import { SidebarNav } from "./sidebar-nav";
+
+export default function SettingsLayout() {
+  const { t } = useTranslation();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { isTauri, isMobile } = usePlatform();
+  // The embedded MCP server only ships in the desktop build & web server, not on iOS/Android app.
+  const hasMcpServer = !(isTauri && isMobile);
+
+  const sections = useMemo(
+    () => [
+      {
+        title: t("settings:nav.sections.preferences"),
+        items: [
+          {
+            title: t("settings:nav.items.general"),
+            href: "general",
+            subtitle: t("settings:nav.subtitles.general"),
+            icon: <Icons.Settings2 className="size-5" />,
+          },
+          {
+            title: t("settings:nav.items.appearance"),
+            href: "appearance",
+            subtitle: t("settings:nav.subtitles.appearance"),
+            icon: <Icons.Monitor className="size-5" />,
+          },
+        ],
+      },
+      {
+        title: t("settings:nav.sections.finance"),
+        items: [
+          {
+            title: t("settings:nav.items.accounts"),
+            href: "accounts",
+            subtitle: t("settings:nav.subtitles.accounts"),
+            icon: <Icons.CreditCard className="size-5" />,
+          },
+          {
+            title: t("settings:nav.items.portfolios"),
+            href: "portfolios",
+            subtitle: t("settings:nav.subtitles.portfolios"),
+            icon: <Icons.Folder className="size-5" />,
+          },
+          {
+            title: t("settings:nav.items.spending"),
+            href: "spending",
+            subtitle: t("settings:nav.subtitles.spending"),
+            icon: <Icons.Wallet className="size-5" />,
+          },
+        ],
+      },
+      {
+        title: t("settings:nav.sections.data"),
+        items: [
+          {
+            title: t("settings:nav.items.securities"),
+            href: "securities",
+            subtitle: t("settings:nav.subtitles.securities"),
+            icon: <Icons.BadgeDollarSign className="size-5" />,
+          },
+          {
+            title: t("settings:nav.items.classifications"),
+            href: "taxonomies",
+            subtitle: t("settings:nav.subtitles.classifications"),
+            icon: <Icons.Blocks className="size-5" />,
+          },
+          {
+            title: t("settings:nav.items.backup_export"),
+            href: "exports",
+            subtitle: t("settings:nav.subtitles.backup_export"),
+            icon: <Icons.Download className="size-5" />,
+          },
+        ],
+      },
+      {
+        title: t("settings:nav.sections.connections"),
+        items: [
+          {
+            title: t("settings:nav.items.market_data"),
+            href: "market-data",
+            subtitle: t("settings:nav.subtitles.market_data"),
+            icon: <Icons.BarChart className="size-5" />,
+          },
+          ...(hasMcpServer
+            ? [
+                {
+                  title: t("settings:nav.items.agent_access"),
+                  href: "agent-access",
+                  subtitle: t("settings:nav.subtitles.agent_access"),
+                  icon: <Icons.Brain className="size-5" />,
+                },
+              ]
+            : []),
+        ],
+      },
+      {
+        title: t("settings:nav.sections.information"),
+        items: [
+          {
+            title: t("settings:nav.items.about"),
+            href: "about",
+            subtitle: t("settings:nav.subtitles.about"),
+            icon: <Icons.Info className="size-5" />,
+          },
+        ],
+      },
+    ],
+    [t, hasMcpServer],
+  );
+
+  // Check if we're on the main settings page (mobile) or a specific setting page
+  const isMainSettingsPage =
+    location.pathname === "/settings" || location.pathname === "/settings/";
+
+  // One tree and one <Outlet />: a CSS-hidden second copy of a page would still
+  // run its effects and open portaled dialogs. Only the phone settings list
+  // needs the viewport, because it replaces the index page. Same 1024px
+  // breakpoint as `lg`.
+  const isCompact = useIsCompactTableViewport();
+
+  if (isCompact && isMainSettingsPage) {
+    return (
+      <ApplicationShell className="settings-root app-shell h-screen overflow-x-hidden">
+        {/* Mobile Settings List View (carded list with dividers) */}
+        <div className="scan-hide-target w-full max-w-full overflow-x-hidden">
+          <div className="bg-background/95 supports-backdrop-filter:bg-background/60 pt-safe sticky top-0 z-10 border-b backdrop-blur">
+            <div className="flex min-h-[60px] items-center justify-center px-4">
+              <h1 className="text-lg font-semibold">{t("settings:title")}</h1>
+            </div>
+          </div>
+          <div className="space-y-6 p-3 pb-[var(--mobile-nav-total-offset)]">
+            {sections.map((section) => (
+              <div key={section.title} className="space-y-3">
+                <div className="text-muted-foreground px-2 text-xs font-semibold uppercase tracking-widest">
+                  {section.title}
+                </div>
+                <div className="divide-border bg-card divide-y overflow-hidden rounded-2xl border shadow-sm">
+                  {section.items.map((item) => (
+                    <button
+                      key={item.href}
+                      onClick={() => navigate(item.href)}
+                      className="hover:bg-muted/40 flex w-full items-center justify-between gap-3 px-4 py-4 text-left transition-colors active:opacity-90"
+                      aria-label={item.title}
+                    >
+                      <div className="flex min-w-0 flex-1 items-center gap-3">
+                        <div className="text-muted-foreground shrink-0">{item.icon}</div>
+                        <div className="min-w-0">
+                          <div className="text-foreground truncate text-base font-medium">
+                            {item.title}
+                          </div>
+                          {item?.subtitle && (
+                            <div className="text-muted-foreground truncate text-sm">
+                              {item.subtitle}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <Icons.ChevronRight className="text-muted-foreground h-4 w-4 shrink-0" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </ApplicationShell>
+    );
+  }
+
+  return (
+    <ApplicationShell className="settings-root app-shell h-screen overflow-x-hidden">
+      <div className="scan-hide-target pt-safe w-full max-w-full overflow-x-hidden scroll-smooth lg:flex lg:justify-start lg:pt-0">
+        <div className="flex w-full max-w-full flex-col p-2 pb-[var(--mobile-nav-total-offset)] lg:max-w-6xl lg:px-2 lg:py-8">
+          <div className="hidden lg:block">
+            <div className="space-y-0.5">
+              <h2 className="text-2xl font-bold tracking-tight">{t("settings:title")}</h2>
+            </div>
+            <Separator className="my-6" />
+          </div>
+          <div className="lg:flex lg:gap-10">
+            <aside className="hidden w-[240px] shrink-0 lg:sticky lg:top-24 lg:flex lg:flex-col lg:self-start">
+              <div className="space-y-6">
+                {sections.map((section) => (
+                  <div key={section.title} className="space-y-2">
+                    <div className="text-muted-foreground pl-2 text-sm font-light uppercase tracking-widest">
+                      {section.title}
+                    </div>
+                    <SidebarNav items={section.items} />
+                  </div>
+                ))}
+              </div>
+            </aside>
+            <div className="min-w-0 lg:mb-8 lg:flex-1">
+              <Outlet />
+            </div>
+          </div>
+        </div>
+      </div>
+    </ApplicationShell>
+  );
+}

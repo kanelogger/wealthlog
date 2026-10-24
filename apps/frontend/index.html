@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="zh-CN" class="overflow-x-hidden">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="frame-src 'none'" />
+    <link rel="icon" type="image/png" href="/app-icon-192.png" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <title>Wealthlog</title>
+    <!-- Splash styles live in an external file on purpose: an inline <style>
+         here makes Tauri nonce the CSP style-src at runtime, which disables
+         'unsafe-inline' and breaks runtime-injected styles (NumberFlow, sonner)
+         in packaged builds. See public/splash.css. -->
+    <link rel="stylesheet" href="/splash.css" />
+  </head>
+
+  <body class="overflow-x-hidden font-mono">
+    <script>
+      // Apply cached theme before first paint to prevent flash on login screen
+      (function () {
+        try {
+          var theme = localStorage.getItem("wealthfolio-theme") || "system";
+          var resolved =
+            theme === "system"
+              ? window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light"
+              : theme === "dark"
+                ? "dark"
+                : "light";
+          document.documentElement.classList.add(resolved);
+          document.documentElement.style.colorScheme = resolved;
+        } catch (e) {}
+        // Presentation hint only; profile access is still checked by the app.
+        try {
+          var opening = JSON.parse(sessionStorage.getItem("wealthfolio-profile-opening") || "null");
+          var age = opening && Date.now() - opening.at;
+          if (opening && typeof opening.at === "number" && age >= 0 && age < 300000) {
+            document.documentElement.classList.add("profile-opening");
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <div id="root"></div>
+    <div id="profile-splash" class="profile-lock-screen" role="status" aria-label="Opening profile">
+      <span class="profile-lock-avatar profile-opening-placeholder" aria-hidden="true"></span>
+    </div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

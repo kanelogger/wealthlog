@@ -1,0 +1,4 @@
+# VACUUM cannot run inside a transaction; Diesel wraps migrations in one by
+# default. The statements in this migration are idempotent, so running it
+# outside a transaction is safe.
+run_in_transaction = false

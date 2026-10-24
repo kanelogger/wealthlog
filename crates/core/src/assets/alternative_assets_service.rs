@@ -1,0 +1,1714 @@
+//! Alternative Assets service implementation.
+//!
+//! This service manages the lifecycle of alternative assets including
+//! properties, vehicles, collectibles, precious metals, and liabilities.
+//!
+//! Alternative assets use a simplified model:
+//! - No dedicated accounts (avoids account clutter)
+//! - No activities (avoids activity clutter)
+//! - Just asset record + valuation quotes
+
+use std::sync::{Arc, RwLock};
+
+use async_trait::async_trait;
+use chrono::{TimeZone, Utc};
+use log::debug;
+use rust_decimal::Decimal;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use super::alternative_assets_model::{
+    AlternativeHolding, CreateAlternativeAssetRequest, CreateAlternativeAssetResponse,
+    LinkLiabilityRequest, LinkLiabilityResponse, UpdateAssetDetailsRequest,
+    UpdateAssetDetailsResponse, UpdateValuationRequest, UpdateValuationResponse,
+};
+use super::alternative_assets_traits::{
+    AlternativeAssetRepositoryTrait, AlternativeAssetServiceTrait,
+};
+use super::loan::{
+    apply_loan_action, apply_loan_setup, link_payment, preview_loan_terms, AssetDetailsChange,
+    LoanAction, LoanActionResult, LoanError, LoanPayment, LoanRecord, LoanSchedulePreview,
+    LoanSetup, LoanSummary, PaymentLink, LOAN_FIELDS,
+};
+use super::{Asset, AssetKind, AssetRepositoryTrait, NewAsset, QuoteMode};
+use crate::errors::{Error, Result, ValidationError};
+use crate::events::{DomainEvent, DomainEventSink, NoOpDomainEventSink};
+use crate::quotes::constants::DATA_SOURCE_MANUAL;
+use crate::quotes::{Quote, QuoteServiceTrait};
+use crate::utils::time_utils::{parse_user_timezone_or_default, user_today};
+
+/// `existing` metadata with the requested changes; an empty value removes a key.
+fn merged_details(
+    existing: Option<&Value>,
+    changes: Option<&std::collections::HashMap<String, Option<String>>>,
+) -> Option<Value> {
+    let mut fields = existing
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    for (key, value) in changes.into_iter().flatten() {
+        match value {
+            Some(v) if !v.is_empty() => {
+                fields.insert(key.clone(), json!(v));
+            }
+            _ => {
+                fields.remove(key);
+            }
+        }
+    }
+    (!fields.is_empty()).then_some(Value::Object(fields))
+}
+
+fn has_loan_fields<'a>(mut keys: impl Iterator<Item = &'a String>) -> bool {
+    keys.any(|key| LOAN_FIELDS.contains(&key.as_str()))
+}
+
+/// Service for managing alternative assets.
+///
+/// This service coordinates between the asset repository and quote service
+/// to manage the lifecycle of alternative assets.
+///
+/// NOTE: Alternative assets don't create accounts or activities - just asset + quotes.
+pub struct AlternativeAssetService {
+    alternative_asset_repository: Arc<dyn AlternativeAssetRepositoryTrait>,
+    asset_repository: Arc<dyn AssetRepositoryTrait>,
+    quote_service: Arc<dyn QuoteServiceTrait>,
+    timezone: Arc<RwLock<String>>,
+    event_sink: Arc<dyn DomainEventSink>,
+}
+
+impl AlternativeAssetService {
+    /// Creates a new AlternativeAssetService instance.
+    pub fn new(
+        alternative_asset_repository: Arc<dyn AlternativeAssetRepositoryTrait>,
+        asset_repository: Arc<dyn AssetRepositoryTrait>,
+        quote_service: Arc<dyn QuoteServiceTrait>,
+    ) -> Self {
+        Self {
+            alternative_asset_repository,
+            asset_repository,
+            quote_service,
+            event_sink: Arc::new(NoOpDomainEventSink),
+            timezone: Arc::new(RwLock::new(String::new())),
+        }
+    }
+
+    pub fn with_timezone(mut self, timezone: Arc<RwLock<String>>) -> Self {
+        self.timezone = timezone;
+        self
+    }
+
+    /// The settings time zone, which dates today and loan payments.
+    fn timezone(&self) -> chrono_tz::Tz {
+        parse_user_timezone_or_default(
+            &self
+                .timezone
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    fn today(&self) -> chrono::NaiveDate {
+        user_today(self.timezone())
+    }
+
+    /// Sets the domain event sink for this service.
+    pub fn with_event_sink(mut self, event_sink: Arc<dyn DomainEventSink>) -> Self {
+        self.event_sink = event_sink;
+        self
+    }
+
+    /// Validates that the request is for an alternative asset kind.
+    fn validate_alternative_asset_kind(kind: &AssetKind) -> Result<()> {
+        match kind {
+            AssetKind::Property
+            | AssetKind::Vehicle
+            | AssetKind::Collectible
+            | AssetKind::PreciousMetal
+            | AssetKind::PrivateEquity
+            | AssetKind::Liability
+            | AssetKind::Other => Ok(()),
+            _ => Err(Error::Validation(ValidationError::InvalidInput(format!(
+                "Asset kind {:?} is not an alternative asset type",
+                kind
+            )))),
+        }
+    }
+
+    /// Builds the asset metadata JSON, including purchase info and kind-specific metadata.
+    fn build_asset_metadata(request: &CreateAlternativeAssetRequest) -> Option<Value> {
+        let mut metadata = request.metadata.clone().unwrap_or_else(|| json!({}));
+
+        // Add purchase info if provided
+        if let Some(purchase_price) = &request.purchase_price {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(
+                    "purchase_price".to_string(),
+                    json!(purchase_price.to_string()),
+                );
+            }
+        }
+        if let Some(purchase_date) = &request.purchase_date {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert(
+                    "purchase_date".to_string(),
+                    json!(purchase_date.to_string()),
+                );
+            }
+        }
+
+        // For liabilities, add linked_asset_id if provided
+        if request.kind == AssetKind::Liability {
+            if let Some(linked_id) = &request.linked_asset_id {
+                if let Some(obj) = metadata.as_object_mut() {
+                    obj.insert("linked_asset_id".to_string(), json!(linked_id));
+                }
+            }
+        }
+
+        // Return None if metadata is empty, Some otherwise
+        if metadata.as_object().is_some_and(|o| o.is_empty()) {
+            None
+        } else {
+            Some(metadata)
+        }
+    }
+
+    /// A new liability's metadata with its loan setup applied. The first balance
+    /// cannot predate origination, and Paid from is chosen when editing.
+    fn created_loan_metadata(
+        metadata: Value,
+        setup: &LoanSetup,
+        value_date: chrono::NaiveDate,
+    ) -> Result<Value> {
+        if setup
+            .schedule
+            .as_ref()
+            .is_some_and(|schedule| schedule.payment_account_id.is_some())
+        {
+            return Err(LoanError::PaymentAccountInvalid.into());
+        }
+        if setup
+            .origination_date
+            .is_some_and(|origination| value_date < origination)
+        {
+            return Err(LoanError::BalanceBeforeOrigination.into());
+        }
+        Ok(apply_loan_setup(&metadata, setup)?)
+    }
+
+    /// Extracts linked_asset_id from liability metadata.
+    #[cfg(test)]
+    fn get_linked_asset_id(metadata: &Option<Value>) -> Option<String> {
+        metadata
+            .as_ref()
+            .and_then(|m| m.get("linked_asset_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }
+
+    /// Adds or updates linked_asset_id in metadata.
+    fn set_linked_asset_id(metadata: Option<Value>, linked_asset_id: &str) -> Value {
+        let mut meta = metadata.unwrap_or_else(|| json!({}));
+        if let Some(obj) = meta.as_object_mut() {
+            obj.insert("linked_asset_id".to_string(), json!(linked_asset_id));
+        }
+        meta
+    }
+
+    /// Removes linked_asset_id from metadata.
+    fn remove_linked_asset_id(metadata: Option<Value>) -> Option<Value> {
+        let mut meta = metadata?;
+        if let Some(obj) = meta.as_object_mut() {
+            obj.remove("linked_asset_id");
+            if obj.is_empty() {
+                return None;
+            }
+        }
+        Some(meta)
+    }
+
+    /// Derives the display code for an alternative asset from its metadata.
+    ///
+    /// Uses the unified `sub_type` field (e.g., "gold" → "Gold", "mortgage" → "Mortgage").
+    /// Falls back to the kind's display name if sub_type is not set.
+    pub fn derive_display_code(kind: &AssetKind, metadata: &Option<Value>) -> String {
+        metadata
+            .as_ref()
+            .and_then(|m| m.get("sub_type"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(Self::format_subtype)
+            .unwrap_or_else(|| kind.display_name().to_string())
+    }
+
+    /// Records a new purchase quote when the purchase price or date changed.
+    async fn sync_purchase_quote(&self, asset: &Asset, updated: Option<&Value>) -> Result<bool> {
+        let purchase = |metadata: Option<&Value>, key: &str| {
+            metadata
+                .and_then(|m| m.get(key))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+        let (old_purchase_price, old_purchase_date) = (
+            purchase(asset.metadata.as_ref(), "purchase_price"),
+            purchase(asset.metadata.as_ref(), "purchase_date"),
+        );
+        let (new_purchase_price, new_purchase_date) = (
+            purchase(updated, "purchase_price"),
+            purchase(updated, "purchase_date"),
+        );
+        let mut purchase_quote_updated = false;
+        let purchase_info_changed =
+            old_purchase_price != new_purchase_price || old_purchase_date != new_purchase_date;
+
+        if purchase_info_changed {
+            if let (Some(price_str), Some(date_str)) = (&new_purchase_price, &new_purchase_date) {
+                let purchase_price: Decimal = price_str.parse().map_err(|_| {
+                    Error::Validation(ValidationError::InvalidInput(
+                        "Invalid purchase price format".to_string(),
+                    ))
+                })?;
+                let purchase_date = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+                    .map_err(|_| {
+                        Error::Validation(ValidationError::InvalidInput(
+                            "Invalid purchase date format".to_string(),
+                        ))
+                    })?;
+
+                let purchase_quote = Quote {
+                    id: Uuid::new_v4().to_string(),
+                    asset_id: asset.id.clone(),
+                    timestamp: Utc.from_utc_datetime(
+                        &purchase_date
+                            .and_hms_opt(12, 0, 0)
+                            .expect("12:00:00 is a valid time"),
+                    ),
+                    open: purchase_price,
+                    high: purchase_price,
+                    low: purchase_price,
+                    close: purchase_price,
+                    adjclose: purchase_price,
+                    volume: Decimal::ZERO,
+                    currency: asset.quote_ccy.clone(),
+                    data_source: DATA_SOURCE_MANUAL.to_string(),
+                    created_at: Utc::now(),
+                    notes: None,
+                };
+
+                self.quote_service.add_quote(&purchase_quote).await?;
+                purchase_quote_updated = true;
+                debug!(
+                    "Updated purchase quote for {} at {} with value {}",
+                    asset.id, purchase_date, purchase_price
+                );
+            }
+        }
+
+        Ok(purchase_quote_updated)
+    }
+
+    /// Formats a snake_case subtype to Title Case (e.g., "auto_loan" → "Auto Loan").
+    fn format_subtype(subtype: &str) -> String {
+        subtype
+            .split('_')
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    None => String::new(),
+                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+#[async_trait]
+impl AlternativeAssetServiceTrait for AlternativeAssetService {
+    async fn create_alternative_asset(
+        &self,
+        request: CreateAlternativeAssetRequest,
+    ) -> Result<CreateAlternativeAssetResponse> {
+        // Validate the asset kind is an alternative asset
+        Self::validate_alternative_asset_kind(&request.kind)?;
+
+        // Validate required fields
+        if request.name.trim().is_empty() {
+            return Err(Error::Validation(ValidationError::InvalidInput(
+                "Asset name cannot be empty".to_string(),
+            )));
+        }
+        if request.currency.trim().is_empty() {
+            return Err(Error::Validation(ValidationError::InvalidInput(
+                "Currency cannot be empty".to_string(),
+            )));
+        }
+
+        // Validate purchase date is before value date when both are provided
+        if let (Some(purchase_date), value_date) = (request.purchase_date, request.value_date) {
+            if purchase_date >= value_date {
+                return Err(Error::Validation(ValidationError::InvalidInput(
+                    "Purchase/origination date must be before current value date".to_string(),
+                )));
+            }
+        }
+
+        debug!(
+            "Creating alternative asset: {} ({:?})",
+            request.name, request.kind
+        );
+
+        // 1. Build asset metadata; a liability's loan fields come only from its setup.
+        let is_liability = request.kind == AssetKind::Liability;
+        if is_liability
+            && request
+                .metadata
+                .as_ref()
+                .and_then(Value::as_object)
+                .is_some_and(|m| has_loan_fields(m.keys()))
+        {
+            return Err(LoanError::FieldsReadOnly.into());
+        }
+        let mut metadata = Self::build_asset_metadata(&request);
+        if let Some(setup) = &request.loan {
+            if !is_liability {
+                return Err(LoanError::Invalid.into());
+            }
+            metadata = Some(Self::created_loan_metadata(
+                metadata.unwrap_or_else(|| json!({})),
+                setup,
+                request.value_date,
+            )?);
+        }
+
+        // 2. Determine display_code from metadata
+        let display_code = Self::derive_display_code(&request.kind, &metadata);
+
+        // 3. Create the asset record (DB generates UUID)
+        let new_asset = NewAsset {
+            id: None, // DB generates UUID
+            name: Some(request.name.clone()),
+            display_code: Some(display_code),
+            quote_ccy: request.currency.clone(),
+            kind: request.kind.clone(),
+            quote_mode: QuoteMode::Manual,
+            is_active: true,
+            metadata,
+            ..Default::default()
+        };
+
+        let asset = self.asset_repository.create(new_asset).await?;
+        let asset_id = asset.id.clone();
+        debug!("Created asset: {}", asset_id);
+
+        // Emit asset created event
+        self.event_sink
+            .emit(DomainEvent::assets_created(vec![asset_id.clone()]));
+
+        // 4. Create purchase/origination quote if both price and date are provided
+        if let (Some(purchase_price), Some(purchase_date)) =
+            (request.purchase_price, request.purchase_date)
+        {
+            let purchase_quote = Quote {
+                id: Uuid::new_v4().to_string(),
+                asset_id: asset_id.clone(),
+                timestamp: Utc.from_utc_datetime(
+                    &purchase_date
+                        .and_hms_opt(12, 0, 0)
+                        .expect("12:00:00 is a valid time"),
+                ),
+                open: purchase_price,
+                high: purchase_price,
+                low: purchase_price,
+                close: purchase_price,
+                adjclose: purchase_price,
+                volume: Decimal::ZERO,
+                currency: request.currency.clone(),
+                data_source: DATA_SOURCE_MANUAL.to_string(),
+                created_at: Utc::now(),
+                notes: None,
+            };
+            self.quote_service.add_quote(&purchase_quote).await?;
+            debug!(
+                "Created purchase/origination quote at {} with value {}",
+                purchase_date, purchase_price
+            );
+        }
+
+        // 5. Create current valuation quote
+        let quote_id = Uuid::new_v4().to_string();
+        let quote = Quote {
+            id: quote_id.clone(),
+            asset_id: asset_id.clone(),
+            timestamp: Utc.from_utc_datetime(
+                &request
+                    .value_date
+                    .and_hms_opt(12, 0, 0)
+                    .expect("12:00:00 is a valid time"),
+            ),
+            open: request.current_value,
+            high: request.current_value,
+            low: request.current_value,
+            close: request.current_value,
+            adjclose: request.current_value,
+            volume: Decimal::ZERO,
+            currency: request.currency.clone(),
+            data_source: DATA_SOURCE_MANUAL.to_string(),
+            created_at: Utc::now(),
+            notes: None,
+        };
+
+        let saved_quote = self.quote_service.add_quote(&quote).await?;
+        debug!("Created current valuation quote: {}", saved_quote.id);
+
+        Ok(CreateAlternativeAssetResponse {
+            asset_id,
+            quote_id: saved_quote.id,
+        })
+    }
+
+    async fn update_valuation(
+        &self,
+        request: UpdateValuationRequest,
+    ) -> Result<UpdateValuationResponse> {
+        debug!(
+            "Updating valuation for asset {} to {} on {}",
+            request.asset_id, request.value, request.date
+        );
+
+        // Verify the asset exists
+        self.asset_repository.get_by_id(&request.asset_id)?;
+
+        // Get the existing quote to find the currency
+        let currency = match self.quote_service.get_latest_quote(&request.asset_id) {
+            Ok(existing_quote) => existing_quote.currency,
+            Err(_) => {
+                return Err(Error::Validation(ValidationError::InvalidInput(format!(
+                    "Cannot find existing valuation for asset: {}. Please check the asset exists.",
+                    request.asset_id
+                ))));
+            }
+        };
+
+        // Create new valuation quote
+        let quote_id = Uuid::new_v4().to_string();
+        let quote = Quote {
+            id: quote_id.clone(),
+            asset_id: request.asset_id.clone(),
+            timestamp: Utc.from_utc_datetime(
+                &request
+                    .date
+                    .and_hms_opt(12, 0, 0)
+                    .expect("12:00:00 is a valid time"),
+            ),
+            open: request.value,
+            high: request.value,
+            low: request.value,
+            close: request.value,
+            adjclose: request.value,
+            volume: Decimal::ZERO,
+            currency,
+            data_source: DATA_SOURCE_MANUAL.to_string(),
+            created_at: Utc::now(),
+            notes: request.notes.clone(),
+        };
+
+        let saved_quote = self.quote_service.add_quote(&quote).await?;
+        debug!("Created valuation quote: {}", saved_quote.id);
+
+        Ok(UpdateValuationResponse {
+            quote_id: saved_quote.id,
+            valuation_date: request.date,
+            value: request.value,
+        })
+    }
+
+    async fn delete_alternative_asset(&self, asset_id: &str) -> Result<()> {
+        debug!("Deleting alternative asset: {}", asset_id);
+
+        // Verify the asset exists and is an alternative asset
+        let asset = self.asset_repository.get_by_id(asset_id)?;
+        if !asset.kind.is_alternative() {
+            return Err(Error::Validation(ValidationError::InvalidInput(format!(
+                "Asset {} is not an alternative asset (kind: {:?})",
+                asset_id, asset.kind
+            ))));
+        }
+
+        self.alternative_asset_repository
+            .delete_alternative_asset(asset_id)
+            .await?;
+
+        debug!("Successfully deleted alternative asset: {}", asset_id);
+        Ok(())
+    }
+
+    async fn link_liability(&self, request: LinkLiabilityRequest) -> Result<LinkLiabilityResponse> {
+        debug!(
+            "Linking liability {} to asset {}",
+            request.liability_id, request.target_asset_id
+        );
+
+        // Validate liability is actually a Liability kind
+        let liability = self.asset_repository.get_by_id(&request.liability_id)?;
+        if liability.kind != AssetKind::Liability {
+            return Err(Error::Validation(ValidationError::InvalidInput(format!(
+                "Asset {} is not a liability (kind: {:?})",
+                request.liability_id, liability.kind
+            ))));
+        }
+
+        // Validate target asset exists and is an alternative asset
+        let target = self.asset_repository.get_by_id(&request.target_asset_id)?;
+        if !target.kind.is_alternative() {
+            return Err(Error::Validation(ValidationError::InvalidInput(format!(
+                "Target asset {} is not an alternative asset (kind: {:?})",
+                request.target_asset_id, target.kind
+            ))));
+        }
+
+        // Update liability metadata with linked_asset_id
+        let new_metadata = Self::set_linked_asset_id(liability.metadata, &request.target_asset_id);
+        self.alternative_asset_repository
+            .update_asset_metadata(&request.liability_id, Some(new_metadata))
+            .await?;
+
+        debug!(
+            "Linked liability {} to asset {}",
+            request.liability_id, request.target_asset_id
+        );
+
+        Ok(LinkLiabilityResponse {
+            liability_id: request.liability_id,
+            linked_asset_id: Some(request.target_asset_id),
+        })
+    }
+
+    async fn unlink_liability(&self, liability_id: &str) -> Result<LinkLiabilityResponse> {
+        debug!("Unlinking liability {}", liability_id);
+
+        // Validate liability is actually a Liability kind
+        let liability = self.asset_repository.get_by_id(liability_id)?;
+        if liability.kind != AssetKind::Liability {
+            return Err(Error::Validation(ValidationError::InvalidInput(format!(
+                "Asset {} is not a liability (kind: {:?})",
+                liability_id, liability.kind
+            ))));
+        }
+
+        // Replace metadata with the remaining fields. None means "no update"
+        // in the repository, so an otherwise empty object must be explicit.
+        let metadata =
+            Self::remove_linked_asset_id(liability.metadata).unwrap_or_else(|| json!({}));
+        self.alternative_asset_repository
+            .update_asset_metadata(liability_id, Some(metadata))
+            .await?;
+
+        debug!("Unlinked liability {}", liability_id);
+
+        Ok(LinkLiabilityResponse {
+            liability_id: liability_id.to_string(),
+            linked_asset_id: None,
+        })
+    }
+
+    async fn update_asset_details(
+        &self,
+        request: UpdateAssetDetailsRequest,
+    ) -> Result<UpdateAssetDetailsResponse> {
+        debug!("Updating asset details for {}", request.asset_id);
+
+        // Verify the asset exists and is an alternative asset
+        let asset = self.asset_repository.get_by_id(&request.asset_id)?;
+        if !asset.kind.is_alternative() {
+            return Err(Error::Validation(ValidationError::InvalidInput(format!(
+                "Asset {} is not an alternative asset (kind: {:?})",
+                request.asset_id, asset.kind
+            ))));
+        }
+
+        // Loan fields change only through a loan setup or loan actions.
+        if asset.kind == AssetKind::Liability
+            && request
+                .metadata
+                .as_ref()
+                .is_some_and(|m| has_loan_fields(m.keys()))
+        {
+            return Err(LoanError::FieldsReadOnly.into());
+        }
+
+        let updated_metadata = match request.loan.clone() {
+            // The loan section is checked and saved with the other details in the
+            // loan's transaction, so a refusal or a failure saves none of the edit.
+            Some(setup) => {
+                if asset.kind != AssetKind::Liability {
+                    return Err(LoanError::Invalid.into());
+                }
+                let (name, notes) = (request.name.clone(), request.notes.clone());
+                let changes = request.metadata.clone();
+                let kind = asset.kind.clone();
+                let today = self.today();
+                let timezone = self.timezone();
+                let update = self
+                    .alternative_asset_repository
+                    .update_loan(
+                        &request.asset_id,
+                        Box::new(move |stored| {
+                            let record = stored.dated(timezone);
+                            let edited = LoanRecord {
+                                metadata: merged_details(Some(&record.metadata), changes.as_ref())
+                                    .unwrap_or_else(|| json!({})),
+                                ..record
+                            };
+                            let mut update =
+                                apply_loan_action(&edited, &LoanAction::SetTerms(setup), today)?;
+                            let metadata = update.metadata.take().unwrap_or(edited.metadata);
+                            let display_code =
+                                Self::derive_display_code(&kind, &Some(metadata.clone()));
+                            update.details = Some(AssetDetailsChange {
+                                name,
+                                display_code: Some(display_code),
+                                notes,
+                            });
+                            update.metadata = Some(metadata);
+                            Ok(update)
+                        }),
+                    )
+                    .await?;
+                update.metadata
+            }
+            None => {
+                let updated_metadata =
+                    merged_details(asset.metadata.as_ref(), request.metadata.as_ref());
+                let display_code = Self::derive_display_code(&asset.kind, &updated_metadata);
+                self.alternative_asset_repository
+                    .update_asset_details(
+                        &request.asset_id,
+                        request.name.as_deref(),
+                        Some(&display_code),
+                        updated_metadata.clone(),
+                        request.notes.as_deref(),
+                    )
+                    .await?;
+                updated_metadata
+            }
+        };
+
+        let purchase_quote_updated = self
+            .sync_purchase_quote(&asset, updated_metadata.as_ref())
+            .await?;
+
+        debug!(
+            "Updated asset details for {}, purchase_quote_updated: {}",
+            request.asset_id, purchase_quote_updated
+        );
+
+        Ok(UpdateAssetDetailsResponse {
+            asset_id: request.asset_id,
+            purchase_quote_updated,
+        })
+    }
+
+    async fn apply_loan_action(
+        &self,
+        asset_id: &str,
+        action: LoanAction,
+    ) -> Result<LoanActionResult> {
+        let asset = self.asset_repository.get_by_id(asset_id)?;
+        if asset.kind != AssetKind::Liability {
+            return Err(Error::Validation(ValidationError::InvalidInput(format!(
+                "Asset {asset_id} is not a liability"
+            ))));
+        }
+        let today = self.today();
+        let timezone = self.timezone();
+        let update = self
+            .alternative_asset_repository
+            .update_loan(
+                asset_id,
+                Box::new(move |stored| {
+                    Ok(apply_loan_action(&stored.dated(timezone), &action, today)?)
+                }),
+            )
+            .await?;
+        Ok(LoanActionResult {
+            balances_changed: update.changes_balances(),
+        })
+    }
+
+    async fn link_loan_payment(&self, activity_id: &str, link: PaymentLink) -> Result<()> {
+        let loan_id = link.loan_id().map(str::to_string);
+        let timezone = self.timezone();
+        let changed = self
+            .alternative_asset_repository
+            .update_payment_tag(
+                activity_id,
+                loan_id.as_deref(),
+                Box::new(move |activity, account_type, stored| {
+                    let loan = stored.map(|loan| loan.dated(timezone));
+                    Ok(link_payment(
+                        activity,
+                        account_type,
+                        loan.as_ref(),
+                        &link,
+                        timezone,
+                    )?)
+                }),
+            )
+            .await?;
+        // Rewriting the withdrawal marks its account for recalculation, as any
+        // activity edit does; the event runs it.
+        if let Some(activity) = changed {
+            self.event_sink.emit(DomainEvent::activities_changed(
+                vec![activity.account_id],
+                activity.asset_id.into_iter().collect(),
+                vec![activity.currency],
+                Some(activity.activity_date),
+            ));
+        }
+        Ok(())
+    }
+
+    fn preview_loan_terms(
+        &self,
+        asset_id: Option<&str>,
+        setup: &LoanSetup,
+    ) -> Result<Option<LoanSchedulePreview>> {
+        let stored = match asset_id {
+            Some(id) => self.asset_repository.get_by_id(id)?.metadata,
+            None => None,
+        };
+        Ok(preview_loan_terms(
+            setup,
+            &stored.unwrap_or_else(|| json!({})),
+        )?)
+    }
+
+    fn get_loan_payments(&self, asset_id: &str) -> Result<Vec<LoanPayment>> {
+        let timezone = self.timezone();
+        Ok(self
+            .alternative_asset_repository
+            .loan_payments(&[asset_id.to_string()])?
+            .remove(asset_id)
+            .unwrap_or_default()
+            .iter()
+            .map(|payment| payment.dated(timezone))
+            .collect())
+    }
+
+    fn get_alternative_holdings(&self) -> Result<Vec<AlternativeHolding>> {
+        debug!("Fetching alternative holdings");
+
+        // Get all assets
+        let all_assets = self.asset_repository.list()?;
+
+        // Filter to alternative assets only
+        let alternative_assets: Vec<_> = all_assets
+            .into_iter()
+            .filter(|a| a.kind.is_alternative())
+            .collect();
+
+        if alternative_assets.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Get asset IDs for quote lookup
+        let asset_ids: Vec<String> = alternative_assets.iter().map(|a| a.id.clone()).collect();
+
+        // Fetch latest quotes for all alternative assets, restricted to rows
+        // with day <= today so future-dated payoff rows (e.g. a mortgage's
+        // planned 2041 zero) do not zero out the balance today.
+        let as_of = self.today();
+        let quotes = self
+            .quote_service
+            .get_latest_quotes_as_of(&asset_ids, as_of)?;
+
+        let loan_ids: Vec<String> = alternative_assets
+            .iter()
+            .filter(|asset| asset.kind == AssetKind::Liability)
+            .map(|asset| asset.id.clone())
+            .collect();
+        let mut payments = self.alternative_asset_repository.loan_payments(&loan_ids)?;
+        let timezone = self.timezone();
+        // One calculation per scheduled loan gives both its value and its card summary.
+        let mut loan_values = std::collections::HashMap::new();
+        let mut loan_summaries = std::collections::HashMap::new();
+        for asset in &alternative_assets {
+            if asset.kind != AssetKind::Liability {
+                continue;
+            }
+            let metadata = asset.metadata.clone().unwrap_or_else(|| json!({}));
+            let calculation = if metadata.get(super::loan::LOAN_PROJECTION_KEY).is_some() {
+                let history = self.quote_service.get_historical_quotes(&asset.id)?;
+                let dated: Vec<LoanPayment> = payments
+                    .remove(&asset.id)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|payment| payment.dated(timezone))
+                    .collect();
+                super::loan::loan_calculation(&metadata, &history, &dated, as_of)
+            } else {
+                None
+            };
+            if let Some(value) = calculation.as_ref().and_then(super::loan::loan_balance) {
+                loan_values.insert(asset.id.clone(), value);
+            }
+            loan_summaries.insert(
+                asset.id.clone(),
+                LoanSummary::new(&metadata, calculation.as_ref()),
+            );
+        }
+
+        // Build AlternativeHolding for each asset
+        let holdings: Vec<AlternativeHolding> = alternative_assets
+            .into_iter()
+            .filter_map(|asset| {
+                let quote = quotes.get(&asset.id);
+                // A deleted final confirmation must not hide a loan whose original
+                // terms still provide an authoritative estimated balance.
+                let market_value = loan_values
+                    .get(&asset.id)
+                    .copied()
+                    .or_else(|| quote.map(|q| q.close))?;
+                let valuation_date = quote
+                    .map(|q| q.timestamp)
+                    .unwrap_or_else(|| as_of.and_time(chrono::NaiveTime::MIN).and_utc());
+
+                // Liabilities store their original amount separately from the
+                // purchase price used by other alternative assets.
+                let purchase_price = asset
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("purchase_price").or_else(|| m.get("original_amount")))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<Decimal>().ok());
+
+                // Liabilities use origination_date instead of purchase_date.
+                let purchase_date = asset
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("purchase_date").or_else(|| m.get("origination_date")))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok());
+
+                // Extract linked_asset_id from metadata (for liabilities)
+                let linked_asset_id = asset
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("linked_asset_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                // Calculate unrealized gain if we have purchase price
+                let (unrealized_gain, unrealized_gain_pct) = if let Some(pp) = purchase_price {
+                    let gain = market_value - pp;
+                    let pct = if pp != Decimal::ZERO {
+                        Some(gain / pp)
+                    } else {
+                        None
+                    };
+                    (Some(gain), pct)
+                } else {
+                    (None, None)
+                };
+
+                Some(AlternativeHolding {
+                    id: asset.id.clone(),
+                    kind: asset.kind.clone(),
+                    name: asset
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| asset.display_code.clone().unwrap_or_default()),
+                    symbol: asset.display_code.unwrap_or_default(),
+                    currency: asset.quote_ccy,
+                    market_value,
+                    purchase_price,
+                    purchase_date,
+                    unrealized_gain,
+                    unrealized_gain_pct,
+                    valuation_date,
+                    metadata: asset.metadata,
+                    linked_asset_id,
+                    notes: asset.notes,
+                    loan: loan_summaries.remove(&asset.id),
+                })
+            })
+            .collect();
+
+        debug!("Found {} alternative holdings", holdings.len());
+        Ok(holdings)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assets::alternative_assets_traits::AlternativeAssetRepositoryTrait;
+    use crate::errors::{DatabaseError, Error, Result};
+    use crate::quotes::{
+        LatestQuotePair, LatestQuoteSnapshot, ProviderInfo, Quote, QuoteServiceTrait,
+        QuoteSyncState, SymbolSearchResult, SymbolSyncPlan, SyncMode, SyncResult,
+    };
+    use chrono::NaiveDate;
+    use std::collections::{HashMap, HashSet};
+
+    // ---------------------------------------------------------------------------
+    // Minimal mock: QuoteService
+    // Only the two methods called by get_alternative_holdings are meaningful;
+    // everything else panics so accidental calls are caught immediately.
+    //
+    // Crucially, get_latest_quotes returns the "bad" future-zero quote for the
+    // asset. If the implementation accidentally calls the old method instead of
+    // get_latest_quotes_as_of, the returned market_value will be 0 and the
+    // assert_eq!(…, Decimal::new(180_000, 0)) will fail.
+    // ---------------------------------------------------------------------------
+    struct MockQuoteService {
+        cutoff: Arc<std::sync::Mutex<Option<NaiveDate>>>,
+        /// Quotes returned by get_latest_quotes_as_of (correct, today-bounded path).
+        as_of_quotes: HashMap<String, Quote>,
+        /// Quotes returned by get_latest_quotes (old, unbounded path — should NOT be called).
+        latest_quotes: HashMap<String, Quote>,
+    }
+
+    #[async_trait]
+    impl QuoteServiceTrait for MockQuoteService {
+        fn get_latest_quote(&self, _symbol: &str) -> Result<Quote> {
+            unimplemented!("not used in this test")
+        }
+
+        fn get_latest_quotes(&self, symbols: &[String]) -> Result<HashMap<String, Quote>> {
+            // Intentionally returns "bad" future-zero quotes — fail the test if called.
+            Ok(symbols
+                .iter()
+                .filter_map(|s| self.latest_quotes.get(s).cloned().map(|q| (s.clone(), q)))
+                .collect())
+        }
+
+        fn get_latest_quotes_as_of(
+            &self,
+            symbols: &[String],
+            as_of: NaiveDate,
+        ) -> Result<HashMap<String, Quote>> {
+            *self.cutoff.lock().unwrap() = Some(as_of);
+            Ok(symbols
+                .iter()
+                .filter_map(|s| self.as_of_quotes.get(s).cloned().map(|q| (s.clone(), q)))
+                .collect())
+        }
+
+        fn get_sparse_asset_market_facts(
+            &self,
+            _requests: &[(String, NaiveDate)],
+        ) -> Result<crate::quotes::SparseAssetMarketFacts> {
+            Err(Error::Unexpected(
+                "MockQuoteService::get_sparse_asset_market_facts should not be called".to_string(),
+            ))
+        }
+
+        fn get_latest_quotes_snapshot(
+            &self,
+            _asset_ids: &[String],
+        ) -> Result<HashMap<String, LatestQuoteSnapshot>> {
+            unimplemented!("not used in this test")
+        }
+
+        fn get_latest_quotes_pair(
+            &self,
+            _symbols: &[String],
+        ) -> Result<HashMap<String, LatestQuotePair>> {
+            unimplemented!("not used in this test")
+        }
+
+        fn get_historical_quotes(&self, symbol: &str) -> Result<Vec<Quote>> {
+            Ok(self
+                .as_of_quotes
+                .values()
+                .filter(|q| q.asset_id == symbol)
+                .cloned()
+                .collect())
+        }
+
+        fn get_all_historical_quotes(&self) -> Result<HashMap<String, Vec<(NaiveDate, Quote)>>> {
+            unimplemented!("not used in this test")
+        }
+
+        fn get_quotes_in_range(
+            &self,
+            _symbols: &HashSet<String>,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<Quote>> {
+            unimplemented!("not used in this test")
+        }
+
+        fn get_quotes_in_range_filled(
+            &self,
+            _symbols: &HashSet<String>,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<Quote>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn get_daily_quotes(
+            &self,
+            _asset_ids: &HashSet<String>,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<HashMap<NaiveDate, HashMap<String, Quote>>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn add_quote(&self, _quote: &Quote) -> Result<Quote> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn update_quote(&self, _quote: Quote) -> Result<Quote> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn delete_quote(&self, _quote_id: &str) -> Result<()> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn bulk_upsert_quotes(&self, _quotes: Vec<Quote>) -> Result<usize> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn search_symbol(&self, _query: &str) -> Result<Vec<SymbolSearchResult>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn search_symbol_with_currency(
+            &self,
+            _query: &str,
+            _account_currency: Option<&str>,
+        ) -> Result<Vec<SymbolSearchResult>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn get_asset_profile(
+            &self,
+            _asset: &crate::assets::assets_model::Asset,
+        ) -> Result<crate::assets::assets_model::ProviderProfile> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn fetch_quotes_from_provider(
+            &self,
+            _asset_id: &str,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<Quote>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn fetch_quotes_for_symbol(
+            &self,
+            _symbol: &str,
+            _currency: &str,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> Result<Vec<Quote>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn sync(
+            &self,
+            _mode: SyncMode,
+            _asset_ids: Option<Vec<String>>,
+        ) -> Result<SyncResult> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn resync(&self, _asset_ids: Option<Vec<String>>) -> Result<SyncResult> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn refresh_sync_state(&self) -> Result<()> {
+            unimplemented!("not used in this test")
+        }
+
+        fn get_sync_plan(&self) -> Result<Vec<SymbolSyncPlan>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn handle_activity_created(
+            &self,
+            _symbol: &str,
+            _activity_date: NaiveDate,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn handle_activity_deleted(&self, _symbol: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_sync_state(&self, _symbol: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_symbols_needing_sync(&self) -> Result<Vec<QuoteSyncState>> {
+            Ok(Vec::new())
+        }
+
+        fn get_sync_state(&self, _symbol: &str) -> Result<Option<QuoteSyncState>> {
+            Ok(None)
+        }
+
+        async fn mark_profile_enriched(&self, _symbol: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_assets_needing_profile_enrichment(&self) -> Result<Vec<QuoteSyncState>> {
+            Ok(Vec::new())
+        }
+
+        fn get_sync_states_with_errors(&self) -> Result<Vec<QuoteSyncState>> {
+            Ok(Vec::new())
+        }
+
+        async fn reset_sync_errors(&self, _asset_ids: &[String]) -> Result<()> {
+            Ok(())
+        }
+
+        async fn reset_sync_state_for_profile_change(&self, _asset_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn update_position_status_from_holdings(
+            &self,
+            _current_holdings: &HashMap<String, rust_decimal::Decimal>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_providers_info(&self) -> Result<Vec<ProviderInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn update_provider_settings(
+            &self,
+            _provider_id: &str,
+            _priority: i32,
+            _enabled: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Minimal mock: AssetRepository — returns a fixed list of assets.
+    // ---------------------------------------------------------------------------
+    struct MockAssetRepository {
+        assets: Vec<crate::assets::assets_model::Asset>,
+    }
+
+    #[async_trait]
+    impl AssetRepositoryTrait for MockAssetRepository {
+        async fn create(&self, _new_asset: NewAsset) -> Result<crate::assets::assets_model::Asset> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn create_batch(
+            &self,
+            _new_assets: Vec<NewAsset>,
+        ) -> Result<Vec<crate::assets::assets_model::Asset>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn update_profile(
+            &self,
+            _asset_id: &str,
+            _payload: crate::assets::UpdateAssetProfile,
+        ) -> Result<crate::assets::assets_model::Asset> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn update_quote_mode(
+            &self,
+            _asset_id: &str,
+            _quote_mode: &str,
+        ) -> Result<crate::assets::assets_model::Asset> {
+            unimplemented!("not used in this test")
+        }
+
+        fn get_by_id(&self, asset_id: &str) -> Result<crate::assets::assets_model::Asset> {
+            self.assets
+                .iter()
+                .find(|a| a.id == asset_id)
+                .cloned()
+                .ok_or_else(|| Error::Database(DatabaseError::NotFound(asset_id.to_string())))
+        }
+
+        fn list(&self) -> Result<Vec<crate::assets::assets_model::Asset>> {
+            Ok(self.assets.clone())
+        }
+
+        fn list_by_asset_ids(
+            &self,
+            asset_ids: &[String],
+        ) -> Result<Vec<crate::assets::assets_model::Asset>> {
+            Ok(self
+                .assets
+                .iter()
+                .filter(|a| asset_ids.contains(&a.id))
+                .cloned()
+                .collect())
+        }
+
+        async fn delete(&self, _asset_id: &str) -> Result<()> {
+            unimplemented!("not used in this test")
+        }
+
+        fn search_by_symbol(
+            &self,
+            _query: &str,
+        ) -> Result<Vec<crate::assets::assets_model::Asset>> {
+            unimplemented!("not used in this test")
+        }
+
+        fn find_by_instrument_key(
+            &self,
+            _instrument_key: &str,
+        ) -> Result<Option<crate::assets::assets_model::Asset>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn cleanup_legacy_metadata(&self, _asset_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn deactivate(&self, _asset_id: &str) -> Result<()> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn reactivate(&self, _asset_id: &str) -> Result<()> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn copy_user_metadata(&self, _source_id: &str, _target_id: &str) -> Result<()> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn deactivate_orphaned_investments(&self) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Minimal mock: AlternativeAssetRepository — records metadata writes
+    // ---------------------------------------------------------------------------
+    #[derive(Default)]
+    struct MockAltAssetRepository {
+        metadata_writes: std::sync::Mutex<Vec<(String, Option<Value>)>>,
+    }
+
+    #[async_trait]
+    impl AlternativeAssetRepositoryTrait for MockAltAssetRepository {
+        async fn delete_alternative_asset(&self, _asset_id: &str) -> Result<()> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn update_asset_metadata(
+            &self,
+            asset_id: &str,
+            metadata: Option<serde_json::Value>,
+        ) -> Result<()> {
+            self.metadata_writes
+                .lock()
+                .unwrap()
+                .push((asset_id.to_string(), metadata));
+            Ok(())
+        }
+
+        fn find_liabilities_linked_to(&self, _linked_asset_id: &str) -> Result<Vec<String>> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn update_asset_details(
+            &self,
+            _asset_id: &str,
+            _name: Option<&str>,
+            _display_code: Option<&str>,
+            _metadata: Option<serde_json::Value>,
+            _notes: Option<&str>,
+        ) -> Result<()> {
+            unimplemented!("not used in this test")
+        }
+
+        async fn update_loan(
+            &self,
+            _asset_id: &str,
+            _change: crate::assets::LoanChange,
+        ) -> Result<crate::assets::loan::LoanUpdate> {
+            unimplemented!("not used in this test")
+        }
+
+        fn loan_payments(
+            &self,
+            _loan_ids: &[String],
+        ) -> Result<HashMap<String, Vec<crate::assets::loan::StoredPayment>>> {
+            Ok(HashMap::new())
+        }
+
+        async fn update_payment_tag(
+            &self,
+            _activity_id: &str,
+            _loan_id: Option<&str>,
+            _change: crate::assets::PaymentTagChange,
+        ) -> Result<Option<crate::activities::Activity>> {
+            unimplemented!("not used in this test")
+        }
+    }
+
+    // Helper: build a minimal Quote for a given asset + close value + date.
+    fn make_quote(asset_id: &str, close: Decimal, day: NaiveDate) -> Quote {
+        use chrono::{TimeZone, Utc};
+        let ts = Utc.from_utc_datetime(&day.and_hms_opt(12, 0, 0).unwrap());
+        Quote {
+            id: uuid::Uuid::new_v4().to_string(),
+            asset_id: asset_id.to_string(),
+            timestamp: ts,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            adjclose: close,
+            volume: Decimal::ZERO,
+            currency: "EUR".to_string(),
+            data_source: "MANUAL".to_string(),
+            created_at: Utc::now(),
+            notes: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_alternative_asset_kind() {
+        // Valid alternative asset kinds
+        assert!(
+            AlternativeAssetService::validate_alternative_asset_kind(&AssetKind::Property).is_ok()
+        );
+        assert!(
+            AlternativeAssetService::validate_alternative_asset_kind(&AssetKind::Vehicle).is_ok()
+        );
+        assert!(
+            AlternativeAssetService::validate_alternative_asset_kind(&AssetKind::Collectible)
+                .is_ok()
+        );
+        assert!(AlternativeAssetService::validate_alternative_asset_kind(
+            &AssetKind::PreciousMetal
+        )
+        .is_ok());
+        assert!(
+            AlternativeAssetService::validate_alternative_asset_kind(&AssetKind::Liability).is_ok()
+        );
+        assert!(
+            AlternativeAssetService::validate_alternative_asset_kind(&AssetKind::Other).is_ok()
+        );
+
+        // Invalid asset kinds
+        assert!(
+            AlternativeAssetService::validate_alternative_asset_kind(&AssetKind::Investment)
+                .is_err()
+        );
+        assert!(AlternativeAssetService::validate_alternative_asset_kind(&AssetKind::Fx).is_err());
+    }
+
+    #[test]
+    fn test_build_asset_metadata() {
+        let request = CreateAlternativeAssetRequest {
+            kind: AssetKind::Property,
+            name: "Beach House".to_string(),
+            currency: "USD".to_string(),
+            current_value: Decimal::new(450000, 0),
+            value_date: chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+            purchase_price: Some(Decimal::new(400000, 0)),
+            purchase_date: Some(chrono::NaiveDate::from_ymd_opt(2020, 3, 1).unwrap()),
+            metadata: Some(json!({"sub_type": "residence"})),
+            linked_asset_id: None,
+            loan: None,
+        };
+
+        let metadata = AlternativeAssetService::build_asset_metadata(&request);
+        assert!(metadata.is_some());
+        let meta = metadata.unwrap();
+        assert_eq!(meta.get("sub_type").unwrap(), "residence");
+        assert!(meta.get("purchase_price").is_some());
+        assert!(meta.get("purchase_date").is_some());
+    }
+
+    #[tokio::test]
+    async fn link_liability_preserves_existing_metadata() {
+        let original = json!({
+            "sub_type": "mortgage",
+            "original_amount": "500000",
+            "origination_date": "2020-01-01",
+            "purchase_price": "500000",
+            "purchase_date": "2020-01-01",
+            "custom": { "label": "keep me" },
+        });
+        let mut previously_linked = original.clone();
+        previously_linked["linked_asset_id"] = json!("old-property");
+
+        for metadata in [None, Some(original), Some(previously_linked)] {
+            let alt_repo = Arc::new(MockAltAssetRepository::default());
+            let asset_repo = MockAssetRepository {
+                assets: vec![
+                    super::super::Asset {
+                        id: "mortgage".into(),
+                        kind: AssetKind::Liability,
+                        metadata: metadata.clone(),
+                        ..Default::default()
+                    },
+                    super::super::Asset {
+                        id: "property".into(),
+                        kind: AssetKind::Property,
+                        ..Default::default()
+                    },
+                ],
+            };
+            let service = AlternativeAssetService::new(
+                alt_repo.clone(),
+                Arc::new(asset_repo),
+                Arc::new(MockQuoteService {
+                    cutoff: Arc::default(),
+                    as_of_quotes: HashMap::new(),
+                    latest_quotes: HashMap::new(),
+                }),
+            );
+            let response = service
+                .link_liability(LinkLiabilityRequest {
+                    liability_id: "mortgage".into(),
+                    target_asset_id: "property".into(),
+                })
+                .await
+                .unwrap();
+
+            let mut expected = metadata.unwrap_or_else(|| json!({}));
+            expected["linked_asset_id"] = json!("property");
+            assert_eq!(response.linked_asset_id.as_deref(), Some("property"));
+            assert_eq!(
+                *alt_repo.metadata_writes.lock().unwrap(),
+                vec![("mortgage".into(), Some(expected))],
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_and_remove_linked_asset_id() {
+        let metadata = AlternativeAssetService::set_linked_asset_id(None, "some-uuid-for-property");
+        assert_eq!(
+            metadata.get("linked_asset_id").unwrap(),
+            "some-uuid-for-property"
+        );
+
+        let linked_id = AlternativeAssetService::get_linked_asset_id(&Some(metadata.clone()));
+        assert_eq!(linked_id, Some("some-uuid-for-property".to_string()));
+
+        let removed = AlternativeAssetService::remove_linked_asset_id(Some(metadata));
+        assert!(removed.is_none()); // Only had linked_asset_id, so should be None when removed
+    }
+
+    /// Regression test for: liability with a future-dated 0 quote must NOT appear
+    /// as "fully paid" in today's holdings.
+    ///
+    /// The mock's `get_latest_quotes` returns a zero quote dated 2041-01-01 (the
+    /// planned payoff date). The mock's `get_latest_quotes_as_of` returns the
+    /// correct today-bounded quote with close = 180_000. If the implementation
+    /// accidentally calls the old method the assertion will fail with 0 ≠ 180_000.
+    #[test]
+    fn get_alternative_holdings_uses_past_quote_for_liability_with_future_zero() {
+        const ASSET_ID: &str = "mortgage-001";
+
+        let past_day = NaiveDate::from_ymd_opt(2025, 11, 1).unwrap();
+        let future_day = NaiveDate::from_ymd_opt(2041, 1, 1).unwrap();
+
+        let past_quote = make_quote(ASSET_ID, Decimal::new(180_000, 0), past_day);
+        let future_zero_quote = make_quote(ASSET_ID, Decimal::ZERO, future_day);
+
+        let cutoff = Arc::new(std::sync::Mutex::new(None));
+        let quote_svc = MockQuoteService {
+            cutoff: cutoff.clone(),
+            as_of_quotes: [(ASSET_ID.to_string(), past_quote)].into_iter().collect(),
+            latest_quotes: [(ASSET_ID.to_string(), future_zero_quote)]
+                .into_iter()
+                .collect(),
+        };
+
+        let liability = crate::assets::assets_model::Asset {
+            id: ASSET_ID.to_string(),
+            kind: AssetKind::Liability,
+            name: Some("Home Mortgage".to_string()),
+            display_code: Some("Mortgage".to_string()),
+            quote_ccy: "EUR".to_string(),
+            is_active: true,
+            quote_mode: QuoteMode::Manual,
+            metadata: Some(json!({
+                "original_amount": "200000",
+                "purchase_price": "200000",
+            })),
+            ..Default::default()
+        };
+
+        let asset_repo = MockAssetRepository {
+            assets: vec![liability],
+        };
+        let alt_repo = MockAltAssetRepository::default();
+
+        let timezone = Arc::new(RwLock::new("Pacific/Kiritimati".to_string()));
+        let service = AlternativeAssetService::new(
+            Arc::new(alt_repo),
+            Arc::new(asset_repo),
+            Arc::new(quote_svc),
+        )
+        .with_timezone(timezone.clone());
+
+        let holdings = service
+            .get_alternative_holdings()
+            .expect("get_alternative_holdings should succeed");
+
+        for zone in ["Pacific/Kiritimati", "Etc/GMT+12"] {
+            *timezone.write().unwrap() = zone.to_string();
+            service.get_alternative_holdings().unwrap();
+            assert_eq!(
+                *cutoff.lock().unwrap(),
+                Some(user_today(parse_user_timezone_or_default(zone)))
+            );
+        }
+
+        assert_eq!(holdings.len(), 1, "expected exactly one holding");
+        assert_eq!(
+            holdings[0].market_value,
+            Decimal::new(180_000, 0),
+            "market_value must reflect the past-dated quote, not the future 0 payoff row"
+        );
+    }
+    #[test]
+    fn automated_loan_holdings_use_shared_as_of_calculation() {
+        let today = Utc::now().date_naive();
+        let initial = today - chrono::Days::new(28);
+        let first = today - chrono::Days::new(14);
+        let quote = make_quote("loan", Decimal::new(1200, 0), initial);
+        let asset = crate::assets::Asset {
+            id: "loan".into(),
+            kind: AssetKind::Liability,
+            quote_ccy: "EUR".into(),
+            metadata: Some(
+                json!({"loan_projection": {"version": 1,"annualRate":0,"paymentAmount":100,"frequency":"biweekly","firstPaymentDate":first.to_string(),"paymentCount":12}}),
+            ),
+            ..Default::default()
+        };
+        let quotes = MockQuoteService {
+            cutoff: Arc::new(std::sync::Mutex::new(None)),
+            as_of_quotes: [("loan".into(), quote)].into_iter().collect(),
+            latest_quotes: HashMap::new(),
+        };
+        let service = AlternativeAssetService::new(
+            Arc::new(MockAltAssetRepository::default()),
+            Arc::new(MockAssetRepository {
+                assets: vec![asset],
+            }),
+            Arc::new(quotes),
+        )
+        .with_timezone(Arc::new(RwLock::new("UTC".into())));
+        assert_eq!(
+            service.get_alternative_holdings().unwrap()[0].market_value,
+            Decimal::new(1000, 0)
+        );
+    }
+    #[test]
+    fn automated_loan_remains_visible_without_confirmed_balances() {
+        let today = Utc::now().date_naive();
+        let initial = today - chrono::Days::new(28);
+        let first = today - chrono::Days::new(14);
+        let asset = crate::assets::Asset {
+            id: "loan".into(),
+            kind: AssetKind::Liability,
+            quote_ccy: "EUR".into(),
+            metadata: Some(json!({
+                "original_amount": "1200",
+                "origination_date": initial.to_string(),
+                "loan_projection": {"version": 1,"annualRate":0,"paymentAmount":100,
+                    "frequency":"biweekly","firstPaymentDate":first.to_string(),"paymentCount":12}
+            })),
+            ..Default::default()
+        };
+        let service = AlternativeAssetService::new(
+            Arc::new(MockAltAssetRepository::default()),
+            Arc::new(MockAssetRepository {
+                assets: vec![asset],
+            }),
+            Arc::new(MockQuoteService {
+                cutoff: Arc::new(std::sync::Mutex::new(None)),
+                as_of_quotes: HashMap::new(),
+                latest_quotes: HashMap::new(),
+            }),
+        )
+        .with_timezone(Arc::new(RwLock::new("UTC".into())));
+        let holdings = service.get_alternative_holdings().unwrap();
+        assert_eq!(holdings.len(), 1);
+        assert_eq!(holdings[0].id, "loan");
+        assert_eq!(holdings[0].market_value, Decimal::new(1000, 0));
+    }
+
+    #[test]
+    fn liability_holdings_carry_the_summary_of_their_valuation() {
+        let today = Utc::now().date_naive();
+        let initial = today - chrono::Days::new(28);
+        let first = today - chrono::Days::new(14);
+        let loan = crate::assets::Asset {
+            id: "loan".into(),
+            kind: AssetKind::Liability,
+            quote_ccy: "EUR".into(),
+            metadata: Some(json!({
+                "original_amount": "1200",
+                "origination_date": initial.to_string(),
+                "loan_projection": {"version": 1,"annualRate":0,"paymentAmount":100,
+                    "frequency":"biweekly","firstPaymentDate":first.to_string(),"paymentCount":12}
+            })),
+            ..Default::default()
+        };
+        let house = crate::assets::Asset {
+            id: "house".into(),
+            kind: AssetKind::Property,
+            quote_ccy: "EUR".into(),
+            ..Default::default()
+        };
+        let service = AlternativeAssetService::new(
+            Arc::new(MockAltAssetRepository::default()),
+            Arc::new(MockAssetRepository {
+                assets: vec![loan, house],
+            }),
+            Arc::new(MockQuoteService {
+                cutoff: Arc::new(std::sync::Mutex::new(None)),
+                as_of_quotes: [(
+                    "house".into(),
+                    make_quote("house", Decimal::new(5000, 0), initial),
+                )]
+                .into_iter()
+                .collect(),
+                latest_quotes: HashMap::new(),
+            }),
+        )
+        .with_timezone(Arc::new(RwLock::new("UTC".into())));
+        let holdings = service.get_alternative_holdings().unwrap();
+        let loan = holdings.iter().find(|h| h.id == "loan").unwrap();
+        let summary = loan.loan.as_ref().expect("a liability has a summary");
+        assert!(summary.scheduled);
+        assert_eq!(summary.original_amount, Some(1200.0));
+        assert_eq!(summary.payment_amount, Some(100.0));
+        assert_eq!(
+            summary.frequency,
+            Some(crate::assets::loan::LoanFrequency::Biweekly)
+        );
+        // Twelve fortnightly payments from the first, at 0%.
+        assert_eq!(
+            summary.payoff_date,
+            Some(first + chrono::Days::new(11 * 14))
+        );
+        let house = holdings.iter().find(|h| h.id == "house").unwrap();
+        assert!(house.loan.is_none());
+    }
+}

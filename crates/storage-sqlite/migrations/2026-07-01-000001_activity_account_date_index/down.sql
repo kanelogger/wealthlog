@@ -1,0 +1,1 @@
+DROP INDEX idx_activities_account_date;

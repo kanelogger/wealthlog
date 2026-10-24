@@ -1,0 +1,25 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "ES2024.Promise", "DOM", "DOM.Iterable"],
+    "types": ["@tauri-apps/api", "vitest/globals", "node"],
+    "noEmit": true,
+    "composite": false,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@wealthfolio/ui": ["../../packages/ui/src"],
+      "@wealthfolio/ui/*": ["../../packages/ui/src/*"],
+      "#platform": ["./src/adapters/tauri/core"]
+    }
+  },
+  "include": ["src"],
+  "references": [
+    {
+      "path": "./tsconfig.node.json"
+    },
+    {
+      "path": "../../packages/ui"
+    }
+  ]
+}

@@ -1,0 +1,889 @@
+//! Rules resolver - deterministic MIC->suffix resolution.
+//!
+//! This resolver applies deterministic rules to convert canonical instruments
+//! to provider-specific symbols. It uses the exchange map for securities
+//! and provider-specific format rules for FX, crypto, and metals.
+
+use std::sync::Arc;
+
+use log::warn;
+
+use crate::errors::MarketDataError;
+use crate::models::{Currency, InstrumentId, ProviderId, ProviderInstrument, QuoteContext};
+
+use super::exchange_suffixes::{has_unrecognized_dotted_suffix, ExchangeMap};
+use super::traits::{ResolutionSource, ResolvedInstrument, Resolver};
+use super::yahoo_equity_base_to_provider;
+
+/// Resolves provider instruments from deterministic MIC->suffix rules.
+///
+/// This resolver handles:
+/// - Securities: Uses exchange map to add provider-specific suffixes
+/// - FX: Formats currency pairs according to provider conventions
+/// - Crypto: Formats crypto pairs according to provider conventions
+/// - Metals: Maps metal codes to provider-specific symbols
+///
+/// # Supported Providers
+///
+/// - `YAHOO`: Yahoo Finance format (SHOP.TO, BTC-USD, EURUSD=X)
+/// - `ALPHA_VANTAGE`: AlphaVantage format (SHOP.TRT, CryptoPair, FxPair)
+/// - `METAL_PRICE_API`: Metal Price API format
+pub struct RulesResolver {
+    exchange_map: ExchangeMap,
+}
+
+fn looks_like_isin(value: &str) -> bool {
+    let bytes = value.trim().as_bytes();
+    bytes.len() == 12
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2..11]
+            .iter()
+            .all(|character| character.is_ascii_alphanumeric())
+        && bytes[11].is_ascii_digit()
+}
+
+impl RulesResolver {
+    /// Create a new RulesResolver with the default exchange map.
+    pub fn new() -> Self {
+        Self {
+            exchange_map: ExchangeMap::new(),
+        }
+    }
+
+    /// Create a RulesResolver with a custom exchange map.
+    pub fn with_exchange_map(exchange_map: ExchangeMap) -> Self {
+        Self { exchange_map }
+    }
+
+    /// Get the expected currency for an equity on a provider.
+    pub fn get_equity_currency(
+        &self,
+        mic: &Option<std::borrow::Cow<'static, str>>,
+        provider: &ProviderId,
+    ) -> Option<Currency> {
+        let mic = mic.as_ref()?;
+        self.exchange_map
+            .get_currency(mic, provider)
+            .map(|s| Currency::from(s.to_string()))
+    }
+
+    /// Resolve an equity instrument.
+    ///
+    /// Returns the instrument alongside the source describing how much the
+    /// symbol can be trusted: [`ResolutionSource::RulesFallback`] means a venue
+    /// was asked for and the symbol does not encode it.
+    fn resolve_equity(
+        &self,
+        ticker: &Arc<str>,
+        mic: &Option<std::borrow::Cow<'static, str>>,
+        isin: Option<&str>,
+        provider: &ProviderId,
+    ) -> Option<(ProviderInstrument, ResolutionSource)> {
+        // A multi-character dotted tail without a MIC may be an exchange suffix
+        // that this snapshot/provider map cannot uniquely identify. Treating it as a
+        // Yahoo share-class separator (`ABC.ZZ` -> `ABC-ZZ`) both changes the
+        // caller's identity and makes the result look verified. A one-character
+        // tail remains the established share-class convention (`BRK.B`). Exact
+        // provider symbols selected by search use the explicit-config resolver
+        // before reaching these generic rules.
+        let has_unverified_dotted_suffix = mic.is_none() && has_unrecognized_dotted_suffix(ticker);
+
+        if provider.as_ref() == "BOERSE_FRANKFURT" {
+            let has_mic = mic.is_some();
+            let provider_symbol = if !has_mic {
+                isin.map(str::trim)
+                    .filter(|value| looks_like_isin(value))
+                    .unwrap_or(ticker)
+            } else {
+                ticker
+            };
+            let mic = mic.as_deref().unwrap_or("XETR");
+            let source = if !has_mic && !looks_like_isin(provider_symbol) {
+                ResolutionSource::RulesFallback
+            } else {
+                ResolutionSource::Rules
+            };
+            return Some((
+                ProviderInstrument::EquitySymbol {
+                    symbol: Arc::from(format!("{}:{}", mic, provider_symbol)),
+                },
+                source,
+            ));
+        }
+
+        let provider_ticker = if provider.as_ref() == "YAHOO" && !has_unverified_dotted_suffix {
+            yahoo_equity_base_to_provider(ticker)
+        } else {
+            ticker.to_string()
+        };
+
+        let mut source = if has_unverified_dotted_suffix {
+            ResolutionSource::RulesFallback
+        } else {
+            ResolutionSource::Rules
+        };
+        let symbol = match mic {
+            Some(mic) => {
+                // Look up suffix for this MIC and provider, fallback to ticker only if not found
+                match self.exchange_map.get_suffix_checked(mic, provider) {
+                    Some((suffix, true)) => Arc::from(format!("{}{}", provider_ticker, suffix)),
+                    // Either the registry has no suffix for this venue on this
+                    // provider, or it has an empty one on a venue that does not
+                    // write its tickers bare. Both produce the same bare
+                    // ticker, and it is a guess rather than a resolution: it
+                    // addresses whichever listing the provider indexes under
+                    // that ticker, which is routinely a different instrument on
+                    // a different exchange. Report it and mark the result
+                    // untrusted so `check_profile` confirms what came back.
+                    Some((_, false)) | None => {
+                        warn!(
+                            "No usable {} symbol mapping for MIC '{}' - falling back to the bare ticker '{}', which is unverified and may be a different listing",
+                            provider, mic, provider_ticker
+                        );
+                        source = ResolutionSource::RulesFallback;
+                        Arc::from(provider_ticker)
+                    }
+                }
+            }
+            None => {
+                // No MIC = assume US market, no suffix needed
+                Arc::from(provider_ticker)
+            }
+        };
+
+        Some((ProviderInstrument::EquitySymbol { symbol }, source))
+    }
+
+    /// Resolve a crypto instrument.
+    fn resolve_crypto(
+        &self,
+        base: &Arc<str>,
+        quote: &Currency,
+        provider: &ProviderId,
+    ) -> Option<ProviderInstrument> {
+        match provider.as_ref() {
+            "YAHOO" => {
+                // Yahoo uses "BTC-USD" format
+                Some(ProviderInstrument::CryptoSymbol {
+                    symbol: Arc::from(format!("{}-{}", base, quote)),
+                })
+            }
+            "ALPHA_VANTAGE" => {
+                // AlphaVantage uses separate symbol and market
+                Some(ProviderInstrument::CryptoPair {
+                    symbol: Arc::from(base.as_ref()),
+                    market: quote.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve an FX instrument.
+    fn resolve_fx(
+        &self,
+        base: &Currency,
+        quote: &Currency,
+        provider: &ProviderId,
+    ) -> Option<ProviderInstrument> {
+        match provider.as_ref() {
+            "YAHOO" => {
+                // Yahoo uses "EURUSD=X" format
+                Some(ProviderInstrument::FxSymbol {
+                    symbol: Arc::from(format!("{}{}=X", base, quote)),
+                })
+            }
+            "ALPHA_VANTAGE" => {
+                // AlphaVantage uses from/to pair
+                Some(ProviderInstrument::FxPair {
+                    from: base.clone(),
+                    to: quote.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve a bond instrument by ISIN.
+    ///
+    /// Bonds use ISIN directly — no provider-specific symbol transformation needed.
+    /// Provider-specific ISIN filtering ensures bonds are routed to the correct provider:
+    /// - US_TREASURY_CALC: only US Treasury ISINs (US912*)
+    /// - BOERSE_FRANKFURT and others: all ISINs
+    fn resolve_bond(&self, isin: &Arc<str>, provider: &ProviderId) -> Option<ProviderInstrument> {
+        if provider.as_ref() == "US_TREASURY_CALC" && !isin.starts_with("US912") {
+            return None;
+        }
+        Some(ProviderInstrument::BondIsin { isin: isin.clone() })
+    }
+
+    /// Resolve an option instrument.
+    /// Yahoo and Alpha Vantage accept OCC symbols as equity-like symbols.
+    /// Alpha Vantage internally routes to the REALTIME_OPTIONS endpoint.
+    fn resolve_option(
+        &self,
+        occ_symbol: &Arc<str>,
+        provider: &ProviderId,
+    ) -> Option<ProviderInstrument> {
+        match provider.as_ref() {
+            "YAHOO" | "ALPHA_VANTAGE" => Some(ProviderInstrument::EquitySymbol {
+                symbol: occ_symbol.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Resolve a metal instrument.
+    fn resolve_metal(
+        &self,
+        code: &Arc<str>,
+        quote: &Currency,
+        provider: &ProviderId,
+    ) -> Option<ProviderInstrument> {
+        match provider.as_ref() {
+            "METAL_PRICE_API" => Some(ProviderInstrument::MetalSymbol {
+                symbol: Arc::from(code.as_ref()),
+                quote: quote.clone(),
+            }),
+            "YAHOO" => {
+                // Yahoo uses futures symbols for metals
+                let futures = match code.as_ref() {
+                    "XAU" => "GC=F", // Gold
+                    "XAG" => "SI=F", // Silver
+                    "XPT" => "PL=F", // Platinum
+                    "XPD" => "PA=F", // Palladium
+                    _ => return None,
+                };
+                Some(ProviderInstrument::EquitySymbol {
+                    symbol: Arc::from(futures),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Default for RulesResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Resolver for RulesResolver {
+    fn resolve(
+        &self,
+        provider: &ProviderId,
+        context: &QuoteContext,
+    ) -> Option<Result<ResolvedInstrument, MarketDataError>> {
+        // CUSTOM_SCRAPER: extract symbol from any instrument variant
+        if provider.as_ref() == "CUSTOM_SCRAPER" {
+            let symbol = match &context.instrument {
+                InstrumentId::Equity { ticker, .. } => ticker.clone(),
+                InstrumentId::Crypto { base, .. } => base.clone(),
+                InstrumentId::Fx { base, quote } => {
+                    Arc::from(format!("{}{}", base, quote).as_str())
+                }
+                InstrumentId::Metal { code, .. } => code.clone(),
+                InstrumentId::Bond { isin } => isin.clone(),
+                InstrumentId::Option { occ_symbol } => occ_symbol.clone(),
+            };
+            return Some(Ok(ResolvedInstrument {
+                instrument: ProviderInstrument::EquitySymbol { symbol },
+                source: ResolutionSource::Rules,
+            }));
+        }
+
+        let (instrument, source) = match &context.instrument {
+            InstrumentId::Equity { ticker, mic } => {
+                self.resolve_equity(ticker, mic, context.identifiers.isin.as_deref(), provider)?
+            }
+
+            InstrumentId::Crypto { base, quote } => (
+                self.resolve_crypto(base, quote, provider)?,
+                ResolutionSource::Rules,
+            ),
+
+            InstrumentId::Fx { base, quote } => (
+                self.resolve_fx(base, quote, provider)?,
+                ResolutionSource::Rules,
+            ),
+
+            InstrumentId::Metal { code, quote } => (
+                self.resolve_metal(code, quote, provider)?,
+                ResolutionSource::Rules,
+            ),
+
+            InstrumentId::Option { occ_symbol } => (
+                self.resolve_option(occ_symbol, provider)?,
+                ResolutionSource::Rules,
+            ),
+
+            InstrumentId::Bond { isin } => {
+                (self.resolve_bond(isin, provider)?, ResolutionSource::Rules)
+            }
+        };
+
+        Some(Ok(ResolvedInstrument { instrument, source }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_equity_context(ticker: &str, mic: Option<&'static str>) -> QuoteContext {
+        QuoteContext {
+            instrument: InstrumentId::Equity {
+                ticker: Arc::from(ticker),
+                mic: mic.map(|m| m.into()),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        }
+    }
+
+    fn make_fx_context(base: &'static str, quote: &'static str) -> QuoteContext {
+        QuoteContext {
+            instrument: InstrumentId::Fx {
+                base: base.into(),
+                quote: quote.into(),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        }
+    }
+
+    fn make_crypto_context(base: &str, quote: &'static str) -> QuoteContext {
+        QuoteContext {
+            instrument: InstrumentId::Crypto {
+                base: Arc::from(base),
+                quote: quote.into(),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        }
+    }
+
+    fn make_metal_context(code: &str, quote: &'static str) -> QuoteContext {
+        QuoteContext {
+            instrument: InstrumentId::Metal {
+                code: Arc::from(code),
+                quote: quote.into(),
+            },
+            identifiers: Default::default(),
+            overrides: None,
+            currency_hint: None,
+            preferred_provider: None,
+            bond_metadata: None,
+            custom_provider_code: None,
+        }
+    }
+
+    #[test]
+    fn test_resolve_us_equity_yahoo() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("AAPL", None);
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+        assert_eq!(resolved.source, ResolutionSource::Rules);
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "AAPL");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_canadian_equity_yahoo() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("SHOP", Some("XTSE"));
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "SHOP.TO");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    /// Cboe Canada is NEOE in ISO 10383 and `.NE` at Yahoo. Pinned because the
+    /// registry used to spell the venue `XNEO`, which is not a MIC at all, so a
+    /// broker reporting the real one resolved nothing.
+    #[test]
+    fn test_resolve_cboe_canada_equity_yahoo() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("ZAAA.F", Some("NEOE"));
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "ZAAA-F.NE");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_yahoo_share_class_uses_provider_hyphen() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("BRK.B", None);
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "BRK-B");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_yahoo_known_exchange_suffix_keeps_dot() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("VOD", Some("XLON"));
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "VOD.L");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_yahoo_share_class_with_exchange_suffix_formats_base_then_suffix() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("BRK.B", Some("XTSE"));
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "BRK-B.TO");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_alphavantage_share_class_keeps_dot() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("BRK.B", None);
+
+        let result = resolver.resolve(&"ALPHA_VANTAGE".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "BRK.B");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_canadian_equity_alphavantage() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("SHOP", Some("XTSE"));
+
+        let result = resolver.resolve(&"ALPHA_VANTAGE".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "SHOP.TRT");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_fx_yahoo() {
+        let resolver = RulesResolver::new();
+        let context = make_fx_context("EUR", "USD");
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::FxSymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "EURUSD=X");
+            }
+            _ => panic!("Expected FxSymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_fx_alphavantage() {
+        let resolver = RulesResolver::new();
+        let context = make_fx_context("EUR", "USD");
+
+        let result = resolver.resolve(&"ALPHA_VANTAGE".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::FxPair { from, to } => {
+                assert_eq!(from.as_ref(), "EUR");
+                assert_eq!(to.as_ref(), "USD");
+            }
+            _ => panic!("Expected FxPair"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_crypto_yahoo() {
+        let resolver = RulesResolver::new();
+        let context = make_crypto_context("BTC", "USD");
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::CryptoSymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "BTC-USD");
+            }
+            _ => panic!("Expected CryptoSymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_crypto_alphavantage() {
+        let resolver = RulesResolver::new();
+        let context = make_crypto_context("BTC", "USD");
+
+        let result = resolver.resolve(&"ALPHA_VANTAGE".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::CryptoPair { symbol, market } => {
+                assert_eq!(symbol.as_ref(), "BTC");
+                assert_eq!(market.as_ref(), "USD");
+            }
+            _ => panic!("Expected CryptoPair"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_metal_yahoo() {
+        let resolver = RulesResolver::new();
+        let context = make_metal_context("XAU", "USD");
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "GC=F");
+            }
+            _ => panic!("Expected EquitySymbol for metal futures"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_metal_api() {
+        let resolver = RulesResolver::new();
+        let context = make_metal_context("XAU", "USD");
+
+        let result = resolver.resolve(&"METAL_PRICE_API".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::MetalSymbol { symbol, quote } => {
+                assert_eq!(symbol.as_ref(), "XAU");
+                assert_eq!(quote.as_ref(), "USD");
+            }
+            _ => panic!("Expected MetalSymbol"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_unknown_provider() {
+        let resolver = RulesResolver::new();
+        let context = make_fx_context("EUR", "USD");
+
+        let result = resolver.resolve(&"UNKNOWN_PROVIDER".into(), &context);
+
+        // Should return None for unknown providers
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_unknown_mic() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("TEST", Some("UNKNOWN_MIC"));
+
+        let result = resolver.resolve(&"YAHOO".into(), &context);
+
+        // Unknown MICs still fall back to the bare ticker so pricing keeps
+        // working, but the result says so rather than passing as a resolution.
+        let resolved = result.unwrap().unwrap();
+        assert_eq!(resolved.source, ResolutionSource::RulesFallback);
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => assert_eq!(symbol.as_ref(), "TEST"),
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    /// A US venue resolves to the bare ticker by design - the registry holds an
+    /// empty suffix for it - so it must not be confused with a missing mapping.
+    #[test]
+    fn test_resolve_us_equity_is_not_a_fallback() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("AAPL", Some("XNAS"));
+
+        let resolved = resolver
+            .resolve(&"YAHOO".into(), &context)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.source, ResolutionSource::Rules);
+    }
+
+    #[test]
+    fn test_verified_us_bare_rules_cover_non_yahoo_quote_providers() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("AAPL", Some("XNAS"));
+
+        for provider in ["FINNHUB", "MARKETDATA_APP"] {
+            let resolved = resolver
+                .resolve(&provider.into(), &context)
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.source, ResolutionSource::Rules, "{provider}");
+            match resolved.instrument {
+                ProviderInstrument::EquitySymbol { symbol } => {
+                    assert_eq!(symbol.as_ref(), "AAPL", "{provider}");
+                }
+                _ => panic!("Expected EquitySymbol"),
+            }
+        }
+    }
+
+    /// No MIC means no venue was claimed, so the bare ticker is the whole
+    /// answer rather than a degraded one.
+    #[test]
+    fn test_resolve_without_mic_is_not_a_fallback() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("AAPL", None);
+
+        let resolved = resolver
+            .resolve(&"YAHOO".into(), &context)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.source, ResolutionSource::Rules);
+    }
+
+    #[test]
+    fn test_unverified_dotted_suffix_without_mic_is_an_exact_fallback() {
+        let resolver = RulesResolver::new();
+        for ticker in ["ABC.ZZ", "FOO.AE"] {
+            let context = make_equity_context(ticker, None);
+
+            let resolved = resolver
+                .resolve(&"YAHOO".into(), &context)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(resolved.source, ResolutionSource::RulesFallback);
+            match resolved.instrument {
+                ProviderInstrument::EquitySymbol { symbol } => {
+                    assert_eq!(symbol.as_ref(), ticker);
+                }
+                _ => panic!("Expected EquitySymbol"),
+            }
+
+            let resolved = resolver
+                .resolve(&"BOERSE_FRANKFURT".into(), &context)
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.source, ResolutionSource::RulesFallback);
+        }
+    }
+
+    /// Euronext Amsterdam has no verified Alpha Vantage symbol rule. Falling
+    /// back to the bare ticker can land on the US listing, so it is marked as
+    /// unverified rather than treated as a deterministic resolution.
+    #[test]
+    fn test_resolve_missing_provider_rule_is_a_fallback() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("ASML", Some("XAMS"));
+
+        let resolved = resolver
+            .resolve(&"ALPHA_VANTAGE".into(), &context)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.source, ResolutionSource::RulesFallback);
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => assert_eq!(symbol.as_ref(), "ASML"),
+            _ => panic!("Expected EquitySymbol"),
+        }
+    }
+
+    /// The registry has no Alpha Vantage suffix for the Korea Exchange - 42 of
+    /// its 75 venues carry a Yahoo entry only - so an AV lookup there is a guess
+    /// even though the MIC itself is known.
+    #[test]
+    fn test_resolve_known_mic_without_provider_mapping_is_a_fallback() {
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("005930", Some("XKRX"));
+
+        let resolved = resolver
+            .resolve(&"ALPHA_VANTAGE".into(), &context)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.source, ResolutionSource::RulesFallback);
+    }
+
+    #[test]
+    fn test_get_equity_currency() {
+        let resolver = RulesResolver::new();
+
+        // Toronto
+        let currency = resolver.get_equity_currency(&Some("XTSE".into()), &"YAHOO".into());
+        assert_eq!(currency.as_deref(), Some("CAD"));
+
+        // London (Yahoo returns prices in pence, so currency is GBp)
+        let currency = resolver.get_equity_currency(&Some("XLON".into()), &"YAHOO".into());
+        assert_eq!(currency.as_deref(), Some("GBp"));
+
+        // Tel Aviv fallback quote unit for listed securities.
+        let currency = resolver.get_equity_currency(&Some("XTAE".into()), &"YAHOO".into());
+        assert_eq!(currency.as_deref(), Some("ILA"));
+
+        // No MIC
+        let currency = resolver.get_equity_currency(&None, &"YAHOO".into());
+        assert!(currency.is_none());
+    }
+
+    #[test]
+    fn test_resolve_equity_boerse_frankfurt_bare_ticker() {
+        // BF needs the MIC to distinguish Xetra vs Frankfurt for both quotes and profiles.
+        let resolver = RulesResolver::new();
+        let context = make_equity_context("XDWD", Some("XETR"));
+
+        let result = resolver.resolve(&"BOERSE_FRANKFURT".into(), &context);
+
+        assert!(result.is_some());
+        let resolved = result.unwrap().unwrap();
+
+        match resolved.instrument {
+            ProviderInstrument::EquitySymbol { symbol } => {
+                assert_eq!(symbol.as_ref(), "XETR:XDWD");
+            }
+            _ => panic!("Expected EquitySymbol"),
+        }
+        assert_eq!(resolved.source, ResolutionSource::Rules);
+    }
+
+    #[test]
+    fn test_boerse_frankfurt_requires_a_venue_or_isin() {
+        let resolver = RulesResolver::new();
+
+        let unresolved = resolver
+            .resolve(
+                &"BOERSE_FRANKFURT".into(),
+                &make_equity_context("AAPL", None),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(unresolved.source, ResolutionSource::RulesFallback);
+        assert_eq!(unresolved.instrument.to_symbol_string(), "XETR:AAPL");
+
+        let isin_ticker = resolver
+            .resolve(
+                &"BOERSE_FRANKFURT".into(),
+                &make_equity_context("US0378331005", None),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(isin_ticker.source, ResolutionSource::Rules);
+        assert_eq!(
+            isin_ticker.instrument.to_symbol_string(),
+            "XETR:US0378331005"
+        );
+
+        let mut identified = make_equity_context("AAPL", None);
+        identified.identifiers.isin = Some("US0378331005".into());
+        let identified = resolver
+            .resolve(&"BOERSE_FRANKFURT".into(), &identified)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identified.source, ResolutionSource::Rules);
+        assert_eq!(
+            identified.instrument.to_symbol_string(),
+            "XETR:US0378331005"
+        );
+    }
+
+    #[test]
+    fn test_get_equity_currency_ignores_wrong_hint() {
+        // Simulates BATS@XLON: asset.quote_ccy="GBP" but Yahoo returns pence.
+        // The resolver should return "GBp" based on exchange metadata,
+        // regardless of what currency_hint says.
+        let resolver = RulesResolver::new();
+        let currency = resolver.get_equity_currency(&Some("XLON".into()), &"YAHOO".into());
+        assert_eq!(currency.as_deref(), Some("GBp"));
+
+        // Alpha Vantage correctly returns GBP (not pence) for XLON
+        let currency = resolver.get_equity_currency(&Some("XLON".into()), &"ALPHA_VANTAGE".into());
+        assert_eq!(currency.as_deref(), Some("GBP"));
+    }
+}

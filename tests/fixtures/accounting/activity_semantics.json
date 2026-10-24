@@ -1,0 +1,191 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "cash deposit is external income",
+      "accountType": "CASH",
+      "activityType": "DEPOSIT",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "100.00",
+        "gainDelta": "0.00",
+        "externalFlow": true,
+        "spendingDelta": "0.00",
+        "incomeDelta": "100.00"
+      }
+    },
+    {
+      "name": "cash withdrawal is an external expense",
+      "accountType": "CASH",
+      "activityType": "WITHDRAWAL",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "-100.00",
+        "netContributionDelta": "-100.00",
+        "gainDelta": "0.00",
+        "externalFlow": true,
+        "spendingDelta": "100.00",
+        "incomeDelta": "0.00"
+      }
+    },
+    {
+      "name": "cash interest is internal income",
+      "accountType": "CASH",
+      "activityType": "INTEREST",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "0.00",
+        "gainDelta": "100.00",
+        "externalFlow": false,
+        "spendingDelta": "0.00",
+        "incomeDelta": "100.00"
+      }
+    },
+    {
+      "name": "cash fee is an internal cost",
+      "accountType": "CASH",
+      "activityType": "FEE",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "-100.00",
+        "netContributionDelta": "0.00",
+        "gainDelta": "-100.00",
+        "externalFlow": false,
+        "spendingDelta": "100.00",
+        "incomeDelta": "0.00"
+      }
+    },
+    {
+      "name": "cash tax is an internal cost",
+      "accountType": "CASH",
+      "activityType": "TAX",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "-100.00",
+        "netContributionDelta": "0.00",
+        "gainDelta": "-100.00",
+        "externalFlow": false,
+        "spendingDelta": "100.00",
+        "incomeDelta": "0.00"
+      }
+    },
+    {
+      "name": "cash bonus is external income",
+      "accountType": "CASH",
+      "activityType": "CREDIT",
+      "subtype": "BONUS",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "100.00",
+        "gainDelta": "0.00",
+        "externalFlow": true,
+        "spendingDelta": "0.00",
+        "incomeDelta": "100.00"
+      }
+    },
+    {
+      "name": "cash reimbursement is an external expense reversal",
+      "accountType": "CASH",
+      "activityType": "CREDIT",
+      "subtype": "REIMBURSEMENT",
+      "isExternal": true,
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "100.00",
+        "gainDelta": "0.00",
+        "externalFlow": true,
+        "spendingDelta": "-100.00",
+        "incomeDelta": "0.00"
+      }
+    },
+    {
+      "name": "cash merchant refund can explicitly cross the boundary",
+      "accountType": "CASH",
+      "activityType": "CREDIT",
+      "subtype": "REFUND",
+      "isExternal": true,
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "100.00",
+        "gainDelta": "0.00",
+        "externalFlow": true,
+        "spendingDelta": "-100.00",
+        "incomeDelta": "0.00"
+      }
+    },
+    {
+      "name": "cash merchant rebate can explicitly cross the boundary",
+      "accountType": "CASH",
+      "activityType": "CREDIT",
+      "subtype": "REBATE",
+      "isExternal": true,
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "100.00",
+        "gainDelta": "0.00",
+        "externalFlow": true,
+        "spendingDelta": "-100.00",
+        "incomeDelta": "0.00"
+      }
+    },
+    {
+      "name": "securities refund defaults to an internal correction",
+      "accountType": "SECURITIES",
+      "activityType": "CREDIT",
+      "subtype": "REFUND",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "0.00",
+        "gainDelta": "100.00",
+        "externalFlow": false
+      }
+    },
+    {
+      "name": "securities rebate defaults to internal income",
+      "accountType": "SECURITIES",
+      "activityType": "CREDIT",
+      "subtype": "REBATE",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "0.00",
+        "gainDelta": "100.00",
+        "externalFlow": false
+      }
+    },
+    {
+      "name": "securities dividend is internal income",
+      "accountType": "SECURITIES",
+      "activityType": "DIVIDEND",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "0.00",
+        "gainDelta": "100.00",
+        "externalFlow": false
+      }
+    },
+    {
+      "name": "unknown cash credit is ignored by spending and internal to performance",
+      "accountType": "CASH",
+      "activityType": "CREDIT",
+      "subtype": "ADJUSTMENT",
+      "amount": "100.00",
+      "expected": {
+        "cashDelta": "100.00",
+        "netContributionDelta": "0.00",
+        "gainDelta": "100.00",
+        "externalFlow": false,
+        "spendingDelta": "0.00",
+        "incomeDelta": "0.00"
+      }
+    }
+  ]
+}

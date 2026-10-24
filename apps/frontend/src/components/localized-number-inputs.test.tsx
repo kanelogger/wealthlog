@@ -1,0 +1,319 @@
+import { fireEvent, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { createFormatter, FormattingProvider, MoneyInput, QuantityInput } from "@wealthfolio/ui";
+import { describe, expect, it, vi } from "vitest";
+
+function paste(text: string) {
+  return fireEvent.paste(screen.getByRole("textbox"), {
+    clipboardData: { getData: () => text },
+  });
+}
+
+describe("localized financial input typing", () => {
+  it.each([
+    ["money", "zh-CN", "1.5", "1.5", 1.5],
+    ["quantity", "zh-CN", "1.5", "1.5", 1.5],
+  ] as const)(
+    "accepts an alternate decimal separator in the %s input for %s",
+    async (inputKind, locale, typedValue, displayedValue, expected) => {
+      const user = userEvent.setup();
+      const onValueChange = vi.fn();
+      render(
+        <FormattingProvider locale={locale}>
+          {inputKind === "money" ? (
+            <MoneyInput onValueChange={onValueChange} />
+          ) : (
+            <QuantityInput onValueChange={onValueChange} />
+          )}
+        </FormattingProvider>,
+      );
+
+      const input = screen.getByRole<HTMLInputElement>("textbox");
+      await user.type(input, typedValue);
+
+      expect(input).toHaveValue(displayedValue);
+      // MoneyInput reports typing as a user edit via the second argument.
+      if (inputKind === "money") {
+        expect(onValueChange).toHaveBeenLastCalledWith(expected, true);
+      } else {
+        expect(onValueChange).toHaveBeenLastCalledWith(expected);
+      }
+    },
+  );
+
+  it.each([
+    ["money", 2, "12.345", "12.34", 12.34],
+    ["quantity", 4, "12.34567", "12.3456", 12.3456],
+  ] as const)(
+    "enforces the configured precision in the %s input",
+    async (inputKind, maxDecimalPlaces, typedValue, displayedValue, expected) => {
+      const user = userEvent.setup();
+      const onValueChange = vi.fn();
+      render(
+        <FormattingProvider locale="zh-CN">
+          {inputKind === "money" ? (
+            <MoneyInput maxDecimalPlaces={maxDecimalPlaces} onValueChange={onValueChange} />
+          ) : (
+            <QuantityInput maxDecimalPlaces={maxDecimalPlaces} onValueChange={onValueChange} />
+          )}
+        </FormattingProvider>,
+      );
+
+      const input = screen.getByRole<HTMLInputElement>("textbox");
+      await user.type(input, typedValue);
+
+      expect(input).toHaveValue(displayedValue);
+      if (inputKind === "money") {
+        expect(onValueChange).toHaveBeenLastCalledWith(expected, true);
+      } else {
+        expect(onValueChange).toHaveBeenLastCalledWith(expected);
+      }
+    },
+  );
+
+  it("allows negative quantities only when configured", async () => {
+    const user = userEvent.setup();
+    const onValueChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <QuantityInput allowNegative onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+
+    const input = screen.getByRole<HTMLInputElement>("textbox");
+    await user.type(input, "-12.5");
+
+    expect(input).toHaveValue("-12.5");
+    expect(onValueChange).toHaveBeenLastCalledWith(-12.5);
+  });
+
+  it("rejects negative keyboard values by default", async () => {
+    const user = userEvent.setup();
+    const onMoneyChange = vi.fn();
+    const onQuantityChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <MoneyInput aria-label="金额" onValueChange={onMoneyChange} />
+        <QuantityInput aria-label="数量" onValueChange={onQuantityChange} />
+      </FormattingProvider>,
+    );
+
+    await user.type(screen.getByRole("textbox", { name: "金额" }), "-12.5");
+    await user.type(screen.getByRole("textbox", { name: "数量" }), "-12.5");
+
+    expect(onMoneyChange).toHaveBeenLastCalledWith(12.5, true);
+    expect(onQuantityChange).toHaveBeenLastCalledWith(12.5);
+    expect(onMoneyChange.mock.calls.every(([value]) => value === undefined || value >= 0)).toBe(
+      true,
+    );
+    expect(onQuantityChange.mock.calls.every(([value]) => value === undefined || value >= 0)).toBe(
+      true,
+    );
+  });
+
+  it("renders configured grouping and fixed decimal scale", () => {
+    render(
+      <FormattingProvider locale="zh-CN">
+        <MoneyInput
+          aria-label="金额"
+          value={1234.5}
+          maxDecimalPlaces={2}
+          fixedDecimalScale
+          thousandSeparator
+        />
+        <QuantityInput aria-label="数量" value={1234.5} />
+      </FormattingProvider>,
+    );
+
+    expect(screen.getByRole("textbox", { name: "金额" })).toHaveValue("1,234.50");
+    expect(screen.getByRole("textbox", { name: "数量" })).toHaveValue("1,234.5");
+  });
+
+  it("keeps the legacy change contract when the preferred handler is absent", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <MoneyInput name="amount" onChange={onChange} />
+      </FormattingProvider>,
+    );
+
+    await user.type(screen.getByRole("textbox"), "12.5");
+
+    expect(onChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ target: { name: "amount", value: 12.5 } }),
+    );
+  });
+
+  it("prefers the numeric change handler over the legacy handler", async () => {
+    const user = userEvent.setup();
+    const onValueChange = vi.fn();
+    const onChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <QuantityInput onValueChange={onValueChange} onChange={onChange} />
+      </FormattingProvider>,
+    );
+
+    await user.type(screen.getByRole("textbox"), "12.5");
+
+    expect(onValueChange).toHaveBeenLastCalledWith(12.5);
+    expect(onChange).not.toHaveBeenCalled();
+  });
+});
+
+describe("localized financial input paste", () => {
+  it.each([
+    ["1234.56", 1234.56],
+    ["1,234.56", 1234.56],
+    ["$1,234.56", 1234.56],
+    ["USD 1,234.56", 1234.56],
+  ])("pastes %s using US formats", (clipboardValue, expected) => {
+    const onValueChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <MoneyInput onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+
+    paste(clipboardValue);
+
+    expect(onValueChange).toHaveBeenLastCalledWith(expected, true);
+  });
+
+  it.each([
+    ["1234.56", 1234.56],
+    ["1,234.56", 1234.56],
+    ["¥1,234.56", 1234.56],
+    ["CN¥1,234.56", 1234.56],
+  ])("pastes %s using China formats", (clipboardValue, expected) => {
+    const onValueChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <MoneyInput onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+
+    paste(clipboardValue);
+
+    expect(onValueChange).toHaveBeenLastCalledWith(expected, true);
+  });
+
+  it.each([
+    ["1.234,56", "money"],
+    ["-100", "money"],
+    ["1.234,56", "quantity"],
+    ["-100", "quantity"],
+  ] as const)(
+    "blocks rejected %s full-value pastes in %s inputs",
+    async (clipboardValue, inputKind) => {
+      const user = userEvent.setup();
+      const onValueChange = vi.fn();
+      render(
+        <FormattingProvider locale="zh-CN">
+          {inputKind === "money" ? (
+            <MoneyInput onValueChange={onValueChange} />
+          ) : (
+            <QuantityInput onValueChange={onValueChange} />
+          )}
+        </FormattingProvider>,
+      );
+      const input = screen.getByRole<HTMLInputElement>("textbox");
+
+      await user.click(input);
+      await user.paste(clipboardValue);
+
+      expect(input).toHaveValue("");
+      expect(onValueChange).not.toHaveBeenCalled();
+    },
+  );
+
+  it("uses the same locale-aware paste behavior for quantities", () => {
+    const onValueChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <QuantityInput onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+
+    paste("1,234.56");
+
+    expect(onValueChange).toHaveBeenLastCalledWith(1234.56);
+  });
+
+  it("pastes invariant decimals into German quantities", () => {
+    const onValueChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <QuantityInput onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+
+    paste("1234.56");
+
+    expect(onValueChange).toHaveBeenLastCalledWith(1234.56);
+  });
+
+  it("normalizes full-width CJK numeric input", () => {
+    const onValueChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <MoneyInput onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+
+    paste("￥１，２３４．５６");
+
+    expect(onValueChange).toHaveBeenLastCalledWith(1234.56, true);
+  });
+
+  it.each([
+    ["zh-CN", "¥1,234.56"],
+    ["zh-CN", "CN¥1,234.56"],
+  ] as const)("pastes localized currency output for %s", (locale, clipboardValue) => {
+    const onValueChange = vi.fn();
+    render(
+      <FormattingProvider locale={locale}>
+        <MoneyInput onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+
+    paste(clipboardValue);
+
+    expect(onValueChange).toHaveBeenLastCalledWith(1234.56, true);
+  });
+
+  it.each(["USD", "EUR", "CNY", "GBP"] as const)(
+    "pastes the formatter's own zh-CN %s currency output",
+    (currency) => {
+    const onValueChange = vi.fn();
+    const formatted = createFormatter("zh-CN").formatAmount(1234.56, currency);
+    render(
+      <FormattingProvider locale="zh-CN">
+        <MoneyInput onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+
+    paste(formatted);
+
+    expect(onValueChange).toHaveBeenLastCalledWith(1234.56, true);
+  });
+
+  it("leaves partial plain-number pastes to the input", () => {
+    const onValueChange = vi.fn();
+    render(
+      <FormattingProvider locale="zh-CN">
+        <MoneyInput value={100} onValueChange={onValueChange} />
+      </FormattingProvider>,
+    );
+    const input = screen.getByRole<HTMLInputElement>("textbox");
+    input.setSelectionRange(1, 2);
+
+    const allowed = fireEvent.paste(input, {
+      clipboardData: { getData: () => "5" },
+    });
+
+    expect(allowed).toBe(true);
+    expect(onValueChange).not.toHaveBeenCalled();
+  });
+});

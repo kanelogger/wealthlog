@@ -1,0 +1,1888 @@
+import { createActivity, getAssetHoldings, getAssetLots, searchActivities } from "@/adapters";
+import { ActionPalette, type ActionPaletteGroup } from "@/components/action-palette";
+import { AssetLogoDialog } from "@/components/asset-logo/asset-logo-dialog";
+import { EditableTickerAvatar } from "@/components/asset-logo/editable-ticker-avatar";
+import { useAccounts } from "@/hooks/use-accounts";
+import { useAlternativeAssetHolding, useAlternativeHoldings } from "@/hooks/use-alternative-assets";
+import { useHoldings } from "@/hooks/use-holdings";
+import { useIsMobileViewport } from "@/hooks/use-platform";
+import { useQuoteHistory } from "@/hooks/use-quote-history";
+import { useSyncMarketDataMutation } from "@/hooks/use-sync-market-data";
+import { useAssetTaxonomyAssignments, useTaxonomy } from "@/hooks/use-taxonomies";
+import { getActivityRestrictionLevel } from "@/lib/activity-restrictions";
+import { generateId } from "@/lib/id";
+import { QueryKeys } from "@/lib/query-keys";
+import { useSettingsContext } from "@/lib/settings-provider";
+import type { ActivityDetails, AssetKind, AssetLotView, Holding, Quote } from "@/lib/types";
+import { cn, normalizeCurrency } from "@/lib/utils";
+import { ActivityDeleteModal } from "@/pages/activity/components/activity-delete-modal";
+import { ActivityForm, type AccountSelectOption } from "@/pages/activity/components/activity-form";
+import ActivityTable from "@/pages/activity/components/activity-table/activity-table";
+import ActivityTableMobile from "@/pages/activity/components/activity-table/activity-table-mobile";
+import { MobileActivityForm } from "@/pages/activity/components/mobile-forms/mobile-activity-form";
+import { useActivityActionDialogs } from "@/pages/activity/hooks/use-activity-action-dialogs";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  AnimatedToggleGroup,
+  Page,
+  PageContent,
+  PageHeader,
+  SwipableView,
+  useDateFormatting,
+  type FormattingApi,
+} from "@wealthfolio/ui";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@wealthfolio/ui/components/ui/alert-dialog";
+import { Badge } from "@wealthfolio/ui/components/ui/badge";
+import { Button } from "@wealthfolio/ui/components/ui/button";
+import { Icons } from "@wealthfolio/ui/components/ui/icons";
+import { Skeleton } from "@wealthfolio/ui/components/ui/skeleton";
+import { Tabs, TabsContent } from "@wealthfolio/ui/components/ui/tabs";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@wealthfolio/ui/components/ui/tooltip";
+import type { TFunction } from "i18next";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { toast } from "sonner";
+import { AlternativeAssetContent, useAlternativeAssetActions } from "./alternative-asset-content";
+import { AssetSnapshotHistory, useHasManualSnapshots } from "./asset-account-holdings";
+import { resolveContractMultiplier } from "./asset-contract-multiplier";
+import AssetDetailCard from "./asset-detail-card";
+import { AssetEditSheet } from "./asset-edit-sheet";
+import AssetHistoryCard from "./asset-history-card";
+import AssetLotsTable from "./asset-lots-table";
+import { getAssetProfileHolding } from "./asset-profile-holding";
+import { isExpiredOptionAsset } from "./asset-utils";
+import { useAssetProfile } from "./hooks/use-asset-profile";
+import { useAssetProfileMutations } from "./hooks/use-asset-profile-mutations";
+import { useQuoteMutations } from "./hooks/use-quote-mutations";
+import { QuoteHistoryDataGrid } from "./quote-history-data-grid";
+import { RefreshQuotesConfirmDialog } from "./refresh-quotes-confirm-dialog";
+import { ResetProviderHistoryDialog } from "./reset-provider-history-dialog";
+
+// Alternative asset kinds that should use ValueHistoryDataGrid
+const ALTERNATIVE_ASSET_KINDS: AssetKind[] = [
+  "PROPERTY",
+  "VEHICLE",
+  "COLLECTIBLE",
+  "PRECIOUS_METAL",
+  "LIABILITY",
+  "OTHER",
+];
+
+const isAlternativeAsset = (kind: AssetKind | undefined | null): boolean => {
+  if (!kind) return false;
+  return ALTERNATIVE_ASSET_KINDS.includes(kind);
+};
+
+// Helper to parse JSON field that might be a string or already an object
+const parseJsonField = (value: unknown): unknown => {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  }
+  return value;
+};
+
+interface AssetDetailData {
+  numShares: number;
+  marketValue: number;
+  costBasis: number;
+  averagePrice: number;
+  portfolioPercent: number;
+  todaysReturn: number | null;
+  todaysReturnPercent: number | null;
+  unrealizedPnl: number | null;
+  unrealizedPnlPercent: number | null;
+  realizedPnl: number | null;
+  realizedPnlPercent: number | null;
+  income: number | null;
+  fxEffect: number | null;
+  priceReturnPercent: number | null;
+  totalPnl: number | null;
+  totalPnlPercent: number | null;
+  totalReturn: number | null;
+  totalReturnPercent: number | null;
+  currency: string;
+  baseCurrency: string;
+  quoteCurrency: string | null;
+  quote: {
+    open: number;
+    high: number;
+    low: number;
+    volume: number;
+    close: number;
+    adjclose: number;
+  } | null;
+  bondSpec?: {
+    maturityDate?: string | null;
+    couponRate?: number | null;
+    couponFrequency?: string | null;
+  } | null;
+  optionSpec?: {
+    right?: string | null;
+    strike?: number | null;
+    expiration?: string | null;
+  } | null;
+  contractMultiplier?: number | null;
+}
+
+type AssetTab = "overview" | "history";
+type OverviewSubTab = "about" | "holdings" | "activities" | "snapshots" | "quotes";
+type AssetHealthContext = "price" | "basis" | "activity";
+
+const REGULAR_SUB_TAB_VALUES: OverviewSubTab[] = [
+  "about",
+  "holdings",
+  "activities",
+  "snapshots",
+  "quotes",
+];
+
+const parseSubTabParam = (param: string | null): OverviewSubTab => {
+  if (param === "history") return "quotes";
+  if (param === "overview") return "about";
+  if (param === "lots") return "holdings";
+  if (param && (REGULAR_SUB_TAB_VALUES as string[]).includes(param)) {
+    return param as OverviewSubTab;
+  }
+  return "about";
+};
+
+const parseHealthContext = (value: string | null): AssetHealthContext | null => {
+  if (value === "price" || value === "basis" || value === "activity") {
+    return value;
+  }
+  return null;
+};
+
+const formatHealthDate = (
+  value: string | null,
+  formatting: Pick<FormattingApi, "formatDate">,
+): string | null => {
+  if (!value) return null;
+  const date = new Date(`${value}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return value;
+  return formatting.formatDate(date, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+};
+
+function AssetHealthBanner({
+  context,
+  isManualPricingMode,
+  date,
+  canRefreshPrices,
+  isRefreshingPrices,
+  onRefreshPrices,
+  onClear,
+}: {
+  context: AssetHealthContext | null;
+  isManualPricingMode: boolean;
+  date: string | null;
+  canRefreshPrices: boolean;
+  isRefreshingPrices: boolean;
+  onRefreshPrices: () => void;
+  onClear: () => void;
+}) {
+  const formatting = useDateFormatting();
+  const { t } = useTranslation();
+  if (!context) return null;
+
+  const dateLabel = formatHealthDate(date, formatting);
+  const copy =
+    context === "price"
+      ? isManualPricingMode
+        ? {
+            title: dateLabel
+              ? t("asset:profile.health.add_price_for_date", { date: dateLabel })
+              : t("asset:profile.health.manual_prices_need_review"),
+            description: dateLabel
+              ? t("asset:profile.health.carrying_forward_add_date")
+              : t("asset:profile.health.review_missing_dates"),
+          }
+        : {
+            title: dateLabel
+              ? t("asset:profile.health.price_missing_for_date", { date: dateLabel })
+              : t("asset:profile.health.price_history_needs_review"),
+            description: dateLabel
+              ? t("asset:profile.health.carrying_forward_refetch")
+              : t("asset:profile.health.refetch_history"),
+          }
+      : context === "basis"
+        ? {
+            title: t("asset:profile.health.cost_basis_needs_review"),
+            description: t("asset:profile.health.cost_basis_description"),
+          }
+        : {
+            title: t("asset:profile.health.transactions_need_review"),
+            description: t("asset:profile.health.transactions_description"),
+          };
+
+  return (
+    <div className="border-warning/30 bg-warning/10 mb-4 rounded-md border px-3 py-3">
+      <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div className="flex min-w-0 items-start gap-2">
+          <Icons.AlertTriangle className="text-warning mt-0.5 h-4 w-4 shrink-0" />
+          <div className="min-w-0 space-y-1">
+            <p className="text-sm font-medium">{copy.title}</p>
+            <p className="text-muted-foreground text-sm leading-relaxed">{copy.description}</p>
+          </div>
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center gap-2 md:justify-end">
+          {context === "price" && !isManualPricingMode && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={!canRefreshPrices || isRefreshingPrices}
+              onClick={onRefreshPrices}
+            >
+              {isRefreshingPrices ? (
+                <Icons.Spinner className="mr-2 h-4 w-4 animate-spin" />
+              ) : (
+                <Icons.Refresh className="mr-2 h-4 w-4" />
+              )}
+              {t("asset:profile.health.refetch_prices")}
+            </Button>
+          )}
+          <Button type="button" variant="ghost" size="sm" onClick={onClear}>
+            {t("common:clear")}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export const AssetProfilePage = () => {
+  const { t } = useTranslation();
+  const { settings } = useSettingsContext();
+  const baseCurrency = settings?.baseCurrency ?? "USD";
+  const { assetId: encodedAssetId = "" } = useParams<{ assetId: string }>();
+  const assetId = decodeURIComponent(encodedAssetId);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const queryParams = new URLSearchParams(location.search);
+  const tabParam = queryParams.get("tab");
+  const healthContext = parseHealthContext(queryParams.get("healthContext"));
+  const healthDate = queryParams.get("date");
+  // activeTab is only used by alternative assets (Overview | Values).
+  const defaultTab: AssetTab = tabParam === "history" ? "history" : "overview";
+  const [activeTab, setActiveTab] = useState<AssetTab>(defaultTab);
+  const [overviewSubTab, setOverviewSubTab] = useState<OverviewSubTab>(parseSubTabParam(tabParam));
+  const hasManualSnapshots = useHasManualSnapshots(assetId);
+  const [actionPaletteOpen, setActionPaletteOpen] = useState(false);
+  const [editSheetOpen, setEditSheetOpen] = useState(false);
+  const [logoDialogOpen, setLogoDialogOpen] = useState(false);
+  const [editSheetDefaultTab, setEditSheetDefaultTab] = useState<
+    "general" | "classification" | "market-data"
+  >("general");
+  const isMobile = useIsMobileViewport();
+  const {
+    selectedActivity,
+    formOpen: activityFormOpen,
+    deleteDialogOpen: showActivityDeleteAlert,
+    isDeleting: isActivityDeleting,
+    openForm: handleActivityEdit,
+    closeForm: handleActivityFormClose,
+    requestDelete: handleActivityDelete,
+    cancelDelete: handleActivityDeleteCancel,
+    confirmDelete: handleActivityDeleteConfirm,
+    duplicateActivity: handleActivityDuplicate,
+  } = useActivityActionDialogs();
+
+  const fxTabs = useMemo(() => {
+    const items: { value: "overview" | "quotes"; label: string }[] = [
+      { value: "overview", label: t("asset:profile.overview") },
+      { value: "quotes", label: t("asset:profile.quotes") },
+    ];
+    return items;
+  }, [t]);
+
+  const [fxActiveTab, setFxActiveTab] = useState<"overview" | "quotes">(
+    queryParams.get("tab") === "quotes" ? "quotes" : "overview",
+  );
+
+  const {
+    data: assetProfile,
+    isLoading: isAssetProfileLoading,
+    isError: isAssetProfileError,
+  } = useAssetProfile(assetId);
+
+  const {
+    holdings: allHoldings,
+    isLoading: isHoldingLoading,
+    isError: isHoldingError,
+  } = useHoldings({ type: "all" }, { includeClosed: true });
+
+  const holding = useMemo<Holding | null>(() => {
+    if (!assetId) return null;
+    return getAssetProfileHolding(allHoldings, assetId);
+  }, [allHoldings, assetId]);
+
+  const {
+    data: quoteHistory,
+    isLoading: isQuotesLoading,
+    isError: isQuotesError,
+  } = useQuoteHistory({
+    assetId,
+    enabled: !!assetId,
+  });
+
+  // Taxonomy data for category badges - use same approach as edit sheet
+  const { data: assignments = [], isLoading: isAssignmentsLoading } =
+    useAssetTaxonomyAssignments(assetId);
+  const { updateQuoteModeMutation } = useAssetProfileMutations();
+
+  // Fetch taxonomy details for taxonomies with assignments
+  // We need the categories to get name and color
+  const { data: typeOfSecurityTaxonomy } = useTaxonomy(
+    assignments.find((a) => a.taxonomyId === "instrument_type")?.taxonomyId ?? null,
+  );
+  const { data: riskCategoryTaxonomy } = useTaxonomy(
+    assignments.find((a) => a.taxonomyId === "risk_category")?.taxonomyId ?? null,
+  );
+  const { data: assetClassesTaxonomy } = useTaxonomy(
+    assignments.find((a) => a.taxonomyId === "asset_classes")?.taxonomyId ?? null,
+  );
+  const { data: industriesTaxonomy } = useTaxonomy(
+    assignments.find((a) => a.taxonomyId === "industries_gics")?.taxonomyId ?? null,
+  );
+  const { data: regionsTaxonomy } = useTaxonomy(
+    assignments.find((a) => a.taxonomyId === "regions")?.taxonomyId ?? null,
+  );
+
+  const isClassificationsLoading = isAssignmentsLoading;
+
+  // Build category badges from assignments and taxonomy data
+  // Order: Class, Type, Risk
+  const categoryBadges = useMemo(() => {
+    const badges: {
+      id: string;
+      categoryName: string;
+      categoryColor: string;
+      taxonomyName: string;
+    }[] = [];
+
+    // Asset Class badge (first)
+    const assetClassAssignment = assignments.find((a) => a.taxonomyId === "asset_classes");
+    if (assetClassAssignment && assetClassesTaxonomy?.categories) {
+      const category = assetClassesTaxonomy.categories.find(
+        (c) => c.id === assetClassAssignment.categoryId,
+      );
+      if (category) {
+        badges.push({
+          id: category.id,
+          categoryName: category.name,
+          categoryColor: category.color,
+          taxonomyName: t("asset:profile.class"),
+        });
+      }
+    }
+
+    // Type of Security badge (second)
+    const typeAssignment = assignments.find((a) => a.taxonomyId === "instrument_type");
+    if (typeAssignment && typeOfSecurityTaxonomy?.categories) {
+      const category = typeOfSecurityTaxonomy.categories.find(
+        (c) => c.id === typeAssignment.categoryId,
+      );
+      if (category) {
+        badges.push({
+          id: category.id,
+          categoryName: category.name === "Exchange Traded Fund (ETF)" ? "ETF" : category.name,
+          categoryColor: category.color,
+          taxonomyName: t("asset:profile.type"),
+        });
+      }
+    }
+
+    // Risk Category badge (third)
+    const riskAssignment = assignments.find((a) => a.taxonomyId === "risk_category");
+    if (riskAssignment && riskCategoryTaxonomy?.categories) {
+      const category = riskCategoryTaxonomy.categories.find(
+        (c) => c.id === riskAssignment.categoryId,
+      );
+      if (category) {
+        badges.push({
+          id: category.id,
+          categoryName: t("asset:profile.risk", { name: category.name }),
+          categoryColor: category.color,
+          taxonomyName: "Risk",
+        });
+      }
+    }
+
+    // Industries (GICS) - top 2 by weight
+    const industryAssignments = assignments
+      .filter((a) => a.taxonomyId === "industries_gics")
+      .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))
+      .slice(0, 2);
+    if (industriesTaxonomy?.categories) {
+      for (const assignment of industryAssignments) {
+        const category = industriesTaxonomy.categories.find((c) => c.id === assignment.categoryId);
+        if (category) {
+          badges.push({
+            id: `industry-${category.id}`,
+            categoryName: category.name,
+            categoryColor: category.color,
+            taxonomyName: "Industry",
+          });
+        }
+      }
+    }
+
+    // Regions - top 2 by weight
+    const regionAssignments = assignments
+      .filter((a) => a.taxonomyId === "regions")
+      .sort((a, b) => (b.weight ?? 0) - (a.weight ?? 0))
+      .slice(0, 2);
+    if (regionsTaxonomy?.categories) {
+      for (const assignment of regionAssignments) {
+        const category = regionsTaxonomy.categories.find((c) => c.id === assignment.categoryId);
+        if (category) {
+          badges.push({
+            id: `region-${category.id}`,
+            categoryName: category.name,
+            categoryColor: category.color,
+            taxonomyName: "Region",
+          });
+        }
+      }
+    }
+
+    return badges;
+  }, [
+    assignments,
+    assetClassesTaxonomy,
+    typeOfSecurityTaxonomy,
+    riskCategoryTaxonomy,
+    industriesTaxonomy,
+    regionsTaxonomy,
+    t,
+  ]);
+
+  const quote = useMemo(() => {
+    // Backend returns quotes in descending order (newest first)
+    // So .at(0) gives the latest quote
+    return quoteHistory?.at(0) ?? null;
+  }, [quoteHistory]);
+
+  // Bond metadata for display (only when asset is a bond)
+  const bondSpec = useMemo(() => {
+    if (assetProfile?.instrumentType !== "BOND" || !assetProfile?.metadata) return null;
+    const bond = assetProfile.metadata.bond as
+      | {
+          maturityDate?: string | null;
+          couponRate?: number | null;
+          couponFrequency?: string | null;
+        }
+      | undefined;
+    // Frequency alone has nothing to render — the card only draws a coupon cell
+    // (which carries the frequency) and a maturity cell.
+    if (!bond || (!bond.maturityDate && bond.couponRate == null)) return null;
+    return bond;
+  }, [assetProfile]);
+
+  // Option metadata for display (only when asset is an option)
+  const optionSpec = useMemo(() => {
+    if (assetProfile?.instrumentType !== "OPTION" || !assetProfile?.metadata) return null;
+    const option = assetProfile.metadata.option as
+      | { right?: string | null; strike?: number | null; expiration?: string | null }
+      | undefined;
+    if (!option || (!option.right && option.strike == null && !option.expiration)) return null;
+    return option;
+  }, [assetProfile]);
+
+  const isExpiredOption =
+    optionSpec?.expiration && assetProfile
+      ? isExpiredOptionAsset(assetProfile, settings?.timezone)
+      : false;
+
+  const [confirmExpiryOpen, setConfirmExpiryOpen] = useState(false);
+  const queryClient = useQueryClient();
+
+  const confirmExpiryMutation = useMutation({
+    mutationFn: async () => {
+      const accountHoldings = await getAssetHoldings(assetId);
+      const nonZeroHoldings = accountHoldings.filter((h) => h.quantity > 0);
+      if (nonZeroHoldings.length === 0) throw new Error(t("asset:profile.no_open_positions"));
+
+      for (const h of nonZeroHoldings) {
+        await createActivity({
+          idempotencyKey: generateId("option-expiry"),
+          accountId: h.accountId,
+          activityType: "ADJUSTMENT",
+          subtype: "OPTION_EXPIRY",
+          activityDate: optionSpec?.expiration ?? new Date().toISOString().split("T")[0],
+          asset: { id: assetId },
+          quantity: String(h.quantity),
+          unitPrice: "0",
+          fee: "0",
+          currency: h.localCurrency,
+        });
+      }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries();
+      toast.success(t("asset:profile.option_expiry_recorded"));
+    },
+    onError: (error) => {
+      toast.error(t("asset:profile.option_expiry_failed"), { description: String(error) });
+    },
+  });
+
+  const { saveQuoteMutation, deleteQuoteMutation } = useQuoteMutations(assetId);
+  const syncMarketDataMutation = useSyncMarketDataMutation(true);
+  const updateMarketDataMutation = useSyncMarketDataMutation(false);
+
+  // Determine if manual tracking based on asset's quoteMode
+  const isManualPricingMode = assetProfile?.quoteMode === "MANUAL";
+
+  // Determine if this is an alternative asset (property, vehicle, liability, etc.)
+  const isAltAsset = isAlternativeAsset(assetProfile?.kind);
+
+  const { data: assetLots = [] } = useQuery<AssetLotView[], Error>({
+    queryKey: [QueryKeys.ASSET_LOTS, assetId, true],
+    queryFn: () => getAssetLots(assetId, true),
+    enabled: !!assetId && !isAssetProfileLoading && !isAltAsset,
+  });
+
+  const { data: assetActivities = [], isLoading: isActivitiesLoading } = useQuery<
+    ActivityDetails[],
+    Error
+  >({
+    queryKey: ["activities", "byAsset", assetId],
+    queryFn: async () => {
+      const pageSize = 500;
+      const activities: ActivityDetails[] = [];
+      let page = 0;
+
+      while (true) {
+        const response = await searchActivities(page, pageSize, { symbol: assetId }, "", {
+          id: "date",
+          desc: true,
+        });
+        activities.push(...response.data);
+
+        if (
+          activities.length >= response.meta.totalRowCount ||
+          response.data.length === 0 ||
+          response.data.length < pageSize
+        ) {
+          break;
+        }
+        page += 1;
+      }
+
+      return activities;
+    },
+    enabled: !!assetId && !isAssetProfileLoading,
+  });
+
+  const { accounts } = useAccounts({ filterActive: false });
+
+  const activityFormAccounts = useMemo<AccountSelectOption[]>(
+    () =>
+      accounts
+        .filter((account) => !account.isArchived)
+        .map((account) => ({
+          value: account.id,
+          label: account.name,
+          currency: account.currency,
+          accountType: account.accountType,
+          restrictionLevel: getActivityRestrictionLevel(account),
+        })),
+    [accounts],
+  );
+
+  const overviewSubTabs = useMemo(() => {
+    const items: { value: OverviewSubTab; label: string }[] = [
+      { value: "about", label: t("asset:profile.about") },
+    ];
+    if (assetLots.length > 0) {
+      items.push({ value: "holdings", label: t("asset:profile.holdings") });
+    }
+    items.push({ value: "activities", label: t("asset:profile.activities") });
+    if (hasManualSnapshots) {
+      items.push({ value: "snapshots", label: t("asset:profile.snapshots") });
+    }
+    items.push({ value: "quotes", label: t("asset:profile.quotes") });
+    return items;
+  }, [hasManualSnapshots, assetLots.length, t]);
+
+  const handleSubTabChange = useCallback(
+    (next: OverviewSubTab) => {
+      if (next === overviewSubTab) return;
+      setOverviewSubTab(next);
+      navigate(`${location.pathname}?tab=${next}`, { replace: true });
+    },
+    [overviewSubTab, navigate, location.pathname],
+  );
+
+  // Fetch alternative asset holding data (for alternative assets only)
+  const { data: altHolding } = useAlternativeAssetHolding({
+    assetId,
+    enabled: isAltAsset,
+  });
+
+  // Fetch all alternative holdings for linking context
+  const { data: allAltHoldings = [] } = useAlternativeHoldings({
+    enabled: isAltAsset,
+  });
+
+  const profile = useMemo(() => {
+    const instrument = holding?.instrument;
+    const asset = assetProfile;
+
+    if (!instrument && !asset) return null;
+
+    const totalGainAmount = holding?.totalGain?.local ?? 0;
+    const totalGainPercent = holding?.totalGainPct ?? 0;
+    const calculatedAt = holding?.asOfDate;
+    const valuationMarketPrice =
+      asset?.valuationMarketPrice != null ? Number(asset.valuationMarketPrice) : 0;
+    const valuationMarketCurrency =
+      asset?.valuationMarketCurrency ?? instrument?.currency ?? asset?.quoteCcy ?? baseCurrency;
+
+    // Legacy data is in asset.metadata.legacy (for migration purposes)
+    // New data should come from taxonomies
+    const legacy = asset?.metadata?.legacy as
+      | { sectors?: string | null; countries?: string | null }
+      | undefined;
+
+    const identifiers = asset?.metadata?.identifiers as { isin?: string } | undefined;
+
+    return {
+      id: instrument?.id ?? asset?.id ?? "",
+      symbol: instrument?.symbol ?? asset?.displayCode ?? assetId,
+      name: instrument?.name ?? asset?.name ?? "-",
+      isin: identifiers?.isin ?? null,
+      assetType: null,
+      symbolMapping: null,
+      notes: instrument?.notes ?? asset?.notes ?? null,
+      // Sectors and countries now come from taxonomy classifications (displayed via badges)
+      countries: JSON.stringify(parseJsonField(legacy?.countries) ?? []),
+      categories: null,
+      classes: null,
+      attributes: null,
+      createdAt: holding?.openDate ? new Date(holding.openDate) : new Date(),
+      updatedAt: new Date(),
+      currency: holding?.localCurrency ?? valuationMarketCurrency,
+      sectors: JSON.stringify(parseJsonField(legacy?.sectors) ?? []),
+      url: null,
+      marketPrice: holding?.price ?? valuationMarketPrice,
+      totalGainAmount,
+      totalGainPercent,
+      calculatedAt,
+    };
+  }, [holding, assetProfile, assetId, baseCurrency]);
+
+  const symbolHolding = useMemo((): AssetDetailData | null => {
+    const instrument = holding?.instrument;
+    const asset = assetProfile;
+    const hasAssetHistory = assetLots.length > 0 || assetActivities.length > 0 || quote != null;
+    if (!holding && !hasAssetHistory) return null;
+
+    const displayCurrency =
+      normalizeCurrency(
+        holding?.localCurrency ??
+          asset?.valuationMarketCurrency ??
+          quote?.currency ??
+          instrument?.currency ??
+          asset?.quoteCcy ??
+          baseCurrency,
+      ) ?? baseCurrency;
+    const quantity = Number(holding?.quantity ?? 0);
+
+    const contractMultiplier = Number(holding?.contractMultiplier ?? 1);
+    // What the asset is configured with, independent of any holding. The line
+    // above falls back to 1, which would misreport a closed option as 1x.
+    const configuredContractMultiplier = resolveContractMultiplier(
+      asset?.metadata,
+      asset?.instrumentType,
+    );
+    const costUnits =
+      optionSpec && contractMultiplier > 0 ? quantity * contractMultiplier : quantity;
+    const averageCostPrice =
+      holding?.costBasis?.local && costUnits !== 0
+        ? Number(holding.costBasis.local) / costUnits
+        : 0;
+
+    const quoteData = quote
+      ? {
+          quote: {
+            open: quote.open,
+            high: quote.high,
+            low: quote.low,
+            volume: quote.volume,
+            close: quote.close,
+            adjclose: quote.adjclose,
+          },
+          quoteCurrency: quote.currency ?? null,
+        }
+      : null;
+
+    const todaysReturn = holding?.dayChange?.local;
+    const todaysReturnPercent = holding?.dayChangePct;
+    const priceReturnPercent =
+      quoteHistory && quoteHistory.length >= 2
+        ? (() => {
+            const ordered = [...quoteHistory].sort(
+              (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+            );
+            const first = ordered[0]?.close;
+            const last = ordered.at(-1)?.close;
+            return first && last != null && first !== 0 ? Number(last / first - 1) : null;
+          })()
+        : null;
+    // Closed positions use the engine's income too, including reclassifications
+    // and rejected-activity filtering. Raw dividend rows cannot reproduce it.
+    const income = holding?.income?.local != null ? Number(holding.income.local) : null;
+    const realizedLots = assetLots.filter(
+      (lot) => lot.source === "TRANSACTION_LOT" && lot.valuationRealizedPnl != null,
+    );
+    const realizedPnlFromLots = realizedLots.reduce(
+      (sum, lot) => sum + Number(lot.valuationRealizedPnl ?? 0),
+      0,
+    );
+    const realizedCostBasisFromLots = realizedLots.reduce(
+      (sum, lot) => sum + Number(lot.valuationDisposalCostBasis ?? 0),
+      0,
+    );
+    const realizedPnl =
+      holding?.realizedGain?.local != null
+        ? Number(holding.realizedGain.local)
+        : realizedLots.length > 0
+          ? realizedPnlFromLots
+          : null;
+    const realizedPnlPercent =
+      holding?.realizedGainPct != null
+        ? Number(holding.realizedGainPct)
+        : realizedLots.length > 0 && realizedCostBasisFromLots > 0
+          ? realizedPnlFromLots / realizedCostBasisFromLots
+          : null;
+    const hasOpenTransactionLotWithBase = assetLots.some(
+      (lot) => lot.source === "TRANSACTION_LOT" && !lot.isClosed && lot.costBasisBase != null,
+    );
+    const isForeignCurrency =
+      displayCurrency.trim().toUpperCase() !==
+      (holding?.baseCurrency ?? baseCurrency).trim().toUpperCase();
+    const fxEffect =
+      isForeignCurrency &&
+      hasOpenTransactionLotWithBase &&
+      holding?.unrealizedGain?.base != null &&
+      holding?.unrealizedGain?.local != null &&
+      holding?.fxRate != null
+        ? Number(holding.unrealizedGain.base) -
+          Number(holding.unrealizedGain.local) * Number(holding.fxRate)
+        : null;
+    const totalPnl =
+      holding?.totalGain?.local != null ? Number(holding.totalGain.local) : realizedPnl;
+    const totalPnlPercent =
+      holding?.totalGainPct != null ? Number(holding.totalGainPct) : realizedPnlPercent;
+    const totalReturn =
+      holding?.totalReturn?.local != null
+        ? Number(holding.totalReturn.local)
+        : totalPnl != null && income != null
+          ? totalPnl + income
+          : null;
+    const fallbackReturnBasis =
+      holding?.returnBasis?.base != null
+        ? Number(holding.returnBasis.base)
+        : realizedCostBasisFromLots;
+    const canUseFallbackTotalReturnPercent =
+      holding == null && displayCurrency.toUpperCase() === baseCurrency.toUpperCase();
+    const totalReturnPercent =
+      holding?.totalReturnPct != null
+        ? Number(holding.totalReturnPct)
+        : totalReturn != null && fallbackReturnBasis > 0 && canUseFallbackTotalReturnPercent
+          ? totalReturn / fallbackReturnBasis
+          : null;
+
+    return {
+      numShares: quantity,
+      marketValue: Number(holding?.marketValue.local ?? 0),
+      costBasis: Number(holding?.costBasis?.local ?? 0),
+      averagePrice: Number(averageCostPrice),
+      portfolioPercent: Number(holding?.weight ?? 0),
+      todaysReturn: todaysReturn != null ? Number(todaysReturn) : null,
+      todaysReturnPercent: todaysReturnPercent != null ? Number(todaysReturnPercent) : null,
+      unrealizedPnl:
+        holding?.unrealizedGain?.local != null ? Number(holding.unrealizedGain.local) : null,
+      unrealizedPnlPercent:
+        holding?.unrealizedGainPct != null ? Number(holding.unrealizedGainPct) : null,
+      realizedPnl,
+      realizedPnlPercent,
+      income,
+      fxEffect,
+      priceReturnPercent,
+      totalPnl,
+      totalPnlPercent,
+      totalReturn,
+      totalReturnPercent,
+      currency: displayCurrency,
+      baseCurrency: holding?.baseCurrency ?? baseCurrency,
+      quoteCurrency: quoteData?.quoteCurrency ?? null,
+      quote: quoteData?.quote ?? null,
+      bondSpec: bondSpec ?? null,
+      optionSpec: optionSpec ?? null,
+      contractMultiplier: configuredContractMultiplier,
+    };
+  }, [
+    holding,
+    quote,
+    quoteHistory,
+    assetActivities,
+    assetLots,
+    assetProfile,
+    assetId,
+    bondSpec,
+    optionSpec,
+    baseCurrency,
+  ]);
+
+  // Top toggle is only used for alternative assets (Overview | Values).
+  const altToggleItems = useMemo(
+    () => [
+      { value: "overview" as AssetTab, label: t("asset:profile.overview") },
+      {
+        value: "history" as AssetTab,
+        label: t(
+          altHolding?.kind.toLowerCase() === "liability"
+            ? "asset:loanOverview.history"
+            : "asset:profile.history",
+        ),
+      },
+    ],
+    [t, altHolding?.kind],
+  );
+
+  // Content for each sub-tab. Shared between desktop and mobile renderers.
+  const subTabContent = useMemo<Record<OverviewSubTab, React.ReactNode>>(() => {
+    const aboutContent = (
+      <div className="space-y-4">
+        {/* Category badges */}
+        <div className="flex flex-wrap items-center gap-2">
+          {isClassificationsLoading ? (
+            <>
+              <Skeleton className="h-6 w-16 rounded-full" />
+              <Skeleton className="h-6 w-20 rounded-full" />
+            </>
+          ) : categoryBadges.length > 0 ? (
+            <>
+              {categoryBadges.map((badge) => (
+                <Badge
+                  key={badge.id}
+                  variant="secondary"
+                  className="gap-1.5"
+                  style={{
+                    backgroundColor: `${badge.categoryColor}20`,
+                    color: badge.categoryColor,
+                    borderColor: badge.categoryColor,
+                  }}
+                >
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={{ backgroundColor: badge.categoryColor }}
+                  />
+                  {badge.categoryName}
+                </Badge>
+              ))}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 text-xs"
+                onClick={() => {
+                  setEditSheetDefaultTab("classification");
+                  setEditSheetOpen(true);
+                }}
+              >
+                {t("asset:profile.more")}
+              </Button>
+            </>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground h-6 text-xs"
+              onClick={() => {
+                setEditSheetDefaultTab("classification");
+                setEditSheetOpen(true);
+              }}
+            >
+              {t("asset:profile.add_classifications")}
+            </Button>
+          )}
+        </div>
+
+        {/* ISIN */}
+        {profile?.isin && (
+          <p className="text-muted-foreground text-sm">
+            <span className="font-medium">{t("asset:profile.isin_label")}</span> {profile.isin}
+          </p>
+        )}
+
+        {/* Notes section */}
+        <p className="text-muted-foreground text-sm">
+          {assetProfile?.notes || holding?.instrument?.notes || t("asset:profile.no_notes")}
+        </p>
+      </div>
+    );
+
+    const lotsContent =
+      profile && assetLots.length > 0 ? (
+        <AssetLotsTable
+          lots={assetLots}
+          currency={
+            holding?.localCurrency ?? symbolHolding?.currency ?? profile.currency ?? baseCurrency
+          }
+          marketPrice={Number(holding?.price ?? profile.marketPrice)}
+          contractMultiplier={Number(holding?.contractMultiplier ?? 1)}
+          dayChangeAmount={
+            holding?.dayChange?.local != null ? Number(holding.dayChange.local) : null
+          }
+          dayChangePct={holding?.dayChangePct ?? null}
+        />
+      ) : null;
+
+    const quotesContent = (
+      <QuoteHistoryDataGrid
+        data={quoteHistory ?? []}
+        assetId={assetId}
+        currency={quote?.currency ?? profile?.currency ?? baseCurrency}
+        isManualDataSource={isManualPricingMode}
+        onSaveQuote={(q: Quote) => saveQuoteMutation.mutateAsync(q)}
+        onDeleteQuote={(id: string) => deleteQuoteMutation.mutateAsync(id)}
+        onChangeDataSource={(isManual) => {
+          if (profile) {
+            updateQuoteModeMutation.mutate({
+              assetId: assetId,
+              quoteMode: isManual ? "MANUAL" : "MARKET",
+            });
+          }
+        }}
+      />
+    );
+
+    const activitiesContent = isMobile ? (
+      <ActivityTableMobile
+        activities={assetActivities}
+        isCompactView={true}
+        handleEdit={handleActivityEdit}
+        handleDelete={handleActivityDelete}
+        onDuplicate={handleActivityDuplicate}
+      />
+    ) : (
+      <ActivityTable
+        activities={assetActivities}
+        isLoading={isActivitiesLoading}
+        sorting={[{ id: "date", desc: true }]}
+        onSortingChange={() => undefined}
+        handleEdit={handleActivityEdit}
+        handleDelete={handleActivityDelete}
+      />
+    );
+
+    return {
+      about: aboutContent,
+      holdings: lotsContent,
+      activities: activitiesContent,
+      snapshots: <AssetSnapshotHistory assetId={assetId} baseCurrency={baseCurrency} />,
+      quotes: quotesContent,
+    };
+  }, [
+    assetId,
+    baseCurrency,
+    profile,
+    holding,
+    assetLots,
+    symbolHolding,
+    quoteHistory,
+    quote,
+    assetProfile,
+    isManualPricingMode,
+    categoryBadges,
+    isClassificationsLoading,
+    saveQuoteMutation,
+    deleteQuoteMutation,
+    updateQuoteModeMutation,
+    assetActivities,
+    isActivitiesLoading,
+    isMobile,
+    handleActivityEdit,
+    handleActivityDelete,
+    handleActivityDuplicate,
+    t,
+  ]);
+
+  // Build swipable tabs for mobile from sub-tabs.
+  const swipableTabs = useMemo(
+    () =>
+      overviewSubTabs.map(({ value, label }) => ({
+        name: label,
+        content: subTabContent[value],
+      })),
+    [overviewSubTabs, subTabContent],
+  );
+
+  const isLoading = isHoldingLoading || isQuotesLoading || isAssetProfileLoading;
+  const [refreshConfirmOpen, setRefreshConfirmOpen] = useState(false);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [symbolCopied, setSymbolCopied] = useState(false);
+  const displayedSymbol = assetProfile?.displayCode ?? holding?.instrument?.symbol ?? assetId;
+
+  const handleUpdateQuotes = useCallback(() => {
+    if (!profile?.id) return;
+    updateMarketDataMutation.mutate([profile.id]);
+  }, [profile?.id, updateMarketDataMutation]);
+
+  const handleRefreshQuotes = useCallback(() => {
+    if (!profile?.id) return;
+    syncMarketDataMutation.mutate([profile.id]);
+  }, [profile?.id, syncMarketDataMutation]);
+
+  const handleRefreshQuotesWithConfirm = useCallback(() => {
+    setRefreshConfirmOpen(true);
+  }, []);
+
+  const handleBack = useCallback(() => {
+    navigate(-1);
+  }, [navigate]);
+
+  const handleCopySymbol = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(displayedSymbol);
+      setSymbolCopied(true);
+      window.setTimeout(() => setSymbolCopied(false), 1500);
+    } catch (error) {
+      console.error("Failed to copy asset symbol:", error);
+    }
+  }, [displayedSymbol]);
+
+  const clearHealthContext = useCallback(() => {
+    const next = new URLSearchParams(location.search);
+    next.delete("healthContext");
+    next.delete("date");
+    const query = next.toString();
+    navigate(`${location.pathname}${query ? `?${query}` : ""}`, { replace: true });
+  }, [location.pathname, location.search, navigate]);
+
+  // Alternative asset actions hook (only used when isAltAsset && altHolding)
+  const altAssetActions = useAlternativeAssetActions({
+    holding: altHolding,
+    assetProfile: assetProfile,
+    allHoldings: allAltHoldings,
+    onNavigateBack: handleBack,
+    quoteHistory: quoteHistory ?? [],
+  });
+
+  // The liabilities list links here to confirm a balance with the loan's own sheet.
+  const confirmBalanceRequested = queryParams.get("action") === "confirm-balance";
+  const openConfirmBalance = altAssetActions.loanActions.confirmBalance;
+  useEffect(() => {
+    if (!confirmBalanceRequested || !altHolding) return;
+    openConfirmBalance();
+    const next = new URLSearchParams(location.search);
+    next.delete("action");
+    const query = next.toString();
+    navigate(`${location.pathname}${query ? `?${query}` : ""}`, { replace: true });
+  }, [
+    confirmBalanceRequested,
+    altHolding,
+    openConfirmBalance,
+    location.pathname,
+    location.search,
+    navigate,
+  ]);
+
+  if (isLoading)
+    return (
+      <Page>
+        <PageContent>
+          <Icons.Spinner className="h-6 w-6 animate-spin" />
+        </PageContent>
+      </Page>
+    ); // Show loading spinner
+
+  // FX assets use tabs: Overview (with chart) | Quotes
+
+  // Simplified view for quote-only assets (like FX rates)
+  if (assetProfile?.kind === "FX") {
+    return (
+      <Page>
+        <PageHeader
+          heading={assetProfile.displayCode ?? assetId}
+          text={assetProfile.name ?? ""}
+          onBack={handleBack}
+          actions={
+            <div className="flex items-center gap-2">
+              <AnimatedToggleGroup
+                items={fxTabs}
+                value={fxActiveTab}
+                onValueChange={(next: "overview" | "quotes") => {
+                  if (next === fxActiveTab) return;
+                  setFxActiveTab(next);
+                  const url = `${location.pathname}?tab=${next}`;
+                  navigate(url, { replace: true });
+                }}
+                className="mr-2"
+              />
+              <ActionPalette
+                open={actionPaletteOpen}
+                onOpenChange={setActionPaletteOpen}
+                title={assetProfile.displayCode ?? assetId}
+                groups={
+                  [
+                    {
+                      title: t("asset:profile.manage"),
+                      items: [
+                        {
+                          icon: Icons.Download,
+                          label: t("common:component.update_quotes"),
+                          onClick: handleUpdateQuotes,
+                        },
+                        {
+                          icon: Icons.Refresh,
+                          label: t("asset:profile.refresh_history"),
+                          onClick: handleRefreshQuotesWithConfirm,
+                        },
+                        ...(!isManualPricingMode
+                          ? [
+                              {
+                                icon: Icons.Refresh,
+                                label: t("asset:resetDialog.title"),
+                                onClick: () => setResetConfirmOpen(true),
+                                variant: "destructive" as const,
+                              },
+                            ]
+                          : []),
+                        {
+                          icon: Icons.Pencil,
+                          label: t("asset:profile.edit"),
+                          onClick: () => setEditSheetOpen(true),
+                        },
+                      ],
+                    },
+                  ] satisfies ActionPaletteGroup[]
+                }
+                trigger={
+                  <Button
+                    variant="outline"
+                    size="icon"
+                    className="h-9 w-9"
+                    aria-label={t("common:actions")}
+                  >
+                    <Icons.DotsThreeVertical className="h-5 w-5" weight="fill" />
+                  </Button>
+                }
+              />
+            </div>
+          }
+        />
+        <PageContent>
+          <AssetHealthBanner
+            context={healthContext}
+            isManualPricingMode={isManualPricingMode}
+            date={healthDate}
+            canRefreshPrices={Boolean(profile?.id)}
+            isRefreshingPrices={syncMarketDataMutation.isPending}
+            onRefreshPrices={handleRefreshQuotesWithConfirm}
+            onClear={clearHealthContext}
+          />
+
+          {fxActiveTab === "overview" && (
+            <div className="space-y-4">
+              <AssetHistoryCard
+                assetId={assetId}
+                currency={quote?.currency ?? profile?.currency ?? baseCurrency}
+                marketPrice={quote?.close ?? 0}
+                totalGainAmount={0}
+                totalGainPercent={0}
+                quoteHistory={quoteHistory ?? []}
+                className="w-full"
+              />
+
+              {/* Type badge */}
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge variant="secondary" className="gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-blue-500" />
+                  {t("asset:profile.fx_rate")}
+                </Badge>
+              </div>
+
+              {/* Notes section */}
+              <p className="text-muted-foreground text-sm">
+                {assetProfile?.notes || t("asset:profile.no_notes")}
+              </p>
+            </div>
+          )}
+          {fxActiveTab === "quotes" && (
+            <QuoteHistoryDataGrid
+              data={quoteHistory ?? []}
+              assetId={assetId}
+              currency={profile?.currency ?? baseCurrency}
+              isManualDataSource={isManualPricingMode}
+              onSaveQuote={(quote: Quote) => saveQuoteMutation.mutateAsync(quote)}
+              onDeleteQuote={(id: string) => deleteQuoteMutation.mutateAsync(id)}
+              onChangeDataSource={(isManual) => {
+                updateQuoteModeMutation.mutate({
+                  assetId: assetId,
+                  quoteMode: isManual ? "MANUAL" : "MARKET",
+                });
+              }}
+            />
+          )}
+        </PageContent>
+
+        <RefreshQuotesConfirmDialog
+          open={refreshConfirmOpen}
+          onOpenChange={setRefreshConfirmOpen}
+          onConfirm={handleRefreshQuotes}
+        />
+        <ResetProviderHistoryDialog
+          assetId={assetId}
+          assetName={assetProfile.displayCode ?? assetId}
+          open={resetConfirmOpen}
+          onOpenChange={setResetConfirmOpen}
+        />
+        <AssetEditSheet
+          open={editSheetOpen}
+          onOpenChange={setEditSheetOpen}
+          asset={assetProfile ?? null}
+          latestQuote={quote}
+          defaultTab="general"
+        />
+      </Page>
+    );
+  }
+
+  // Handle case where loading finished but we have no asset data at all
+  if (!profile && (!quoteHistory || quoteHistory.length === 0)) {
+    return (
+      <Page>
+        <PageHeader
+          heading={assetId}
+          text={t("asset:profile.error_loading_data", { assetId })}
+          onBack={handleBack}
+        />
+        <PageContent>
+          <p>{t("asset:profile.could_not_load")}</p>
+          {isHoldingError && (
+            <p className="text-sm text-red-500">{t("asset:profile.holding_fetch_error")}</p>
+          )}
+          {isQuotesError && (
+            <p className="text-sm text-red-500">{t("asset:profile.quote_fetch_error")}</p>
+          )}
+          {isAssetProfileError && (
+            <p className="text-sm text-red-500">{t("asset:profile.asset_profile_fetch_error")}</p>
+          )}
+        </PageContent>
+      </Page>
+    );
+  }
+  return (
+    <Page>
+      <PageHeader
+        onBack={handleBack}
+        actions={
+          <div className="flex items-center gap-2">
+            {isAltAsset && (
+              <div className="hidden sm:flex">
+                <AnimatedToggleGroup
+                  items={altToggleItems}
+                  value={activeTab}
+                  onValueChange={(next: AssetTab) => {
+                    if (next === activeTab) {
+                      return;
+                    }
+                    setActiveTab(next);
+                    const url = `${location.pathname}?tab=${next}`;
+                    navigate(url, { replace: true });
+                  }}
+                  className="md:text-base"
+                />
+              </div>
+            )}
+            <ActionPalette
+              open={actionPaletteOpen}
+              onOpenChange={setActionPaletteOpen}
+              title={
+                isAltAsset && altHolding
+                  ? altHolding.name
+                  : (assetProfile?.displayCode ?? assetProfile?.name ?? assetId)
+              }
+              groups={
+                isAltAsset && altHolding?.kind.toLowerCase() === "liability"
+                  ? ([
+                      {
+                        title: t("asset:valueHistory.balance"),
+                        items: [
+                          {
+                            icon: Icons.Check,
+                            label: t("asset:loanActions.confirm_balance"),
+                            onClick: altAssetActions.loanActions.confirmBalance,
+                          },
+                          {
+                            icon: Icons.HandCoins,
+                            label: t("asset:loanActions.extra_repayment"),
+                            onClick: altAssetActions.loanActions.extraPayment,
+                          },
+                        ],
+                      },
+                      {
+                        title: t(
+                          altAssetActions.loanAvailability.mortgage
+                            ? "asset:loanOverview.mortgage_details"
+                            : "asset:loanOverview.loan_details",
+                        ),
+                        items: [
+                          ...(altAssetActions.loanAvailability.renew
+                            ? [
+                                {
+                                  icon: Icons.RefreshCw,
+                                  label: t(
+                                    altAssetActions.loanAvailability.mortgage
+                                      ? "asset:loanOverview.renew_mortgage"
+                                      : "asset:loanActions.renew_loan",
+                                  ),
+                                  onClick: altAssetActions.loanActions.renew,
+                                },
+                              ]
+                            : []),
+                          ...(altAssetActions.loanAvailability.recalculate
+                            ? [
+                                {
+                                  icon: Icons.Percent,
+                                  label: t("asset:loanActions.recalculate_schedule"),
+                                  onClick: altAssetActions.loanActions.recalculate,
+                                },
+                              ]
+                            : []),
+                          {
+                            icon: Icons.Pencil,
+                            label: t("asset:loanActions.edit_details"),
+                            onClick: () => altAssetActions.openEditDetails(),
+                          },
+                        ],
+                      },
+                      {
+                        title: t("asset:profile.manage"),
+                        items: [
+                          {
+                            icon: Icons.Lock,
+                            label: t("asset:loanActions.close_loan"),
+                            onClick: altAssetActions.loanActions.close,
+                          },
+                          {
+                            icon: Icons.Trash,
+                            label: t("asset:profile.delete"),
+                            onClick: () => altAssetActions.openDeleteConfirm(),
+                          },
+                        ],
+                      },
+                    ] satisfies ActionPaletteGroup[])
+                  : isAltAsset && altHolding
+                    ? ([
+                        {
+                          title: t("asset:profile.valuation"),
+                          items: [
+                            {
+                              icon: Icons.DollarSign,
+                              label: t("asset:profile.update_value"),
+                              onClick: () => altAssetActions.openUpdateValuation(),
+                            },
+                          ],
+                        },
+                        {
+                          title: t("asset:profile.manage"),
+                          items: [
+                            {
+                              icon: Icons.Pencil,
+                              label: t("asset:profile.edit_details"),
+                              onClick: () => altAssetActions.openEditDetails(),
+                            },
+                            ...(altAssetActions.isLinkableAsset
+                              ? [
+                                  {
+                                    icon: Icons.Link,
+                                    label: t("asset:profile.add_liability"),
+                                    onClick: () => altAssetActions.openAddLiability(),
+                                  },
+                                ]
+                              : []),
+                            {
+                              icon: Icons.Trash,
+                              label: t("asset:profile.delete"),
+                              onClick: () => altAssetActions.openDeleteConfirm(),
+                            },
+                          ],
+                        },
+                      ] satisfies ActionPaletteGroup[])
+                    : ([
+                        {
+                          title: t("asset:profile.record_transaction"),
+                          items: [
+                            {
+                              icon: Icons.TrendingUp,
+                              label: t("asset:profile.buy"),
+                              onClick: () =>
+                                navigate(
+                                  `/activities/manage?assetId=${encodeURIComponent(assetId)}&type=BUY`,
+                                ),
+                            },
+                            {
+                              icon: Icons.TrendingDown,
+                              label: t("asset:profile.sell"),
+                              onClick: () =>
+                                navigate(
+                                  `/activities/manage?assetId=${encodeURIComponent(assetId)}&type=SELL`,
+                                ),
+                            },
+                            {
+                              icon: Icons.Coins,
+                              label: t("asset:profile.dividend"),
+                              onClick: () =>
+                                navigate(
+                                  `/activities/manage?assetId=${encodeURIComponent(assetId)}&type=DIVIDEND`,
+                                ),
+                            },
+                            {
+                              icon: Icons.Ellipsis,
+                              label: t("asset:profile.other"),
+                              onClick: () =>
+                                navigate(
+                                  `/activities/manage?assetId=${encodeURIComponent(assetId)}`,
+                                ),
+                            },
+                            ...(isExpiredOption
+                              ? [
+                                  {
+                                    icon: Icons.XCircle,
+                                    label: t("asset:profile.confirm_expiry"),
+                                    onClick: () => setConfirmExpiryOpen(true),
+                                  },
+                                ]
+                              : []),
+                          ],
+                        },
+                        {
+                          title: t("asset:profile.manage"),
+                          items: [
+                            {
+                              icon: Icons.Download,
+                              label: t("common:component.update_quotes"),
+                              onClick: handleUpdateQuotes,
+                            },
+                            {
+                              icon: Icons.Refresh,
+                              label: t("asset:profile.refresh_history"),
+                              onClick: handleRefreshQuotesWithConfirm,
+                            },
+                            ...(!isManualPricingMode
+                              ? [
+                                  {
+                                    icon: Icons.Refresh,
+                                    label: t("asset:resetDialog.title"),
+                                    onClick: () => setResetConfirmOpen(true),
+                                    variant: "destructive" as const,
+                                  },
+                                ]
+                              : []),
+                            {
+                              icon: Icons.Pencil,
+                              label: t("asset:profile.edit"),
+                              onClick: () => setEditSheetOpen(true),
+                            },
+                            {
+                              icon: Icons.ImageUp,
+                              label: t("asset:logo.change"),
+                              onClick: () => setLogoDialogOpen(true),
+                            },
+                          ],
+                        },
+                      ] satisfies ActionPaletteGroup[])
+              }
+              trigger={
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="h-9 w-9"
+                  aria-label={t("common:actions")}
+                >
+                  <Icons.DotsThreeVertical className="h-5 w-5" weight="fill" />
+                </Button>
+              }
+            />
+          </div>
+        }
+      >
+        <div className="group/asset-header flex items-center gap-2" data-tauri-drag-region="true">
+          {isAltAsset && altHolding ? (
+            <div className="bg-muted flex h-9 w-9 items-center justify-center rounded-full">
+              <AlternativeAssetIcon kind={altHolding.kind} size={20} />
+            </div>
+          ) : (
+            (profile?.symbol ?? holding?.instrument?.symbol ?? assetProfile?.displayCode) && (
+              <EditableTickerAvatar
+                symbol={
+                  profile?.symbol ??
+                  holding?.instrument?.symbol ??
+                  assetProfile?.displayCode ??
+                  assetId
+                }
+                exchangeMic={
+                  holding?.instrument?.exchangeMic ?? assetProfile?.instrumentExchangeMic
+                }
+                instrumentType={holding?.instrument?.instrumentType ?? assetProfile?.instrumentType}
+                assetId={assetProfile?.id ?? assetId}
+                className="size-9"
+                onEdit={() => setLogoDialogOpen(true)}
+              />
+            )
+          )}
+          <div className="flex min-w-0 flex-col justify-center">
+            <h1 className="truncate text-base font-semibold leading-tight md:text-lg">
+              {assetProfile?.name ?? holding?.instrument?.name ?? assetId ?? "-"}
+            </h1>
+            <p className="text-muted-foreground flex items-center gap-1.5 text-xs leading-tight md:text-sm">
+              {isAltAsset && altHolding ? (
+                (altHolding.metadata?.sub_type ?? altHolding.metadata?.liability_type) ===
+                "mortgage" ? (
+                  t("asset:altContent.liabilityType.mortgage")
+                ) : (
+                  getAlternativeAssetKindLabel(altHolding.kind, t)
+                )
+              ) : (
+                <>
+                  <span className="flex items-center">
+                    <span>{displayedSymbol}</span>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className={cn(
+                            "ml-1 h-5 w-5 shrink-0 overflow-hidden rounded-sm p-0 transition-[width,margin,opacity]",
+                            "md:ml-0 md:w-0 md:opacity-0 md:focus-visible:ml-1 md:focus-visible:w-5 md:focus-visible:opacity-100 md:group-hover/asset-header:ml-1 md:group-hover/asset-header:w-5 md:group-hover/asset-header:opacity-100",
+                            symbolCopied && "opacity-100 md:ml-1 md:w-5 md:opacity-100",
+                          )}
+                          aria-label={`${t("ui:dataGrid.copy")} ${displayedSymbol}`}
+                          onClick={() => void handleCopySymbol()}
+                        >
+                          {symbolCopied ? (
+                            <Icons.Check className="text-success size-3.5" />
+                          ) : (
+                            <Icons.Copy className="size-3.5" />
+                          )}
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom">{t("ui:dataGrid.copy")}</TooltipContent>
+                    </Tooltip>
+                  </span>
+                  {(assetProfile?.quoteCcy ?? profile?.currency) && (
+                    <>
+                      <span className="bg-muted-foreground/40 h-3 w-px rounded-full" />
+                      {assetProfile?.quoteCcy ?? profile?.currency}
+                    </>
+                  )}
+                </>
+              )}
+            </p>
+          </div>
+        </div>
+      </PageHeader>
+      <PageContent>
+        <AssetHealthBanner
+          context={healthContext}
+          isManualPricingMode={isManualPricingMode}
+          date={healthDate}
+          canRefreshPrices={Boolean(profile?.id)}
+          isRefreshingPrices={syncMarketDataMutation.isPending}
+          onRefreshPrices={handleRefreshQuotesWithConfirm}
+          onClear={clearHealthContext}
+        />
+
+        {/* Alternative Asset Content */}
+        {isAltAsset && altHolding && assetProfile ? (
+          isMobile ? (
+            <SwipableView
+              withMobileNavOffset
+              items={[
+                {
+                  name: t("asset:profile.overview"),
+                  content: (
+                    <AlternativeAssetContent
+                      loanActions={altAssetActions.loanActions}
+                      onEditDetails={altAssetActions.openEditDetails}
+                      assetId={assetId}
+                      assetProfile={assetProfile}
+                      holding={altHolding}
+                      quoteHistory={quoteHistory ?? []}
+                      activeTab="overview"
+                      isMobile={true}
+                    />
+                  ),
+                },
+                {
+                  name: t(
+                    altHolding?.kind.toLowerCase() === "liability"
+                      ? "asset:loanOverview.history"
+                      : "asset:profile.history",
+                  ),
+                  content: (
+                    <AlternativeAssetContent
+                      loanActions={altAssetActions.loanActions}
+                      onEditDetails={altAssetActions.openEditDetails}
+                      assetId={assetId}
+                      assetProfile={assetProfile}
+                      holding={altHolding}
+                      quoteHistory={quoteHistory ?? []}
+                      activeTab="history"
+                      isMobile={true}
+                    />
+                  ),
+                },
+              ]}
+              displayToggle={true}
+              onViewChange={(index: number) => {
+                const tabValue: AssetTab = index === 1 ? "history" : "overview";
+                if (tabValue === activeTab) return;
+                setActiveTab(tabValue);
+                navigate(`${location.pathname}?tab=${tabValue}`, { replace: true });
+              }}
+            />
+          ) : (
+            <Tabs value={activeTab} className="space-y-4">
+              <TabsContent value="overview" className="space-y-4">
+                <AlternativeAssetContent
+                  loanActions={altAssetActions.loanActions}
+                  onEditDetails={altAssetActions.openEditDetails}
+                  assetId={assetId}
+                  assetProfile={assetProfile}
+                  holding={altHolding}
+                  quoteHistory={quoteHistory ?? []}
+                  activeTab="overview"
+                  isMobile={false}
+                />
+              </TabsContent>
+              <TabsContent value="history" className="pt-6">
+                <AlternativeAssetContent
+                  loanActions={altAssetActions.loanActions}
+                  onEditDetails={altAssetActions.openEditDetails}
+                  assetId={assetId}
+                  assetProfile={assetProfile}
+                  holding={altHolding}
+                  quoteHistory={quoteHistory ?? []}
+                  activeTab="history"
+                  isMobile={false}
+                />
+              </TabsContent>
+            </Tabs>
+          )
+        ) : isMobile ? (
+          <div className="space-y-4">
+            {profile && (
+              <div className="grid grid-cols-1 gap-4 pt-0 md:grid-cols-3">
+                <AssetHistoryCard
+                  assetId={profile.id ?? ""}
+                  currency={profile.currency ?? baseCurrency}
+                  marketPrice={profile.marketPrice}
+                  totalGainAmount={profile.totalGainAmount}
+                  totalGainPercent={profile.totalGainPercent}
+                  quoteHistory={quoteHistory ?? []}
+                  averageCost={
+                    symbolHolding && symbolHolding.numShares > 0
+                      ? symbolHolding.averagePrice
+                      : undefined
+                  }
+                  className={`col-span-1 ${symbolHolding ? "md:col-span-2" : "md:col-span-3"}`}
+                />
+                {symbolHolding && (
+                  <AssetDetailCard assetData={symbolHolding} className="col-span-1 md:col-span-1" />
+                )}
+              </div>
+            )}
+            <SwipableView
+              withMobileNavOffset
+              items={swipableTabs}
+              displayToggle={true}
+              onViewChange={(_index: number, name: string) => {
+                const match = overviewSubTabs.find((t) => t.label === name);
+                if (match) handleSubTabChange(match.value);
+              }}
+            />
+          </div>
+        ) : (
+          <div className="space-y-4">
+            {profile && (
+              <div className="grid grid-cols-1 gap-4 pt-0 md:grid-cols-3">
+                <AssetHistoryCard
+                  assetId={profile.id ?? ""}
+                  currency={profile.currency ?? baseCurrency}
+                  marketPrice={profile.marketPrice}
+                  totalGainAmount={profile.totalGainAmount}
+                  totalGainPercent={profile.totalGainPercent}
+                  quoteHistory={quoteHistory ?? []}
+                  averageCost={
+                    symbolHolding && symbolHolding.numShares > 0
+                      ? symbolHolding.averagePrice
+                      : undefined
+                  }
+                  className={`col-span-1 ${symbolHolding ? "md:col-span-2" : "md:col-span-3"}`}
+                />
+                {symbolHolding && (
+                  <AssetDetailCard assetData={symbolHolding} className="col-span-1 md:col-span-1" />
+                )}
+              </div>
+            )}
+
+            <AnimatedToggleGroup
+              items={overviewSubTabs}
+              value={overviewSubTab}
+              onValueChange={handleSubTabChange}
+              className="text-sm"
+            />
+
+            {subTabContent[overviewSubTab]}
+          </div>
+        )}
+      </PageContent>
+
+      <RefreshQuotesConfirmDialog
+        open={refreshConfirmOpen}
+        onOpenChange={setRefreshConfirmOpen}
+        onConfirm={handleRefreshQuotes}
+      />
+
+      <ResetProviderHistoryDialog
+        assetId={assetId}
+        assetName={assetProfile?.displayCode ?? assetId}
+        open={resetConfirmOpen}
+        onOpenChange={setResetConfirmOpen}
+      />
+
+      {/* Confirm Option Expiry Dialog */}
+      <AlertDialog open={confirmExpiryOpen} onOpenChange={setConfirmExpiryOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t("asset:profile.confirm_option_expiry_title")}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("asset:profile.confirm_option_expiry_description")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common:cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                confirmExpiryMutation.mutate();
+                setConfirmExpiryOpen(false);
+              }}
+            >
+              {t("asset:profile.confirm_expiry")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {isMobile ? (
+        <MobileActivityForm
+          key={selectedActivity?.id ?? "new"}
+          accounts={activityFormAccounts}
+          transferAccounts={activityFormAccounts}
+          activity={selectedActivity}
+          open={activityFormOpen}
+          onClose={handleActivityFormClose}
+        />
+      ) : (
+        <ActivityForm
+          accounts={activityFormAccounts}
+          transferAccounts={activityFormAccounts}
+          activity={selectedActivity}
+          open={activityFormOpen}
+          onClose={handleActivityFormClose}
+        />
+      )}
+      <ActivityDeleteModal
+        isOpen={showActivityDeleteAlert}
+        isDeleting={isActivityDeleting}
+        linkedTransfer={!!selectedActivity?.sourceGroupId}
+        onConfirm={handleActivityDeleteConfirm}
+        onCancel={handleActivityDeleteCancel}
+      />
+
+      {/* Edit Sheet (for regular assets) */}
+      <AssetEditSheet
+        open={editSheetOpen}
+        onOpenChange={setEditSheetOpen}
+        asset={assetProfile ?? null}
+        latestQuote={quote}
+        defaultTab={editSheetDefaultTab}
+      />
+
+      <AssetLogoDialog
+        open={logoDialogOpen}
+        onOpenChange={setLogoDialogOpen}
+        assetId={assetProfile?.id ?? assetId}
+        symbol={
+          profile?.symbol ?? holding?.instrument?.symbol ?? assetProfile?.displayCode ?? assetId
+        }
+        exchangeMic={holding?.instrument?.exchangeMic ?? assetProfile?.instrumentExchangeMic}
+        instrumentType={holding?.instrument?.instrumentType ?? assetProfile?.instrumentType}
+        name={assetProfile?.name ?? holding?.instrument?.name}
+      />
+
+      {/* Alternative Asset Modals */}
+      {isAltAsset && altHolding && altAssetActions.modals}
+    </Page>
+  );
+};
+
+// Helper component for alternative asset icons
+function AlternativeAssetIcon({ kind, size = 20 }: { kind: string; size?: number }) {
+  switch (kind.toLowerCase()) {
+    case "property":
+      return <Icons.RealEstateDuotone size={size} />;
+    case "vehicle":
+      return <Icons.VehicleDuotone size={size} />;
+    case "collectible":
+      return <Icons.CollectibleDuotone size={size} />;
+    case "precious":
+      return <Icons.PreciousDuotone size={size} />;
+    case "liability":
+      return <Icons.LiabilityDuotone size={size} />;
+    default:
+      return <Icons.OtherAssetDuotone size={size} />;
+  }
+}
+
+// Helper to get display label for alternative asset kinds
+function getAlternativeAssetKindLabel(kind: string, t: TFunction): string {
+  const labels: Record<string, string> = {
+    property: t("asset:profile.kind.property"),
+    vehicle: t("asset:profile.kind.vehicle"),
+    collectible: t("asset:profile.kind.collectible"),
+    precious: t("asset:profile.kind.precious_metal"),
+    liability: t("asset:profile.kind.liability"),
+    other: t("asset:profile.kind.other"),
+  };
+  return labels[kind.toLowerCase()] || kind;
+}
+
+export default AssetProfilePage;

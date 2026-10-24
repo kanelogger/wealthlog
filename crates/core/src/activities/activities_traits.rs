@@ -1,0 +1,475 @@
+use super::activities_constants::{ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT};
+use super::activities_model::*;
+use crate::Result;
+use async_trait::async_trait;
+use chrono::{DateTime, NaiveDate, Utc};
+use std::collections::{HashMap, HashSet};
+
+/// Trait defining the contract for Activity repository operations.
+#[async_trait]
+pub trait ActivityRepositoryTrait: Send + Sync {
+    fn get_activity(&self, activity_id: &str) -> Result<Activity>;
+    fn get_activities(&self) -> Result<Vec<Activity>>;
+    /// Business-concurrency versions for a batch of ids. Default empty so
+    /// read-only test doubles keep compiling; SQLite returns real values.
+    fn activity_versions(&self, _ids: &[String]) -> Result<HashMap<String, i32>> {
+        Ok(HashMap::new())
+    }
+    fn get_activities_by_ids(&self, activity_ids: &[String]) -> Result<Vec<Activity>> {
+        if activity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested: HashSet<&str> = activity_ids.iter().map(String::as_str).collect();
+        let mut activities = self.get_activities()?;
+        activities.retain(|activity| requested.contains(activity.id.as_str()));
+        Ok(activities)
+    }
+    fn get_activities_by_source_group_id(&self, source_group_id: &str) -> Result<Vec<Activity>> {
+        let group_id = source_group_id.trim();
+        if group_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut activities = self.get_activities()?;
+        activities.retain(|activity| activity.source_group_id.as_deref() == Some(group_id));
+        Ok(activities)
+    }
+    fn get_activities_by_account_id(&self, account_id: &str) -> Result<Vec<Activity>>;
+    /// Activities of the accounts, archived accounts included (the kernel
+    /// pairs transfers against archived counterparties).
+    fn get_activities_by_account_ids_including_archived(
+        &self,
+        account_ids: &[String],
+    ) -> Result<Vec<Activity>> {
+        let requested: HashSet<&str> = account_ids.iter().map(String::as_str).collect();
+        let mut activities = self.get_activities_including_archived_accounts()?;
+        activities.retain(|activity| requested.contains(activity.account_id.as_str()));
+        Ok(activities)
+    }
+    /// Every activity of the transfer groups, archived accounts included.
+    fn get_activities_by_source_group_ids(&self, group_ids: &[String]) -> Result<Vec<Activity>> {
+        let wanted: HashSet<&str> = group_ids.iter().map(String::as_str).collect();
+        if wanted.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut activities = self.get_activities_including_archived_accounts()?;
+        activities.retain(|activity| {
+            activity
+                .source_group_id
+                .as_deref()
+                .is_some_and(|g| wanted.contains(g))
+        });
+        Ok(activities)
+    }
+    fn get_activities_by_account_ids(&self, account_ids: &[String]) -> Result<Vec<Activity>>;
+    fn get_activities_by_account_ids_in_date_range(
+        &self,
+        account_ids: &[String],
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+    ) -> Result<Vec<Activity>> {
+        let requested_accounts: HashSet<&str> = account_ids.iter().map(String::as_str).collect();
+        let mut activities = self.get_activities()?;
+        activities.retain(|activity| {
+            requested_accounts.contains(activity.account_id.as_str())
+                && activity.activity_date >= start_utc
+                && activity.activity_date <= end_utc
+        });
+        Ok(activities)
+    }
+    fn get_transfer_activities_touching_account_ids_in_date_range(
+        &self,
+        account_ids: &[String],
+        start_utc: Option<DateTime<Utc>>,
+        end_exclusive_utc: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Activity>> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let requested_accounts: HashSet<&str> = account_ids.iter().map(String::as_str).collect();
+        let mut scoped_transfers = self.get_activities()?;
+        scoped_transfers.retain(|activity| {
+            requested_accounts.contains(activity.account_id.as_str())
+                && activity.is_posted()
+                && matches!(
+                    activity.effective_type(),
+                    ACTIVITY_TYPE_TRANSFER_IN | ACTIVITY_TYPE_TRANSFER_OUT
+                )
+                && start_utc
+                    .map(|start| activity.activity_date >= start)
+                    .unwrap_or(true)
+                && end_exclusive_utc
+                    .map(|end| activity.activity_date < end)
+                    .unwrap_or(true)
+        });
+
+        let group_ids: HashSet<String> = scoped_transfers
+            .iter()
+            .filter_map(|activity| activity.source_group_id.clone())
+            .collect();
+        let mut by_id: HashMap<String, Activity> = scoped_transfers
+            .into_iter()
+            .map(|activity| (activity.id.clone(), activity))
+            .collect();
+
+        if !group_ids.is_empty() {
+            for activity in self.get_activities()? {
+                if !activity.is_posted()
+                    || !matches!(
+                        activity.effective_type(),
+                        ACTIVITY_TYPE_TRANSFER_IN | ACTIVITY_TYPE_TRANSFER_OUT
+                    )
+                {
+                    continue;
+                }
+                if activity
+                    .source_group_id
+                    .as_ref()
+                    .is_some_and(|group_id| group_ids.contains(group_id))
+                {
+                    by_id.entry(activity.id.clone()).or_insert(activity);
+                }
+            }
+        }
+
+        let mut activities: Vec<Activity> = by_id.into_values().collect();
+        activities.sort_by_key(|activity| activity.activity_date);
+        Ok(activities)
+    }
+    fn get_trading_activities(&self) -> Result<Vec<Activity>>;
+    fn get_income_activities(&self) -> Result<Vec<Activity>>;
+    /// Fetches contribution-eligible activities (DEPOSIT, TRANSFER_IN, TRANSFER_OUT, CREDIT)
+    /// for the given accounts within the date range. Filtering logic is applied in the service.
+    #[allow(clippy::too_many_arguments)]
+    fn search_activities(
+        &self,
+        page: i64,
+        page_size: i64,
+        account_id_filter: Option<Vec<String>>,
+        activity_type_filter: Option<Vec<String>>,
+        asset_id_keyword: Option<String>,
+        sort: Option<Sort>,
+        needs_review_filter: Option<bool>,
+        date_from: Option<NaiveDate>,
+        date_to: Option<NaiveDate>,
+        instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
+    ) -> Result<ActivitySearchResponse>;
+    #[allow(clippy::too_many_arguments)]
+    fn search_activities_in_utc_range(
+        &self,
+        page: i64,
+        page_size: i64,
+        account_id_filter: Option<Vec<String>>,
+        activity_type_filter: Option<Vec<String>>,
+        asset_id_keyword: Option<String>,
+        sort: Option<Sort>,
+        needs_review_filter: Option<bool>,
+        date_from_utc: Option<DateTime<Utc>>,
+        date_to_utc_exclusive: Option<DateTime<Utc>>,
+        instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
+    ) -> Result<ActivitySearchResponse> {
+        let date_from = date_from_utc.map(|dt| dt.date_naive());
+        let date_to =
+            date_to_utc_exclusive.map(|dt| (dt - chrono::Duration::seconds(1)).date_naive());
+
+        self.search_activities(
+            page,
+            page_size,
+            account_id_filter,
+            activity_type_filter,
+            asset_id_keyword,
+            sort,
+            needs_review_filter,
+            date_from,
+            date_to,
+            instrument_type_filter,
+            activity_id_filter,
+        )
+    }
+    async fn create_activity(&self, new_activity: NewActivity) -> Result<Activity>;
+    async fn update_activity(&self, activity_update: ActivityUpdate) -> Result<Activity>;
+    /// Deletes only the specified row. Source grouping is provenance, not cascade authority.
+    /// Services deleting a validated transfer pair pass both IDs to bulk mutation.
+    async fn delete_activity(&self, activity_id: String) -> Result<Activity>;
+    /// Pairs two existing transfer activities by writing a shared `source_group_id`
+    /// and clearing `metadata.flow.is_external` on both. Order of `activity_a_id` /
+    /// `activity_b_id` is irrelevant; the impl resolves which is IN vs OUT.
+    async fn link_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)>;
+    /// Unpairs two linked transfer activities by clearing their shared `source_group_id`
+    /// and marking `metadata.flow.is_external` as true on both rows.
+    async fn unlink_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)>;
+    /// Applies writes and explicit deletion IDs atomically, suppressing duplicate IDs.
+    /// Callers resolve and validate linked transfer pairs before supplying both leg IDs.
+    async fn bulk_mutate_activities(
+        &self,
+        creates: Vec<NewActivity>,
+        updates: Vec<ActivityUpdate>,
+        delete_ids: Vec<String>,
+    ) -> Result<ActivityBulkMutationResult>;
+    async fn create_activities(&self, activities: Vec<NewActivity>) -> Result<usize>;
+    /// Returns activities from both active and archived accounts.
+    fn get_activities_including_archived_accounts(&self) -> Result<Vec<Activity>> {
+        Err(crate::Error::Unexpected(
+            "Activity repository does not support archived-account activity reads".to_string(),
+        ))
+    }
+    /// SPLIT activities (effective type) of the given assets in every account,
+    /// archived ones included: a split belongs to the asset, so it tells how
+    /// every holder's quotes read, whichever account recorded it.
+    fn get_split_activities_by_asset_ids(&self, asset_ids: &[String]) -> Result<Vec<Activity>> {
+        if asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested: HashSet<&str> = asset_ids.iter().map(String::as_str).collect();
+        let mut activities = self.get_activities_including_archived_accounts()?;
+        activities.retain(|activity| {
+            activity.effective_type() == "SPLIT"
+                && activity
+                    .asset_id
+                    .as_deref()
+                    .is_some_and(|asset| requested.contains(asset))
+        });
+        Ok(activities)
+    }
+    async fn update_activities_for_final_cash_migration(
+        &self,
+        updates: Vec<ActivityFinalCashMigrationUpdate>,
+    ) -> Result<ActivityFinalCashMigrationWriteResult> {
+        let _ = updates;
+        Err(crate::Error::Unexpected(
+            "Activity repository does not support the final-cash migration".to_string(),
+        ))
+    }
+    fn get_first_activity_date(
+        &self,
+        account_ids: Option<&[String]>,
+    ) -> Result<Option<DateTime<Utc>>>;
+
+    fn get_income_activities_data(&self, account_ids: Option<&[String]>)
+        -> Result<Vec<IncomeData>>;
+    fn get_first_activity_date_overall(&self) -> Result<DateTime<Utc>>;
+
+    /// Gets the first and last activity dates for each asset in the provided list.
+    ///
+    /// This is useful for sync planning to determine the date range needed for quotes.
+    /// The implementation should chunk the query if asset_ids.len() exceeds SQLite parameter limits.
+    ///
+    /// # Returns
+    ///
+    /// A map from asset_id to a tuple of (first_activity_date, last_activity_date).
+    /// Both dates may be None if no activities exist for the asset.
+    #[allow(clippy::type_complexity)]
+    fn get_activity_bounds_for_assets(
+        &self,
+        asset_ids: &[String],
+    ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>>;
+
+    /// Gets the first and last non-archived holdings snapshot dates where each
+    /// asset appears.
+    ///
+    /// Holdings-mode assets can have historical valuation exposure without any
+    /// activity rows, so quote planning must include these bounds too.
+    #[allow(clippy::type_complexity)]
+    fn get_holdings_snapshot_bounds_for_assets(
+        &self,
+        asset_ids: &[String],
+    ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>>;
+
+    /// Checks for existing activities with the given idempotency keys.
+    ///
+    /// Returns a map of {idempotency_key: existing_activity_id} for keys that already exist.
+    fn check_existing_duplicates(
+        &self,
+        idempotency_keys: &[String],
+    ) -> Result<HashMap<String, String>>;
+
+    /// Upserts multiple activities (insert or update on conflict by ID or idempotency_key).
+    /// Respects is_user_modified flag - skips updates to user-modified activities.
+    ///
+    /// Returns statistics about the operation.
+    async fn bulk_upsert(
+        &self,
+        activities: Vec<super::ActivityUpsert>,
+    ) -> Result<super::BulkUpsertResult>;
+
+    /// Reassigns all activities from one asset to another.
+    /// Used when merging UNKNOWN assets into resolved ones.
+    /// Returns the number of activities updated.
+    async fn reassign_asset(&self, old_asset_id: &str, new_asset_id: &str) -> Result<u32>;
+
+    /// Returns distinct account_ids and currencies for activities with the given asset_id.
+    /// Used to plan recalculations after asset merges.
+    async fn get_activity_accounts_and_currencies_by_asset_id(
+        &self,
+        asset_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>)>;
+}
+
+/// Trait defining the contract for Activity service operations.
+#[async_trait]
+pub trait ActivityServiceTrait: Send + Sync {
+    fn get_activity(&self, activity_id: &str) -> Result<Activity>;
+    fn get_activities(&self) -> Result<Vec<Activity>>;
+    /// Business-concurrency versions for a batch of ids. Default empty so
+    /// read-only test doubles keep compiling; SQLite returns real values.
+    fn activity_versions(&self, _ids: &[String]) -> Result<HashMap<String, i32>> {
+        Ok(HashMap::new())
+    }
+    /// Returns activities from both active and archived accounts.
+    fn get_activities_including_archived_accounts(&self) -> Result<Vec<Activity>>;
+    fn get_activities_by_account_id(&self, account_id: &str) -> Result<Vec<Activity>>;
+    fn get_activities_by_account_ids(&self, account_ids: &[String]) -> Result<Vec<Activity>>;
+    fn get_trading_activities(&self) -> Result<Vec<Activity>>;
+    fn get_income_activities(&self) -> Result<Vec<Activity>>;
+    #[allow(clippy::too_many_arguments)]
+    fn search_activities(
+        &self,
+        page: i64,
+        page_size: i64,
+        account_id_filter: Option<Vec<String>>,
+        activity_type_filter: Option<Vec<String>>,
+        asset_id_keyword: Option<String>,
+        sort: Option<Sort>,
+        needs_review_filter: Option<bool>,
+        date_from: Option<NaiveDate>,
+        date_to: Option<NaiveDate>,
+        instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
+    ) -> Result<ActivitySearchResponse>;
+    #[allow(clippy::too_many_arguments)]
+    fn search_activities_in_utc_range(
+        &self,
+        page: i64,
+        page_size: i64,
+        account_id_filter: Option<Vec<String>>,
+        activity_type_filter: Option<Vec<String>>,
+        asset_id_keyword: Option<String>,
+        sort: Option<Sort>,
+        needs_review_filter: Option<bool>,
+        date_from_utc: Option<DateTime<Utc>>,
+        date_to_utc_exclusive: Option<DateTime<Utc>>,
+        instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
+    ) -> Result<ActivitySearchResponse> {
+        let date_from = date_from_utc.map(|dt| dt.date_naive());
+        let date_to =
+            date_to_utc_exclusive.map(|dt| (dt - chrono::Duration::seconds(1)).date_naive());
+
+        self.search_activities(
+            page,
+            page_size,
+            account_id_filter,
+            activity_type_filter,
+            asset_id_keyword,
+            sort,
+            needs_review_filter,
+            date_from,
+            date_to,
+            instrument_type_filter,
+            activity_id_filter,
+        )
+    }
+    fn get_first_activity_date(
+        &self,
+        account_ids: Option<&[String]>,
+    ) -> Result<Option<DateTime<Utc>>>;
+
+    async fn create_activity(&self, activity: NewActivity) -> Result<Activity>;
+
+    /// Validate and normalize an activity exactly as `create_activity` would,
+    /// without writing it.
+    ///
+    /// The unified business path prepares here, then commits the activity and
+    /// its category/event/request/audit rows in one cross-repository
+    /// transaction.
+    async fn prepare_activity_for_commit(&self, activity: NewActivity) -> Result<NewActivity>;
+
+    /// Validate and normalize an update exactly as `update_activity` would,
+    /// without writing it. Returns the prepared patch and the row it targets.
+    async fn prepare_activity_update_for_commit(
+        &self,
+        update: ActivityUpdate,
+    ) -> Result<(ActivityUpdate, Activity)>;
+
+    /// Emit the standard activities-changed events for a commit performed
+    /// outside this service. Call only after the transaction committed.
+    fn notify_activity_committed(&self, previous: Option<&Activity>, current: &Activity);
+    async fn update_activity(&self, activity: ActivityUpdate) -> Result<Activity>;
+    /// Runs `update_activity`'s validation and returns what it would write,
+    /// for the activity and a linked transfer leg, without writing anything.
+    /// The asset may only be named by id: resolving a symbol may create one.
+    fn preview_activity_update(&self, activity: ActivityUpdate) -> Result<ActivityUpdatePreview>;
+    async fn delete_activity(&self, activity_id: String) -> Result<Activity>;
+    /// Returns the internal transfer pair for the activity, or `None` when the
+    /// activity exists but is not part of a valid internal transfer pair.
+    fn get_transfer_pair_for_activity(
+        &self,
+        activity_id: String,
+    ) -> Result<Option<InternalTransferPairResponse>>;
+    fn find_transfer_match_candidates(
+        &self,
+        request: TransferMatchCandidateRequest,
+    ) -> Result<Vec<TransferMatchCandidate>>;
+    /// Posted transfers in scope with no linked other side, newest first, each
+    /// with its link state and best candidates, in the accounts the Health
+    /// Center checks. One read of the activities serves the scan, which runs
+    /// off the async workers.
+    async fn find_unlinked_transfers(
+        &self,
+        request: UnlinkedTransfersRequest,
+    ) -> Result<UnlinkedTransfers>;
+    async fn save_internal_transfer_pair(
+        &self,
+        request: InternalTransferPairRequest,
+    ) -> Result<InternalTransferPairResponse>;
+    async fn link_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)>;
+    async fn unlink_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)>;
+    async fn bulk_mutate_activities(
+        &self,
+        request: ActivityBulkMutationRequest,
+    ) -> Result<ActivityBulkMutationResult>;
+
+    /// Checks for existing activities with the given idempotency keys.
+    ///
+    /// Returns a map of {idempotency_key: existing_activity_id} for keys that already exist.
+    fn check_existing_duplicates(
+        &self,
+        idempotency_keys: Vec<String>,
+    ) -> Result<HashMap<String, String>>;
+
+    /// Prepares activities for normal save/create flows.
+    /// Uses only payload metadata (no live symbol/provider resolution).
+    ///
+    /// Steps:
+    /// 1. Build canonical asset specs from payload data
+    /// 2. Compute canonical asset IDs
+    /// 3. Ensure all assets exist (batch)
+    /// 4. Register FX pairs (batch)
+    /// 5. Validate each activity
+    ///
+    async fn prepare_activities_for_save(
+        &self,
+        activities: Vec<NewActivity>,
+        account: &crate::accounts::Account,
+    ) -> Result<PrepareActivitiesResult>;
+}

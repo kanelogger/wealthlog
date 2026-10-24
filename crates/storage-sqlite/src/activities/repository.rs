@@ -1,0 +1,5576 @@
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use diesel::expression_methods::ExpressionMethods;
+use diesel::prelude::*;
+use diesel::r2d2::{ConnectionManager, Pool};
+use diesel::sql_query;
+use diesel::sql_types::{Bool, Nullable, Text};
+use diesel::sqlite::Sqlite;
+use diesel::sqlite::SqliteConnection;
+use rust_decimal::Decimal;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
+use std::sync::Arc;
+use uuid::Uuid;
+
+use wealthfolio_core::accounts::{account_supports_purpose, AccountPurpose};
+use wealthfolio_core::activities::ActivityError;
+use wealthfolio_core::activities::{
+    is_cash_symbol, stored_type_override, type_override, violates_final_cash_floor, Activity,
+    ActivityBulkIdentifierMapping, ActivityBulkMutationResult, ActivityDetails,
+    ActivityFinalCashMigrationUpdate, ActivityFinalCashMigrationWriteResult,
+    ActivityRepositoryTrait, ActivitySearchResponse, ActivitySearchResponseMeta, ActivityUpdate,
+    ActivityUpsert, BulkUpsertResult, IncomeData, NewActivity, Sort, ACTIVITY_TYPE_TRANSFER_IN,
+    ACTIVITY_TYPE_TRANSFER_OUT, INCOME_ACTIVITY_TYPES, TRADING_ACTIVITY_TYPES,
+};
+use wealthfolio_core::assets::{contract_multiplier_from_asset_metadata, InstrumentType};
+use wealthfolio_core::{Error, Result};
+
+use super::model::{ActivityDB, ActivityDetailsDB};
+use crate::db::{get_connection, WriteHandle};
+use crate::errors::StorageError;
+use crate::schema::{accounts, activities, assets, spending_activity_splits};
+use crate::utils::{chunk_for_sqlite, SQLITE_MAX_PARAMS_CHUNK};
+use async_trait::async_trait;
+use diesel::dsl::{max, min, sql};
+use num_traits::Zero;
+
+/// Repository for managing activity data in the database
+pub struct ActivityRepository {
+    pool: Arc<Pool<ConnectionManager<SqliteConnection>>>,
+    writer: WriteHandle,
+}
+
+fn apply_decimal_patch(existing: Option<String>, patch: Option<Option<Decimal>>) -> Option<String> {
+    match patch {
+        None => existing,
+        Some(None) => None,
+        Some(Some(value)) => Some(value.to_string()),
+    }
+}
+
+fn is_broker_origin_activity(activity: &ActivityDB) -> bool {
+    let source_system = activity
+        .source_system
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase());
+
+    if matches!(source_system.as_deref(), Some("MANUAL" | "CSV")) {
+        return false;
+    }
+
+    activity
+        .import_run_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || activity
+            .source_record_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+pub fn activity_update_invalidates_spending_splits(
+    before: &ActivityDB,
+    after: &ActivityDB,
+) -> bool {
+    before.account_id != after.account_id
+        || before.activity_type != after.activity_type
+        || type_override(before.activity_type_override.as_deref())
+            != type_override(after.activity_type_override.as_deref())
+        || before.subtype != after.subtype
+        || before.amount != after.amount
+        || before.source_group_id != after.source_group_id
+}
+
+pub(crate) fn clear_spending_splits_for_activity_tx(
+    tx: &mut crate::db::write_actor::DbWriteTx<'_>,
+    activity_id: &str,
+) -> Result<()> {
+    let existing_ids = spending_activity_splits::table
+        .filter(spending_activity_splits::activity_id.eq(activity_id))
+        .select(spending_activity_splits::id)
+        .load::<String>(tx.conn())
+        .map_err(StorageError::from)?;
+    if existing_ids.is_empty() {
+        return Ok(());
+    }
+
+    diesel::delete(
+        spending_activity_splits::table
+            .filter(spending_activity_splits::activity_id.eq(activity_id)),
+    )
+    .execute(tx.conn())
+    .map_err(StorageError::from)?;
+
+    Ok(())
+}
+
+pub fn preserve_broker_base_type(activity: &mut ActivityDB, existing_activity_type: &str) {
+    // Preserve the original classification on historical broker rows; manual edits
+    // continue to use the effective-type override without a sync repository.
+    if !is_broker_origin_activity(activity) {
+        return;
+    }
+
+    let requested_activity_type = activity.activity_type.clone();
+    activity.activity_type = existing_activity_type.to_string();
+    activity.activity_type_override = if requested_activity_type == activity.activity_type {
+        None
+    } else {
+        Some(requested_activity_type)
+    };
+}
+
+fn set_transfer_flow_external(metadata: Option<String>, is_external: bool) -> Option<String> {
+    let mut value = metadata
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(&metadata).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+
+    let object = value
+        .as_object_mut()
+        .expect("transfer metadata value should be an object");
+    let flow = object
+        .entry("flow")
+        .or_insert_with(|| serde_json::json!({}));
+    if !flow.is_object() {
+        *flow = serde_json::json!({});
+    }
+    if let Some(flow_object) = flow.as_object_mut() {
+        flow_object.insert("is_external".to_string(), serde_json::json!(is_external));
+    }
+
+    Some(value.to_string())
+}
+
+fn transfer_flow_is_external(metadata: Option<&str>) -> bool {
+    metadata
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+        .and_then(|value| {
+            value
+                .get("flow")
+                .and_then(|flow| flow.get("is_external"))
+                .and_then(|value| value.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+fn link_transfer_tolerance() -> Decimal {
+    Decimal::new(1, 6)
+}
+
+fn non_cash_transfer_asset_key(activity: &ActivityDB) -> Option<String> {
+    activity
+        .asset_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|asset_id| !asset_id.is_empty())
+        .filter(|asset_id| !is_cash_symbol(asset_id))
+        .map(str::to_uppercase)
+}
+
+fn effective_activity_type(activity: &ActivityDB) -> &str {
+    wealthfolio_core::activities::effective_activity_type(
+        &activity.activity_type,
+        activity.activity_type_override.as_deref(),
+    )
+}
+
+/// The characters Rust's `str::trim` strips (Unicode White_Space), as a
+/// SQLite list, so SQL and Rust agree on what a blank override is. The
+/// projection triggers trim the same list.
+pub(crate) const SQL_WHITESPACE: &str = "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)";
+
+/// An activity's effective type in SQL, `table` naming the activities table:
+/// its override when not blank, else its stored type, as core's
+/// `effective_activity_type` and the engine read it (engine rules §5). Every
+/// query reads the type through this.
+pub(crate) fn effective_type_sql(table: &str) -> String {
+    format!(
+        "COALESCE(NULLIF(TRIM({table}.activity_type_override, {SQL_WHITESPACE}), ''), {table}.activity_type)"
+    )
+}
+
+fn source_group_blocks_transfer_link(
+    conn: &mut SqliteConnection,
+    source_group_id: Option<&str>,
+) -> Result<bool> {
+    let Some(group_id) = source_group_id
+        .map(str::trim)
+        .filter(|group_id| !group_id.is_empty())
+    else {
+        return Ok(false);
+    };
+
+    let group_activities = activities::table
+        .filter(activities::source_group_id.eq(group_id))
+        .select(ActivityDB::as_select())
+        .load::<ActivityDB>(conn)
+        .map_err(StorageError::from)?;
+    if group_activities.len() != 2 {
+        return Ok(false);
+    }
+
+    let transfer_in = group_activities
+        .iter()
+        .find(|activity| effective_activity_type(activity) == ACTIVITY_TYPE_TRANSFER_IN);
+    let transfer_out = group_activities
+        .iter()
+        .find(|activity| effective_activity_type(activity) == ACTIVITY_TYPE_TRANSFER_OUT);
+
+    let (Some(transfer_in), Some(transfer_out)) = (transfer_in, transfer_out) else {
+        return Ok(false);
+    };
+    if transfer_in.account_id == transfer_out.account_id {
+        return Ok(is_same_account_cash_fx_conversion_db(
+            transfer_in,
+            transfer_out,
+        ));
+    }
+
+    Ok(validate_link_transfer_asset_shape(transfer_in, transfer_out).is_ok())
+}
+
+fn clear_invalid_source_group_for_external_transfer(
+    conn: &mut SqliteConnection,
+    activity: &mut ActivityDB,
+) -> Result<()> {
+    let is_transfer = matches!(
+        effective_activity_type(activity),
+        ACTIVITY_TYPE_TRANSFER_IN | ACTIVITY_TYPE_TRANSFER_OUT
+    );
+    if !is_transfer || !transfer_flow_is_external(activity.metadata.as_deref()) {
+        return Ok(());
+    }
+    if !source_group_blocks_transfer_link(conn, activity.source_group_id.as_deref())? {
+        activity.source_group_id = None;
+    }
+    Ok(())
+}
+
+fn parse_optional_decimal(value: Option<&String>) -> Option<Decimal> {
+    value
+        .and_then(|value| Decimal::from_str(value.trim()).ok())
+        .map(|value| value.abs())
+}
+
+fn has_positive_cash_amount(activity: &ActivityDB) -> bool {
+    parse_optional_decimal(activity.amount.as_ref()).is_some_and(|amount| !amount.is_zero())
+}
+
+fn is_same_account_cash_fx_conversion_db(
+    transfer_in: &ActivityDB,
+    transfer_out: &ActivityDB,
+) -> bool {
+    transfer_in.account_id == transfer_out.account_id
+        && non_cash_transfer_asset_key(transfer_in).is_none()
+        && non_cash_transfer_asset_key(transfer_out).is_none()
+        && has_positive_cash_amount(transfer_in)
+        && has_positive_cash_amount(transfer_out)
+        && !transfer_in
+            .currency
+            .trim()
+            .eq_ignore_ascii_case(transfer_out.currency.trim())
+}
+
+fn validate_link_transfer_asset_shape(
+    transfer_in: &ActivityDB,
+    transfer_out: &ActivityDB,
+) -> Result<()> {
+    let in_asset = non_cash_transfer_asset_key(transfer_in);
+    let out_asset = non_cash_transfer_asset_key(transfer_out);
+    if in_asset.is_none() && out_asset.is_none() {
+        return Ok(());
+    }
+
+    if in_asset != out_asset {
+        return Err(Error::from(ActivityError::InvalidData(
+            "Security transfer legs use different assets".to_string(),
+        )));
+    }
+
+    let in_qty = parse_optional_decimal(transfer_in.quantity.as_ref());
+    let out_qty = parse_optional_decimal(transfer_out.quantity.as_ref());
+    match (in_qty, out_qty) {
+        (Some(in_qty), Some(out_qty)) if (in_qty - out_qty).abs() <= link_transfer_tolerance() => {
+            Ok(())
+        }
+        (Some(_), Some(_)) => Err(Error::from(ActivityError::InvalidData(
+            "Security transfer legs use different quantities".to_string(),
+        ))),
+        _ => Err(Error::from(ActivityError::InvalidData(
+            "Security transfer legs must both include quantity".to_string(),
+        ))),
+    }
+}
+
+// Inherent methods for ActivityRepository
+impl ActivityRepository {
+    /// Creates a new ActivityRepository instance
+    pub fn new(pool: Arc<Pool<ConnectionManager<SqliteConnection>>>, writer: WriteHandle) -> Self {
+        Self { pool, writer }
+    }
+
+    fn naive_date_start_utc(date: NaiveDate) -> DateTime<Utc> {
+        DateTime::from_naive_utc_and_offset(date.and_time(NaiveTime::MIN), Utc)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_activities_with_utc_bounds(
+        &self,
+        page: i64,
+        page_size: i64,
+        account_id_filter: Option<Vec<String>>,
+        activity_type_filter: Option<Vec<String>>,
+        asset_id_keyword: Option<String>,
+        sort: Option<Sort>,
+        needs_review_filter: Option<bool>,
+        date_from_utc: Option<DateTime<Utc>>,
+        date_to_utc_exclusive: Option<DateTime<Utc>>,
+        instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
+    ) -> Result<ActivitySearchResponse> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let offset = page * page_size;
+
+        let create_base_query = |_conn: &SqliteConnection| {
+            let mut query = activities::table
+                .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+                .left_join(assets::table.on(activities::asset_id.eq(assets::id.nullable())))
+                .filter(accounts::is_archived.eq(false))
+                .into_boxed();
+
+            if let Some(ref activity_ids) = activity_id_filter {
+                query = query.filter(activities::id.eq_any(activity_ids));
+            }
+            if let Some(ref account_ids) = account_id_filter {
+                query = query.filter(activities::account_id.eq_any(account_ids));
+            }
+            if let Some(ref activity_types) = activity_type_filter {
+                query = query
+                    .filter(sql::<Text>(&effective_type_sql("activities")).eq_any(activity_types));
+            }
+            if let Some(ref keyword) = asset_id_keyword {
+                let pattern = format!("%{}%", keyword);
+                query = query.filter(
+                    assets::id
+                        .like(pattern.clone())
+                        .or(assets::name.like(pattern.clone()))
+                        .or(assets::display_code.like(pattern.clone()))
+                        .or(activities::subtype.like(pattern.clone()))
+                        .or(activities::notes.like(pattern)),
+                );
+            }
+            if let Some(needs_review) = needs_review_filter {
+                query = query.filter(activities::needs_review.eq(i32::from(needs_review)));
+            }
+            if let Some(from_utc) = date_from_utc {
+                query = query.filter(activities::activity_date.ge(from_utc.to_rfc3339()));
+            }
+            if let Some(to_utc) = date_to_utc_exclusive {
+                query = query.filter(activities::activity_date.lt(to_utc.to_rfc3339()));
+            }
+            if let Some(ref instrument_types) = instrument_type_filter {
+                query = query.filter(assets::instrument_type.eq_any(instrument_types));
+            }
+
+            if let Some(ref sort) = sort {
+                match sort.id.as_str() {
+                    "date" => {
+                        if sort.desc {
+                            query = query.order((
+                                activities::activity_date.desc(),
+                                activities::created_at.asc(),
+                            ));
+                        } else {
+                            query = query.order((
+                                activities::activity_date.asc(),
+                                activities::created_at.asc(),
+                            ));
+                        }
+                    }
+                    "activityType" => {
+                        if sort.desc {
+                            query =
+                                query.order(sql::<Text>(&effective_type_sql("activities")).desc());
+                        } else {
+                            query =
+                                query.order(sql::<Text>(&effective_type_sql("activities")).asc());
+                        }
+                    }
+                    "assetSymbol" => {
+                        if sort.desc {
+                            query = query.order(activities::asset_id.desc());
+                        } else {
+                            query = query.order(activities::asset_id.asc());
+                        }
+                    }
+                    "accountName" => {
+                        if sort.desc {
+                            query = query.order(accounts::name.desc());
+                        } else {
+                            query = query.order(accounts::name.asc());
+                        }
+                    }
+                    _ => {
+                        query = query.order((
+                            activities::activity_date.desc(),
+                            activities::created_at.asc(),
+                        ))
+                    }
+                }
+            } else {
+                query = query.order((
+                    activities::activity_date.desc(),
+                    activities::created_at.asc(),
+                ));
+            }
+
+            query
+        };
+
+        let total_row_count = create_base_query(&conn)
+            .count()
+            .get_result::<i64>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        let results_db = create_base_query(&conn)
+            .select((
+                (
+                    activities::id,
+                    activities::account_id,
+                    activities::asset_id,
+                    sql::<Text>(&effective_type_sql("activities")),
+                    activities::subtype,
+                    activities::status,
+                    activities::activity_date,
+                    activities::quantity,
+                    activities::unit_price,
+                    activities::currency,
+                    activities::fee,
+                    activities::tax,
+                    activities::amount,
+                    activities::notes,
+                    activities::fx_rate,
+                    activities::needs_review,
+                    activities::is_user_modified,
+                    activities::source_system,
+                    activities::source_record_id,
+                    activities::source_group_id,
+                    activities::idempotency_key,
+                    activities::import_run_id,
+                    activities::created_at,
+                    activities::updated_at,
+                    accounts::name,
+                    accounts::currency,
+                    assets::display_code.nullable(),
+                    assets::name.nullable(),
+                    assets::instrument_exchange_mic.nullable(),
+                    assets::quote_mode.nullable(),
+                    assets::instrument_type.nullable(),
+                    activities::metadata,
+                ),
+                assets::metadata.nullable(),
+            ))
+            .limit(page_size)
+            .offset(offset)
+            .load::<(ActivityDetailsDB, Option<String>)>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        // Diesel's select tuple tops out at 32 columns; the business version
+        // rides along in a second lookup for the page's ids.
+        let page_ids: Vec<String> = results_db.iter().map(|(db, _)| db.id.clone()).collect();
+        let versions: HashMap<String, (i32, Option<String>)> = if page_ids.is_empty() {
+            HashMap::new()
+        } else {
+            #[derive(QueryableByName)]
+            struct VersionRow {
+                #[diesel(sql_type = Text)]
+                id: String,
+                #[diesel(sql_type = diesel::sql_types::Integer)]
+                version: i32,
+                #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+                activity_type_override: Option<String>,
+            }
+            let quoted = page_ids
+                .iter()
+                .map(|id| format!("'{}'", id.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql_text = format!(
+                "SELECT id, version, activity_type_override FROM activities WHERE id IN ({quoted})"
+            );
+            sql_query(sql_text)
+                .load::<VersionRow>(&mut conn)
+                .map_err(StorageError::from)?
+                .into_iter()
+                .map(|row| (row.id, (row.version, row.activity_type_override)))
+                .collect()
+        };
+
+        let results: Vec<ActivityDetails> = results_db
+            .into_iter()
+            .map(|(db, asset_metadata)| {
+                let has_asset = db.asset_id.is_some();
+                let instrument_type = db
+                    .instrument_type
+                    .as_deref()
+                    .and_then(InstrumentType::from_db_str);
+                let asset_metadata: Option<serde_json::Value> = asset_metadata
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str(value).ok());
+                let mut activity = ActivityDetails::from(db);
+                let (version, override_value) =
+                    versions.get(&activity.id).cloned().unwrap_or_default();
+                activity.version = version;
+                activity.activity_type_override = override_value;
+                activity.asset_contract_multiplier = has_asset.then(|| {
+                    contract_multiplier_from_asset_metadata(
+                        instrument_type.as_ref(),
+                        asset_metadata.as_ref(),
+                    )
+                    .to_string()
+                });
+                activity
+            })
+            .collect();
+
+        Ok(ActivitySearchResponse {
+            data: results,
+            meta: ActivitySearchResponseMeta { total_row_count },
+        })
+    }
+}
+
+/// Merges `final_cash_migration.legacy_amount` into an activity's metadata,
+/// first write wins. Returns `None` when nothing should be written: the
+/// breadcrumb already exists, or the stored metadata is not a JSON object
+/// (never clobber unknown content).
+enum LegacyBreadcrumb {
+    /// The breadcrumb already exists (crash re-run); keep the original.
+    NotNeeded,
+    /// Write this metadata alongside the amount rewrite.
+    Write(String),
+    /// The stored metadata is not a JSON object, so the replaced amount has
+    /// nowhere to be preserved - the rewrite must not proceed silently.
+    Unrecordable,
+}
+
+fn final_cash_legacy_metadata(existing: Option<&str>, legacy_amount: &str) -> LegacyBreadcrumb {
+    let mut metadata = match existing.filter(|raw| !raw.trim().is_empty()) {
+        Some(raw) => match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(map)) => map,
+            // Never clobber unknown content - and never lose the replaced
+            // amount either; the caller preserves the row instead.
+            _ => return LegacyBreadcrumb::Unrecordable,
+        },
+        None => serde_json::Map::new(),
+    };
+    let entry = metadata
+        .entry("final_cash_migration")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(object) = entry.as_object_mut() else {
+        return LegacyBreadcrumb::Unrecordable;
+    };
+    if object.contains_key("legacy_amount") {
+        return LegacyBreadcrumb::NotNeeded;
+    }
+    object.insert(
+        "legacy_amount".to_string(),
+        serde_json::Value::String(legacy_amount.to_string()),
+    );
+    LegacyBreadcrumb::Write(serde_json::Value::Object(metadata).to_string())
+}
+
+/// Final-cash floor (see `violates_final_cash_floor` in core): refuses to
+/// persist a POSTED cash-bearing row that has no amount and no review flag.
+/// Applied at every repository write door; the migration door is exempt by
+/// design (its rewrites always flag the rows they cannot verify).
+pub fn assert_final_cash_floor(activity_db: &ActivityDB) -> Result<()> {
+    let effective_type = effective_activity_type(activity_db);
+    let has_amount = activity_db
+        .amount
+        .as_deref()
+        .is_some_and(|amount| !amount.trim().is_empty());
+    if violates_final_cash_floor(
+        effective_type,
+        activity_db.asset_id.as_deref(),
+        &activity_db.status,
+        has_amount,
+        activity_db.needs_review != 0,
+    ) {
+        return Err(Error::Validation(
+            wealthfolio_core::errors::ValidationError::InvalidInput(format!(
+                "Refusing to persist activity '{}': a posted {} with no final cash amount must be flagged for review",
+                activity_db.id, effective_type
+            )),
+        ));
+    }
+    Ok(())
+}
+
+// Implement the trait for the repository
+#[async_trait]
+impl ActivityRepositoryTrait for ActivityRepository {
+    fn get_activity(&self, activity_id: &str) -> Result<Activity> {
+        let mut conn = get_connection(&self.pool)?;
+        let activity_db = activities::table
+            .select(ActivityDB::as_select())
+            .find(activity_id)
+            .first::<ActivityDB>(&mut conn)
+            .map_err(|e| Error::from(ActivityError::NotFound(e.to_string())))?;
+        Ok(Activity::from(activity_db))
+    }
+
+    fn get_trading_activities(&self) -> Result<Vec<Activity>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let activities_db = activities::table
+            .inner_join(accounts::table.on(accounts::id.eq(activities::account_id)))
+            .filter(accounts::is_archived.eq(false))
+            .filter(sql::<Text>(&effective_type_sql("activities")).eq_any(TRADING_ACTIVITY_TYPES))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn get_income_activities(&self) -> Result<Vec<Activity>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let activities_db = activities::table
+            .inner_join(accounts::table.on(accounts::id.eq(activities::account_id)))
+            .filter(accounts::is_archived.eq(false))
+            .filter(sql::<Text>(&effective_type_sql("activities")).eq_any(INCOME_ACTIVITY_TYPES))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn activity_versions(&self, ids: &[String]) -> Result<HashMap<String, i32>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        #[derive(QueryableByName)]
+        struct VersionRow {
+            #[diesel(sql_type = Text)]
+            id: String,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            version: i32,
+        }
+        let mut conn = get_connection(&self.pool)?;
+        let quoted = ids
+            .iter()
+            .map(|id| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = sql_query(format!(
+            "SELECT id, version FROM activities WHERE id IN ({quoted})"
+        ))
+        .load::<VersionRow>(&mut conn)
+        .map_err(StorageError::from)?;
+        Ok(rows.into_iter().map(|row| (row.id, row.version)).collect())
+    }
+
+    fn get_activities(&self) -> Result<Vec<Activity>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let activities_db = activities::table
+            .inner_join(accounts::table.on(accounts::id.eq(activities::account_id)))
+            .filter(accounts::is_archived.eq(false))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn get_activities_including_archived_accounts(&self) -> Result<Vec<Activity>> {
+        let mut conn = get_connection(&self.pool)?;
+        let activities_db = activities::table
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn search_activities(
+        &self,
+        page: i64,                                   // Page number, 0-based
+        page_size: i64,                              // Number of items per page
+        account_id_filter: Option<Vec<String>>,      // Optional account_id filter
+        activity_type_filter: Option<Vec<String>>,   // Optional activity_type filter
+        asset_id_keyword: Option<String>,            // Optional asset_id keyword for search
+        sort: Option<Sort>,                          // Optional sort
+        needs_review_filter: Option<bool>,           // Optional needs_review filter
+        date_from: Option<NaiveDate>,                // Optional start date filter (inclusive)
+        date_to: Option<NaiveDate>,                  // Optional end date filter (inclusive)
+        instrument_type_filter: Option<Vec<String>>, // Optional instrument_type filter
+        activity_id_filter: Option<Vec<String>>,     // Optional exact activity-id filter
+    ) -> Result<ActivitySearchResponse> {
+        let date_from_utc = date_from.map(Self::naive_date_start_utc);
+        let date_to_utc_exclusive = date_to
+            .and_then(|date| date.succ_opt())
+            .map(Self::naive_date_start_utc);
+
+        self.search_activities_with_utc_bounds(
+            page,
+            page_size,
+            account_id_filter,
+            activity_type_filter,
+            asset_id_keyword,
+            sort,
+            needs_review_filter,
+            date_from_utc,
+            date_to_utc_exclusive,
+            instrument_type_filter,
+            activity_id_filter,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_activities_in_utc_range(
+        &self,
+        page: i64,
+        page_size: i64,
+        account_id_filter: Option<Vec<String>>,
+        activity_type_filter: Option<Vec<String>>,
+        asset_id_keyword: Option<String>,
+        sort: Option<Sort>,
+        needs_review_filter: Option<bool>,
+        date_from_utc: Option<DateTime<Utc>>,
+        date_to_utc_exclusive: Option<DateTime<Utc>>,
+        instrument_type_filter: Option<Vec<String>>,
+        activity_id_filter: Option<Vec<String>>,
+    ) -> Result<ActivitySearchResponse> {
+        self.search_activities_with_utc_bounds(
+            page,
+            page_size,
+            account_id_filter,
+            activity_type_filter,
+            asset_id_keyword,
+            sort,
+            needs_review_filter,
+            date_from_utc,
+            date_to_utc_exclusive,
+            instrument_type_filter,
+            activity_id_filter,
+        )
+    }
+
+    async fn create_activity(&self, new_activity: NewActivity) -> Result<Activity> {
+        new_activity.validate()?;
+        let activity_db_owned: ActivityDB = new_activity.into();
+
+        self.writer
+            .exec_tx(move |tx| -> Result<Activity> {
+                let mut activity_to_insert = activity_db_owned;
+                activity_to_insert.id = Uuid::new_v4().to_string();
+                assert_final_cash_floor(&activity_to_insert)?;
+                let inserted_activity = diesel::insert_into(activities::table)
+                    .values(&activity_to_insert)
+                    .get_result::<ActivityDB>(tx.conn())
+                    .map_err(StorageError::from)?;
+                let activity = Activity::from(inserted_activity);
+
+                Ok(activity)
+            })
+            .await
+    }
+
+    async fn update_activity(&self, activity_update: ActivityUpdate) -> Result<Activity> {
+        activity_update.validate()?;
+        let asset_patch_supplied = activity_update.asset.is_some();
+        let activity_update_owned = activity_update.clone();
+        let activity_db_owned: ActivityDB = activity_update.into();
+        let activity_id_owned = activity_db_owned.id.clone();
+
+        self.writer
+            .exec_tx(move |tx| -> Result<Activity> {
+                let mut activity_to_update = activity_db_owned;
+                let subtype_patch = activity_update_owned.subtype.clone();
+                let existing = activities::table
+                    .select(ActivityDB::as_select())
+                    .find(&activity_id_owned)
+                    .first::<ActivityDB>(tx.conn())
+                    .map_err(StorageError::from)?;
+                let existing_activity_type = existing.activity_type.clone();
+                let existing_before_update = existing.clone();
+
+                // Preserve fields from existing record that shouldn't be overwritten
+                let ActivityDB {
+                    asset_id,
+                    created_at,
+                    fx_rate,
+                    source_system,
+                    source_record_id,
+                    source_group_id,
+                    idempotency_key,
+                    import_run_id,
+                    activity_type_override,
+                    source_type,
+                    subtype,
+                    settlement_date,
+                    metadata,
+                    quantity,
+                    unit_price,
+                    amount,
+                    fee,
+                    tax,
+                    status,
+                    needs_review,
+                    ..
+                } = existing;
+
+                activity_to_update.created_at = created_at;
+                if !asset_patch_supplied {
+                    activity_to_update.asset_id = asset_id;
+                }
+                activity_to_update.quantity =
+                    apply_decimal_patch(quantity, activity_update_owned.quantity);
+                activity_to_update.unit_price =
+                    apply_decimal_patch(unit_price, activity_update_owned.unit_price);
+                activity_to_update.amount =
+                    apply_decimal_patch(amount, activity_update_owned.amount);
+                activity_to_update.fee = apply_decimal_patch(fee, activity_update_owned.fee);
+                activity_to_update.tax = apply_decimal_patch(tax, activity_update_owned.tax);
+                if activity_update_owned.status.is_none() {
+                    activity_to_update.status = status;
+                }
+                activity_to_update.fx_rate =
+                    apply_decimal_patch(fx_rate, activity_update_owned.fx_rate);
+                activity_to_update.needs_review = activity_update_owned
+                    .needs_review
+                    .map(i32::from)
+                    .unwrap_or(needs_review);
+                // Preserve source identity fields
+                if activity_to_update.source_system.is_none() {
+                    activity_to_update.source_system = source_system;
+                }
+                if activity_to_update.source_record_id.is_none() {
+                    activity_to_update.source_record_id = source_record_id;
+                }
+                if activity_to_update.source_group_id.is_none() {
+                    activity_to_update.source_group_id = source_group_id;
+                }
+                if activity_to_update.idempotency_key.is_none() {
+                    activity_to_update.idempotency_key = idempotency_key;
+                }
+                if activity_to_update.import_run_id.is_none() {
+                    activity_to_update.import_run_id = import_run_id;
+                }
+                // Preserve classification fields
+                if type_override(activity_to_update.activity_type_override.as_deref()).is_none() {
+                    activity_to_update.activity_type_override = activity_type_override;
+                }
+                if activity_to_update.source_type.is_none() {
+                    activity_to_update.source_type = source_type;
+                }
+                activity_to_update.subtype = match subtype_patch {
+                    Some(value) if value.trim().is_empty() => None,
+                    Some(value) => Some(value),
+                    None => subtype,
+                };
+                if activity_to_update.settlement_date.is_none() {
+                    activity_to_update.settlement_date = settlement_date;
+                }
+                if activity_to_update.metadata.is_none() {
+                    activity_to_update.metadata = metadata;
+                }
+                clear_invalid_source_group_for_external_transfer(
+                    tx.conn(),
+                    &mut activity_to_update,
+                )?;
+                preserve_broker_base_type(&mut activity_to_update, &existing_activity_type);
+                activity_to_update.activity_type_override =
+                    stored_type_override(activity_to_update.activity_type_override.as_deref());
+                activity_to_update.updated_at = chrono::Utc::now().to_rfc3339();
+                assert_final_cash_floor(&activity_to_update)?;
+
+                let updated_activity =
+                    diesel::update(activities::table.find(&activity_to_update.id))
+                        .set(&activity_to_update)
+                        .get_result::<ActivityDB>(tx.conn())
+                        .map_err(StorageError::from)?;
+                if activity_update_invalidates_spending_splits(
+                    &existing_before_update,
+                    &updated_activity,
+                ) {
+                    clear_spending_splits_for_activity_tx(tx, &updated_activity.id)?;
+                }
+
+                let activity = Activity::from(updated_activity);
+                Ok(activity)
+            })
+            .await
+    }
+
+    async fn delete_activity(&self, activity_id: String) -> Result<Activity> {
+        self.writer
+            .exec_tx(move |tx| -> Result<Activity> {
+                let activity = activities::table
+                    .select(ActivityDB::as_select())
+                    .find(&activity_id)
+                    .first::<ActivityDB>(tx.conn())
+                    .map_err(StorageError::from)?;
+
+                // ActivityService supplies both validated transfer IDs through bulk deletion.
+                // A shared source group alone does not make these activities counterparts.
+
+                diesel::delete(activities::table.filter(activities::id.eq(&activity_id)))
+                    .execute(tx.conn())
+                    .map_err(StorageError::from)?;
+
+                Ok(activity.into())
+            })
+            .await
+    }
+
+    async fn link_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)> {
+        use wealthfolio_core::activities::{ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT};
+
+        if activity_a_id == activity_b_id {
+            return Err(Error::from(ActivityError::InvalidData(
+                "Cannot link an activity to itself".to_string(),
+            )));
+        }
+
+        self.writer
+            .exec_tx(move |tx| -> Result<(Activity, Activity)> {
+                let a = activities::table
+                    .select(ActivityDB::as_select())
+                    .find(&activity_a_id)
+                    .first::<ActivityDB>(tx.conn())
+                    .map_err(|e| Error::from(ActivityError::NotFound(e.to_string())))?;
+                let b = activities::table
+                    .select(ActivityDB::as_select())
+                    .find(&activity_b_id)
+                    .first::<ActivityDB>(tx.conn())
+                    .map_err(|e| Error::from(ActivityError::NotFound(e.to_string())))?;
+
+                let (mut transfer_in, mut transfer_out) =
+                    match (effective_activity_type(&a), effective_activity_type(&b)) {
+                        (ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT) => (a, b),
+                        (ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_TRANSFER_IN) => (b, a),
+                        _ => {
+                            return Err(Error::from(ActivityError::InvalidData(
+                                "Linking requires one TRANSFER_IN and one TRANSFER_OUT activity"
+                                    .to_string(),
+                            )));
+                        }
+                    };
+
+                let in_group_blocks = source_group_blocks_transfer_link(
+                    tx.conn(),
+                    transfer_in.source_group_id.as_deref(),
+                )?;
+                // Linking a pair already linked to each other repairs it: it keeps
+                // the group and clears an external marker left on either leg. Both
+                // legs store the same trimmed group id, and that group is a valid
+                // pair, so it holds exactly these two.
+                let shared_group = transfer_in.source_group_id.clone().filter(|group_id| {
+                    group_id.trim() == group_id.as_str()
+                        && transfer_out.source_group_id.as_deref() == Some(group_id.as_str())
+                });
+                let linked_to_each_other = in_group_blocks && shared_group.is_some();
+                if !linked_to_each_other
+                    && (in_group_blocks
+                        || source_group_blocks_transfer_link(
+                            tx.conn(),
+                            transfer_out.source_group_id.as_deref(),
+                        )?)
+                {
+                    return Err(Error::from(ActivityError::InvalidData(
+                        "One or both activities are already linked to another transfer".to_string(),
+                    )));
+                }
+                if transfer_in.account_id == transfer_out.account_id
+                    && !is_same_account_cash_fx_conversion_db(&transfer_in, &transfer_out)
+                {
+                    return Err(Error::from(ActivityError::InvalidData(
+                        "Same-account transfer links must be cash FX conversions with different currencies"
+                            .to_string(),
+                    )));
+                }
+                validate_link_transfer_asset_shape(&transfer_in, &transfer_out)?;
+
+                let group_id = match shared_group {
+                    Some(group_id) if linked_to_each_other => group_id,
+                    _ => Uuid::new_v4().to_string(),
+                };
+                let now = chrono::Utc::now().to_rfc3339();
+
+                transfer_in.source_group_id = Some(group_id.clone());
+                transfer_in.metadata = set_transfer_flow_external(transfer_in.metadata, false);
+                transfer_in.is_user_modified = 1;
+                transfer_in.updated_at = now.clone();
+                transfer_out.source_group_id = Some(group_id);
+                transfer_out.metadata = set_transfer_flow_external(transfer_out.metadata, false);
+                transfer_out.is_user_modified = 1;
+                transfer_out.updated_at = now;
+
+                let updated_in = diesel::update(activities::table.find(&transfer_in.id))
+                    .set((
+                        activities::source_group_id.eq(transfer_in.source_group_id.clone()),
+                        activities::metadata.eq(transfer_in.metadata.clone()),
+                        activities::is_user_modified.eq(transfer_in.is_user_modified),
+                        activities::updated_at.eq(&transfer_in.updated_at),
+                    ))
+                    .get_result::<ActivityDB>(tx.conn())
+                    .map_err(StorageError::from)?;
+                let updated_out = diesel::update(activities::table.find(&transfer_out.id))
+                    .set((
+                        activities::source_group_id.eq(transfer_out.source_group_id.clone()),
+                        activities::metadata.eq(transfer_out.metadata.clone()),
+                        activities::is_user_modified.eq(transfer_out.is_user_modified),
+                        activities::updated_at.eq(&transfer_out.updated_at),
+                    ))
+                    .get_result::<ActivityDB>(tx.conn())
+                    .map_err(StorageError::from)?;
+
+
+                Ok((Activity::from(updated_in), Activity::from(updated_out)))
+            })
+            .await
+    }
+
+    async fn unlink_transfer_activities(
+        &self,
+        activity_a_id: String,
+        activity_b_id: String,
+    ) -> Result<(Activity, Activity)> {
+        use wealthfolio_core::activities::{ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT};
+
+        if activity_a_id == activity_b_id {
+            return Err(Error::from(ActivityError::InvalidData(
+                "Cannot unlink an activity from itself".to_string(),
+            )));
+        }
+
+        self.writer
+            .exec_tx(move |tx| -> Result<(Activity, Activity)> {
+                let a = activities::table
+                    .select(ActivityDB::as_select())
+                    .find(&activity_a_id)
+                    .first::<ActivityDB>(tx.conn())
+                    .map_err(|e| Error::from(ActivityError::NotFound(e.to_string())))?;
+                let b = activities::table
+                    .select(ActivityDB::as_select())
+                    .find(&activity_b_id)
+                    .first::<ActivityDB>(tx.conn())
+                    .map_err(|e| Error::from(ActivityError::NotFound(e.to_string())))?;
+
+                let (mut transfer_in, mut transfer_out) =
+                    match (effective_activity_type(&a), effective_activity_type(&b)) {
+                        (ACTIVITY_TYPE_TRANSFER_IN, ACTIVITY_TYPE_TRANSFER_OUT) => (a, b),
+                        (ACTIVITY_TYPE_TRANSFER_OUT, ACTIVITY_TYPE_TRANSFER_IN) => (b, a),
+                        _ => {
+                            return Err(Error::from(ActivityError::InvalidData(
+                                "Unlinking requires one TRANSFER_IN and one TRANSFER_OUT activity"
+                                    .to_string(),
+                            )));
+                        }
+                    };
+
+                let Some(in_group_id) = transfer_in.source_group_id.clone() else {
+                    return Err(Error::from(ActivityError::InvalidData(
+                        "Both activities must already be linked".to_string(),
+                    )));
+                };
+                let Some(out_group_id) = transfer_out.source_group_id.clone() else {
+                    return Err(Error::from(ActivityError::InvalidData(
+                        "Both activities must already be linked".to_string(),
+                    )));
+                };
+                if in_group_id != out_group_id {
+                    return Err(Error::from(ActivityError::InvalidData(
+                        "Selected activities belong to different linked transfers".to_string(),
+                    )));
+                }
+
+                let now = chrono::Utc::now().to_rfc3339();
+                transfer_in.source_group_id = None;
+                transfer_in.metadata = set_transfer_flow_external(transfer_in.metadata, true);
+                transfer_in.is_user_modified = 1;
+                transfer_in.updated_at = now.clone();
+                transfer_out.source_group_id = None;
+                transfer_out.metadata = set_transfer_flow_external(transfer_out.metadata, true);
+                transfer_out.is_user_modified = 1;
+                transfer_out.updated_at = now;
+
+                let updated_in = diesel::update(activities::table.find(&transfer_in.id))
+                    .set((
+                        activities::source_group_id.eq(None::<String>),
+                        activities::metadata.eq(transfer_in.metadata.clone()),
+                        activities::is_user_modified.eq(1),
+                        activities::updated_at.eq(&transfer_in.updated_at),
+                    ))
+                    .get_result::<ActivityDB>(tx.conn())
+                    .map_err(StorageError::from)?;
+                let updated_out = diesel::update(activities::table.find(&transfer_out.id))
+                    .set((
+                        activities::source_group_id.eq(None::<String>),
+                        activities::metadata.eq(transfer_out.metadata.clone()),
+                        activities::is_user_modified.eq(1),
+                        activities::updated_at.eq(&transfer_out.updated_at),
+                    ))
+                    .get_result::<ActivityDB>(tx.conn())
+                    .map_err(StorageError::from)?;
+
+                Ok((Activity::from(updated_in), Activity::from(updated_out)))
+            })
+            .await
+    }
+
+    async fn bulk_mutate_activities(
+        &self,
+        creates: Vec<NewActivity>,
+        updates: Vec<ActivityUpdate>,
+        delete_ids: Vec<String>,
+    ) -> Result<ActivityBulkMutationResult> {
+        self.writer
+            .exec_tx(move |tx| -> Result<ActivityBulkMutationResult> {
+                let mut outcome = ActivityBulkMutationResult::default();
+
+                let mut already_deleted = HashSet::new();
+
+                // Delete only the requested IDs; ActivityService expands validated pairs.
+                for delete_id in &delete_ids {
+                    if already_deleted.contains(delete_id) {
+                        continue;
+                    }
+                    let activity_db = activities::table
+                        .select(ActivityDB::as_select())
+                        .find(delete_id)
+                        .first::<ActivityDB>(tx.conn())
+                        .map_err(StorageError::from)?;
+                    diesel::delete(activities::table.filter(activities::id.eq(delete_id)))
+                        .execute(tx.conn())
+                        .map_err(StorageError::from)?;
+
+                    outcome.deleted.push(Activity::from(activity_db));
+                    already_deleted.insert(delete_id.clone());
+                }
+
+                for update in updates {
+                    update.validate()?;
+                    let asset_patch_supplied = update.asset.is_some();
+                    let update_owned = update.clone();
+                    let subtype_patch = update_owned.subtype.clone();
+                    let mut activity_db: ActivityDB = update.into();
+                    let existing = activities::table
+                        .select(ActivityDB::as_select())
+                        .find(&activity_db.id)
+                        .first::<ActivityDB>(tx.conn())
+                        .map_err(StorageError::from)?;
+                    let existing_activity_type = existing.activity_type.clone();
+                    let existing_before_update = existing.clone();
+
+                    // Preserve fields from existing record
+                    let ActivityDB {
+                        asset_id,
+                        created_at,
+                        source_system,
+                        source_record_id,
+                        source_group_id,
+                        idempotency_key,
+                        import_run_id,
+                        activity_type_override,
+                        source_type,
+                        subtype,
+                        settlement_date,
+                        metadata,
+                        quantity,
+                        unit_price,
+                        amount,
+                        fee,
+                        tax,
+                        fx_rate,
+                        status,
+                        needs_review,
+                        ..
+                    } = existing;
+
+                    activity_db.created_at = created_at;
+                    if !asset_patch_supplied {
+                        activity_db.asset_id = asset_id;
+                    }
+                    activity_db.quantity = apply_decimal_patch(quantity, update_owned.quantity);
+                    activity_db.unit_price =
+                        apply_decimal_patch(unit_price, update_owned.unit_price);
+                    activity_db.amount = apply_decimal_patch(amount, update_owned.amount);
+                    activity_db.fee = apply_decimal_patch(fee, update_owned.fee);
+                    activity_db.tax = apply_decimal_patch(tax, update_owned.tax);
+                    activity_db.fx_rate = apply_decimal_patch(fx_rate, update_owned.fx_rate);
+                    if update_owned.status.is_none() {
+                        activity_db.status = status;
+                    }
+                    activity_db.needs_review = update_owned
+                        .needs_review
+                        .map(i32::from)
+                        .unwrap_or(needs_review);
+                    if activity_db.source_system.is_none() {
+                        activity_db.source_system = source_system;
+                    }
+                    if activity_db.source_record_id.is_none() {
+                        activity_db.source_record_id = source_record_id;
+                    }
+                    if activity_db.source_group_id.is_none() {
+                        activity_db.source_group_id = source_group_id;
+                    }
+                    if activity_db.idempotency_key.is_none() {
+                        activity_db.idempotency_key = idempotency_key;
+                    }
+                    if activity_db.import_run_id.is_none() {
+                        activity_db.import_run_id = import_run_id;
+                    }
+                    if type_override(activity_db.activity_type_override.as_deref()).is_none() {
+                        activity_db.activity_type_override = activity_type_override;
+                    }
+                    if activity_db.source_type.is_none() {
+                        activity_db.source_type = source_type;
+                    }
+                    activity_db.subtype = match subtype_patch {
+                        Some(value) if value.trim().is_empty() => None,
+                        Some(value) => Some(value),
+                        None => subtype,
+                    };
+                    if activity_db.settlement_date.is_none() {
+                        activity_db.settlement_date = settlement_date;
+                    }
+                    if activity_db.metadata.is_none() {
+                        activity_db.metadata = metadata;
+                    }
+                    clear_invalid_source_group_for_external_transfer(tx.conn(), &mut activity_db)?;
+                    preserve_broker_base_type(&mut activity_db, &existing_activity_type);
+                    activity_db.activity_type_override =
+                        stored_type_override(activity_db.activity_type_override.as_deref());
+                    activity_db.updated_at = chrono::Utc::now().to_rfc3339();
+                    assert_final_cash_floor(&activity_db)?;
+
+                    let updated_activity = diesel::update(activities::table.find(&activity_db.id))
+                        .set(&activity_db)
+                        .get_result::<ActivityDB>(tx.conn())
+                        .map_err(StorageError::from)?;
+                    if activity_update_invalidates_spending_splits(
+                        &existing_before_update,
+                        &updated_activity,
+                    ) {
+                        clear_spending_splits_for_activity_tx(tx, &updated_activity.id)?;
+                    }
+
+                    outcome.updated.push(Activity::from(updated_activity));
+                }
+
+                for new_activity in creates {
+                    new_activity.validate()?;
+                    let temp_id = new_activity.id.clone();
+                    let mut activity_db: ActivityDB = new_activity.into();
+                    // Always generate a new UUID for created activities
+                    let generated_id = Uuid::new_v4().to_string();
+                    activity_db.id = generated_id.clone();
+                    assert_final_cash_floor(&activity_db)?;
+                    let inserted_activity = diesel::insert_into(activities::table)
+                        .values(&activity_db)
+                        .get_result::<ActivityDB>(tx.conn())
+                        .map_err(StorageError::from)?;
+
+                    outcome
+                        .created
+                        .push(Activity::from(inserted_activity.clone()));
+                    outcome
+                        .created_mappings
+                        .push(ActivityBulkIdentifierMapping {
+                            temp_id: temp_id.filter(|id| !id.is_empty()),
+                            activity_id: generated_id,
+                        });
+                }
+
+                Ok(outcome)
+            })
+            .await
+    }
+
+    /// Retrieves activities by account ID
+    fn get_activities_by_account_id(&self, account_id: &str) -> Result<Vec<Activity>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let activities_db = activities::table
+            .inner_join(accounts::table.on(accounts::id.eq(activities::account_id)))
+            .filter(accounts::is_archived.eq(false))
+            .filter(activities::account_id.eq(account_id))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    /// Retrieves activities by account IDs
+    /// Note: Filters by is_archived (not is_active) so hidden accounts still have their
+    /// activities included in calculations. Only archived accounts are excluded.
+    fn get_activities_by_account_ids(&self, account_ids: &[String]) -> Result<Vec<Activity>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let activities_db = activities::table
+            .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+            .filter(accounts::is_archived.eq(false))
+            .filter(activities::account_id.eq_any(account_ids))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn get_activities_by_ids(&self, activity_ids: &[String]) -> Result<Vec<Activity>> {
+        if activity_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let mut results = Vec::new();
+
+        for chunk in chunk_for_sqlite(activity_ids) {
+            let activities_db = activities::table
+                .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+                .filter(accounts::is_archived.eq(false))
+                .filter(activities::id.eq_any(chunk))
+                .select(ActivityDB::as_select())
+                .order(activities::activity_date.asc())
+                .load::<ActivityDB>(&mut conn)
+                .map_err(StorageError::from)?;
+
+            results.extend(activities_db.into_iter().map(Activity::from));
+        }
+
+        results.sort_by_key(|a| a.activity_date);
+        Ok(results)
+    }
+
+    fn get_activities_by_source_group_id(&self, source_group_id: &str) -> Result<Vec<Activity>> {
+        let group_id = source_group_id.trim();
+        if group_id.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let activities_db = activities::table
+            .filter(activities::source_group_id.eq(group_id))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn get_activities_by_account_ids_including_archived(
+        &self,
+        account_ids: &[String],
+    ) -> Result<Vec<Activity>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let activities_db = activities::table
+            .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+            .filter(activities::account_id.eq_any(account_ids))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn get_split_activities_by_asset_ids(&self, asset_ids: &[String]) -> Result<Vec<Activity>> {
+        if asset_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = get_connection(&self.pool)?;
+        let mut results = Vec::new();
+        for chunk in chunk_for_sqlite(asset_ids) {
+            let activities_db = activities::table
+                .filter(activities::asset_id.eq_any(chunk))
+                .filter(diesel::dsl::sql::<Bool>(&format!(
+                    "{} = 'SPLIT'",
+                    effective_type_sql("activities")
+                )))
+                .select(ActivityDB::as_select())
+                .order(activities::activity_date.asc())
+                .load::<ActivityDB>(&mut conn)
+                .map_err(StorageError::from)?;
+            results.extend(activities_db.into_iter().map(Activity::from));
+        }
+        results.sort_by_key(|activity| activity.activity_date);
+        Ok(results)
+    }
+
+    fn get_activities_by_source_group_ids(&self, group_ids: &[String]) -> Result<Vec<Activity>> {
+        if group_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let activities_db = activities::table
+            .filter(activities::source_group_id.eq_any(group_ids))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn get_activities_by_account_ids_in_date_range(
+        &self,
+        account_ids: &[String],
+        start_utc: DateTime<Utc>,
+        end_utc: DateTime<Utc>,
+    ) -> Result<Vec<Activity>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let activities_db = activities::table
+            .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+            .filter(accounts::is_archived.eq(false))
+            .filter(activities::account_id.eq_any(account_ids))
+            .filter(activities::activity_date.ge(start_utc.to_rfc3339()))
+            .filter(activities::activity_date.le(end_utc.to_rfc3339()))
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        Ok(activities_db.into_iter().map(Activity::from).collect())
+    }
+
+    fn get_transfer_activities_touching_account_ids_in_date_range(
+        &self,
+        account_ids: &[String],
+        start_utc: Option<DateTime<Utc>>,
+        end_exclusive_utc: Option<DateTime<Utc>>,
+    ) -> Result<Vec<Activity>> {
+        if account_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let mut touching_query = activities::table
+            .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+            .filter(accounts::is_archived.eq(false))
+            .filter(activities::account_id.eq_any(account_ids))
+            .filter(activities::status.eq("POSTED"))
+            .filter(diesel::dsl::sql::<Bool>(&format!(
+                "{} IN ('TRANSFER_IN', 'TRANSFER_OUT')",
+                effective_type_sql("activities")
+            )))
+            .into_boxed();
+
+        if let Some(start_utc) = start_utc {
+            touching_query =
+                touching_query.filter(activities::activity_date.ge(start_utc.to_rfc3339()));
+        }
+        if let Some(end_exclusive_utc) = end_exclusive_utc {
+            touching_query =
+                touching_query.filter(activities::activity_date.lt(end_exclusive_utc.to_rfc3339()));
+        }
+
+        let touching = touching_query
+            .select(ActivityDB::as_select())
+            .order(activities::activity_date.asc())
+            .load::<ActivityDB>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        let group_ids: Vec<String> = touching
+            .iter()
+            .filter_map(|activity| activity.source_group_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut by_id: HashMap<String, ActivityDB> = touching
+            .into_iter()
+            .map(|activity| (activity.id.clone(), activity))
+            .collect();
+
+        for chunk in chunk_for_sqlite(&group_ids) {
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let grouped = activities::table
+                .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+                .filter(accounts::is_archived.eq(false))
+                .filter(activities::status.eq("POSTED"))
+                .filter(diesel::dsl::sql::<Bool>(&format!(
+                    "{} IN ('TRANSFER_IN', 'TRANSFER_OUT')",
+                    effective_type_sql("activities")
+                )))
+                .filter(activities::source_group_id.eq_any(chunk))
+                .select(ActivityDB::as_select())
+                .order(activities::activity_date.asc())
+                .load::<ActivityDB>(&mut conn)
+                .map_err(StorageError::from)?;
+
+            for activity in grouped {
+                by_id.entry(activity.id.clone()).or_insert(activity);
+            }
+        }
+
+        let mut activities: Vec<Activity> = by_id.into_values().map(Activity::from).collect();
+        activities.sort_by_key(|activity| activity.activity_date);
+        Ok(activities)
+    }
+
+    async fn create_activities(&self, activities_vec: Vec<NewActivity>) -> Result<usize> {
+        if activities_vec.is_empty() {
+            return Ok(0);
+        }
+        // Validate all activities first
+        for new_act in &activities_vec {
+            new_act.validate()?;
+        }
+        // Convert to ActivityDB and assign IDs
+        let activities_db_owned: Vec<ActivityDB> = activities_vec
+            .into_iter() // Consumes activities_vec
+            .map(|new_act| {
+                let mut db: ActivityDB = new_act.into();
+                db.id = Uuid::new_v4().to_string();
+                db
+            })
+            .collect();
+        for activity_db in &activities_db_owned {
+            assert_final_cash_floor(activity_db)?;
+        }
+
+        self.writer
+            .exec_tx(move |tx| -> Result<usize> {
+                let num_inserted = diesel::insert_into(activities::table)
+                    .values(&activities_db_owned)
+                    .execute(tx.conn())
+                    .map_err(StorageError::from)?;
+
+                Ok(num_inserted)
+            })
+            .await
+    }
+
+    async fn update_activities_for_final_cash_migration(
+        &self,
+        updates: Vec<ActivityFinalCashMigrationUpdate>,
+    ) -> Result<ActivityFinalCashMigrationWriteResult> {
+        if updates.is_empty() {
+            return Ok(ActivityFinalCashMigrationWriteResult::default());
+        }
+
+        self.writer
+            .exec_tx(move |tx| -> Result<ActivityFinalCashMigrationWriteResult> {
+                let update_ids: Vec<String> =
+                    updates.iter().map(|update| update.id.clone()).collect();
+                let mut current_by_id: HashMap<String, (Option<String>, i32, Option<String>)> =
+                    HashMap::new();
+                for chunk in chunk_for_sqlite(&update_ids) {
+                    let current_rows = activities::table
+                        .filter(activities::id.eq_any(chunk))
+                        .select((
+                            activities::id,
+                            activities::amount,
+                            activities::needs_review,
+                            activities::metadata,
+                        ))
+                        .load::<(String, Option<String>, i32, Option<String>)>(tx.conn())
+                        .map_err(StorageError::from)?;
+                    current_by_id.extend(current_rows.into_iter().map(
+                        |(id, amount, needs_review, metadata)| {
+                            (id, (amount, needs_review, metadata))
+                        },
+                    ));
+                }
+                let mut changed = 0;
+                let mut unapplied_amount_update_ids = Vec::new();
+                let updated_at = Utc::now().to_rfc3339();
+                for update in updates {
+                    // Classified amounts are already absolute; backfilled
+                    // out-of-scope rows must pass through byte-identical.
+                    let amount = update.amount.map(|amount| amount.to_string());
+                    let needs_review = i32::from(update.needs_review);
+                    let current = current_by_id.get(&update.id);
+                    if current.is_some_and(|(current_amount, current_review, _)| {
+                        (current_amount, *current_review) == (&amount, needs_review)
+                    }) {
+                        continue;
+                    }
+                    // A replaced amount is preserved on the row itself; this
+                    // breadcrumb is the migration's undo log and the reason no
+                    // database backup is required.
+                    let breadcrumb = current
+                        .and_then(|(current_amount, _, metadata)| {
+                            let replaced = current_amount.as_deref().filter(|current| {
+                                amount.as_deref().is_none_or(|new| new != *current)
+                            })?;
+                            Some(final_cash_legacy_metadata(metadata.as_deref(), replaced))
+                        })
+                        .unwrap_or(LegacyBreadcrumb::NotNeeded);
+                    changed += match breadcrumb {
+                        LegacyBreadcrumb::Write(metadata) => {
+                            diesel::update(activities::table.find(&update.id))
+                                .set((
+                                    activities::amount.eq(amount),
+                                    activities::needs_review.eq(needs_review),
+                                    activities::metadata.eq(metadata),
+                                    activities::updated_at.eq(&updated_at),
+                                ))
+                                .execute(tx.conn())
+                                .map_err(StorageError::from)?
+                        }
+                        LegacyBreadcrumb::NotNeeded => {
+                            diesel::update(activities::table.find(&update.id))
+                                .set((
+                                    activities::amount.eq(amount),
+                                    activities::needs_review.eq(needs_review),
+                                    activities::updated_at.eq(&updated_at),
+                                ))
+                                .execute(tx.conn())
+                                .map_err(StorageError::from)?
+                        }
+                        LegacyBreadcrumb::Unrecordable => {
+                            // Without the undo breadcrumb the replaced value
+                            // would be unrecoverable; keep the row's amount
+                            // and route it to the review queue instead.
+                            log::warn!(
+                                "Final-cash migration cannot record the legacy amount of activity {}; keeping it for review",
+                                update.id
+                            );
+                            unapplied_amount_update_ids.push(update.id.clone());
+                            diesel::update(activities::table.find(&update.id))
+                                .set((
+                                    activities::needs_review.eq(1),
+                                    activities::updated_at.eq(&updated_at),
+                                ))
+                                .execute(tx.conn())
+                                .map_err(StorageError::from)?
+                        }
+                    };
+                }
+                Ok(ActivityFinalCashMigrationWriteResult {
+                    changed,
+                    unapplied_amount_update_ids,
+                })
+            })
+            .await
+    }
+
+    /// Fetches contribution-eligible activities (DEPOSIT, TRANSFER_IN, TRANSFER_OUT, CREDIT)
+    /// for the given accounts within the date range.
+    fn get_income_activities_data(
+        &self,
+        account_ids: Option<&[String]>,
+    ) -> Result<Vec<IncomeData>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        // Stored amount is final cash. Income reporting reverses charges to
+        // gross income and never reconstructs a missing amount from quotes.
+        // A dividend of capital (RETURN_OF_CAPITAL) is no income: it reduces
+        // the asset's cost basis (engine rules R7.4).
+        // IDs are internal UUIDs — safe to interpolate directly; escape single quotes defensively.
+        let account_filter = match account_ids {
+            Some(ids) if !ids.is_empty() => {
+                let escaped = ids
+                    .iter()
+                    .map(|id| format!("'{}'", id.replace('\'', "''")))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("AND a.account_id IN ({escaped})")
+            }
+            _ => String::new(),
+        };
+
+        let effective_type = effective_type_sql("a");
+        let query = format!(
+            "SELECT a.id as activity_id,
+             strftime('%Y-%m', a.activity_date) as date,
+             {effective_type} as income_type,
+             COALESCE(a.asset_id, 'CASH') as asset_id,
+             COALESCE(ast.kind, 'CASH') as asset_kind,
+             COALESCE(ast.display_code, 'CASH') as symbol,
+             COALESCE(ast.name, 'Cash') as symbol_name,
+             a.currency,
+             a.account_id,
+             acc.name as account_name,
+             acc.account_type,
+             a.amount,
+             COALESCE(a.fee, '0') as fee,
+             COALESCE(a.tax, '0') as tax
+             FROM activities a
+             LEFT JOIN assets ast ON a.asset_id = ast.id
+             INNER JOIN accounts acc ON a.account_id = acc.id
+             WHERE {effective_type}
+                   IN ('DIVIDEND', 'INTEREST', 'OTHER_INCOME')
+             AND NOT ({effective_type} = 'DIVIDEND'
+                      AND UPPER(REPLACE(REPLACE(TRIM(COALESCE(a.subtype, '')), ' ', '_'), '-', '_')) = 'RETURN_OF_CAPITAL')
+             AND a.status = 'POSTED'
+             AND acc.is_archived = 0
+             {account_filter}
+             ORDER BY a.activity_date"
+        );
+
+        // Define a struct to hold the raw query results
+        #[derive(QueryableByName, Debug)]
+        struct RawIncomeData {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub activity_id: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub date: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub income_type: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub asset_id: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub asset_kind: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub symbol: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub symbol_name: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub currency: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub account_id: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub account_name: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub account_type: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            pub amount: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub fee: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            pub tax: String,
+        }
+
+        let raw_results = diesel::sql_query(&query)
+            .load::<RawIncomeData>(&mut conn)
+            .map_err(ActivityError::from)?;
+
+        let mut results = Vec::new();
+        for raw in raw_results {
+            if !account_supports_purpose(&raw.account_type, AccountPurpose::Income) {
+                continue;
+            }
+            // A legacy row without a usable final amount (migration keeps
+            // such rows Posted + flagged) must not take down the whole
+            // income report; skip it and leave it to the review queue.
+            let Some(amount_value) = raw.amount.as_deref() else {
+                log::warn!(
+                    "Skipping {} activity {} with missing final amount in income report",
+                    raw.income_type,
+                    raw.activity_id
+                );
+                continue;
+            };
+            let Ok(final_amount) = Decimal::from_str(amount_value) else {
+                log::warn!(
+                    "Skipping {} activity {} with invalid final amount in income report",
+                    raw.income_type,
+                    raw.activity_id
+                );
+                continue;
+            };
+            let fee = Decimal::from_str(&raw.fee).unwrap_or_else(|_| Decimal::zero());
+            let tax = Decimal::from_str(&raw.tax).unwrap_or_else(|_| Decimal::zero());
+            results.push(IncomeData {
+                date: raw.date,
+                income_type: raw.income_type,
+                asset_id: raw.asset_id,
+                asset_kind: raw.asset_kind,
+                symbol: raw.symbol,
+                symbol_name: raw.symbol_name,
+                currency: raw.currency,
+                amount: final_amount.abs() + fee.abs() + tax.abs(),
+                account_id: raw.account_id,
+                account_name: raw.account_name,
+            });
+        }
+
+        Ok(results)
+    }
+
+    fn get_first_activity_date_overall(&self) -> Result<DateTime<Utc>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let min_date_str = activities::table
+            .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+            .filter(accounts::is_archived.eq(false))
+            .select(min(activities::activity_date))
+            .first::<Option<String>>(&mut conn)
+            .map_err(StorageError::from)?
+            .ok_or(ActivityError::NotFound("No activities found.".to_string()))?;
+
+        // Parse the string result
+        DateTime::parse_from_rfc3339(&min_date_str)
+            .map(|dt| dt.with_timezone(&Utc))
+            .map_err(|e| ActivityError::InvalidData(format!("Failed to parse date: {}", e)).into())
+    }
+
+    /// Gets the first activity date for given account IDs
+    fn get_first_activity_date(
+        &self,
+        account_ids: Option<&[String]>,
+    ) -> Result<Option<DateTime<Utc>>> {
+        let mut conn = get_connection(&self.pool)?;
+
+        let mut query = activities::table
+            .inner_join(accounts::table.on(accounts::id.eq(activities::account_id)))
+            .filter(accounts::is_archived.eq(false))
+            .select(min(activities::activity_date))
+            .into_boxed();
+
+        if let Some(ids) = account_ids {
+            query = query.filter(activities::account_id.eq_any(ids));
+        }
+
+        let min_date_str_opt = query
+            .first::<Option<String>>(&mut conn)
+            .map_err(StorageError::from)?;
+
+        match min_date_str_opt {
+            Some(date_str) => DateTime::parse_from_rfc3339(&date_str)
+                .map(|dt| Some(dt.with_timezone(&Utc)))
+                .map_err(|e| {
+                    ActivityError::InvalidData(format!("Failed to parse date: {}", e)).into()
+                }),
+            None => Ok(None), // If no activity found, return None
+        }
+    }
+
+    /// Gets the first and last activity dates for each asset in the provided list.
+    ///
+    /// Uses chunking to avoid SQLite's parameter limit in IN (...) queries.
+    fn get_activity_bounds_for_assets(
+        &self,
+        asset_ids: &[String],
+    ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>> {
+        if asset_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let mut result_map: HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)> =
+            HashMap::new();
+
+        // Chunk the asset_ids to avoid SQLite parameter limits
+        for chunk in chunk_for_sqlite(asset_ids) {
+            // Query to get MIN and MAX activity dates per asset_id
+            let results = activities::table
+                .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
+                .filter(accounts::is_archived.eq(false))
+                .filter(activities::asset_id.eq_any(chunk))
+                .group_by(activities::asset_id)
+                .select((
+                    activities::asset_id.assume_not_null(),
+                    min(activities::activity_date),
+                    max(activities::activity_date),
+                ))
+                .load::<(String, Option<String>, Option<String>)>(&mut conn)
+                .map_err(StorageError::from)?;
+
+            for (asset_id, min_date_str, max_date_str) in results {
+                // Parse the date strings (they are stored as RFC3339, extract the date portion)
+                let first_date = min_date_str.and_then(|s| {
+                    // Activity dates are stored as RFC3339, parse to get the date
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.date_naive())
+                });
+
+                let last_date = max_date_str.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|dt| dt.date_naive())
+                });
+
+                result_map.insert(asset_id, (first_date, last_date));
+            }
+        }
+
+        Ok(result_map)
+    }
+
+    fn get_holdings_snapshot_bounds_for_assets(
+        &self,
+        asset_ids: &[String],
+    ) -> Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>> {
+        if asset_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        #[derive(QueryableByName)]
+        struct HoldingsBoundsRow {
+            #[diesel(sql_type = Text)]
+            asset_id: String,
+            #[diesel(sql_type = Nullable<Text>)]
+            min_date: Option<String>,
+            #[diesel(sql_type = Nullable<Text>)]
+            max_date: Option<String>,
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let mut result_map: HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)> =
+            HashMap::new();
+
+        for chunk in chunk_for_sqlite(asset_ids) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT position.key AS asset_id, \
+                        MIN(snapshot.snapshot_date) AS min_date, \
+                        MAX(snapshot.snapshot_date) AS max_date \
+                 FROM holdings_snapshots snapshot \
+                 JOIN accounts account ON account.id = snapshot.account_id \
+                 JOIN json_each(snapshot.positions) position \
+                 WHERE account.is_archived = 0 \
+                   AND position.key IN ({}) \
+                   AND CAST(COALESCE(json_extract(position.value, '$.quantity'), '0') AS REAL) <> 0 \
+                 GROUP BY position.key",
+                placeholders
+            );
+
+            let mut query_builder = Box::new(sql_query(sql)).into_boxed::<Sqlite>();
+            for asset_id in chunk {
+                query_builder = query_builder.bind::<Text, _>(asset_id);
+            }
+
+            let rows: Vec<HoldingsBoundsRow> = query_builder
+                .load::<HoldingsBoundsRow>(&mut conn)
+                .map_err(StorageError::from)?;
+
+            for row in rows {
+                let first_date = row
+                    .min_date
+                    .and_then(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok());
+                let last_date = row
+                    .max_date
+                    .and_then(|date| NaiveDate::parse_from_str(&date, "%Y-%m-%d").ok());
+
+                result_map.insert(row.asset_id, (first_date, last_date));
+            }
+        }
+
+        Ok(result_map)
+    }
+
+    /// Checks for existing activities with the given idempotency keys.
+    ///
+    /// Returns a map of {idempotency_key: existing_activity_id} for keys that already exist.
+    fn check_existing_duplicates(
+        &self,
+        idempotency_keys: &[String],
+    ) -> Result<HashMap<String, String>> {
+        if idempotency_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut conn = get_connection(&self.pool)?;
+        let mut result_map: HashMap<String, String> = HashMap::new();
+
+        // Chunk the keys to avoid SQLite parameter limits
+        for chunk in chunk_for_sqlite(idempotency_keys) {
+            let results = activities::table
+                .filter(activities::idempotency_key.eq_any(chunk))
+                .select((activities::id, activities::idempotency_key))
+                .load::<(String, Option<String>)>(&mut conn)
+                .map_err(StorageError::from)?;
+
+            for (activity_id, key_opt) in results {
+                if let Some(key) = key_opt {
+                    result_map.insert(key, activity_id);
+                }
+            }
+        }
+
+        Ok(result_map)
+    }
+
+    /// Upserts multiple activities (insert or update on conflict by ID or idempotency_key).
+    /// Respects is_user_modified flag - skips updates to user-modified activities.
+    ///
+    /// Returns statistics about the operation.
+    async fn bulk_upsert(&self, activities_vec: Vec<ActivityUpsert>) -> Result<BulkUpsertResult> {
+        use diesel::upsert::excluded;
+
+        if activities_vec.is_empty() {
+            return Ok(BulkUpsertResult::default());
+        }
+
+        // Convert to ActivityDB
+        let activity_rows: Vec<ActivityDB> =
+            activities_vec.into_iter().map(ActivityDB::from).collect();
+
+        self.writer
+            .exec_tx(move |tx| -> Result<BulkUpsertResult> {
+                // Collect all activity IDs, source identities, and idempotency keys for batch lookup.
+                let activity_ids: Vec<String> =
+                    activity_rows.iter().map(|a| a.id.clone()).collect();
+                let source_identities: Vec<(String, String, String)> = activity_rows
+                    .iter()
+                    .filter_map(|a| {
+                        let source_system = a.source_system.as_deref()?.trim();
+                        let source_record_id = a.source_record_id.as_deref()?.trim();
+                        if source_system.is_empty() || source_record_id.is_empty() {
+                            return None;
+                        }
+                        Some((
+                            source_system.to_string(),
+                            a.account_id.clone(),
+                            source_record_id.to_string(),
+                        ))
+                    })
+                    .collect();
+                let idempotency_keys: Vec<String> = activity_rows
+                    .iter()
+                    .filter_map(|a| a.idempotency_key.clone())
+                    .collect();
+
+                let mut existing_activity_rows: HashMap<String, (Option<String>, i32)> =
+                    HashMap::new();
+                for chunk in chunk_for_sqlite(&activity_ids) {
+                    let rows = activities::table
+                        .filter(activities::id.eq_any(chunk))
+                        .select((
+                            activities::id,
+                            activities::idempotency_key,
+                            activities::is_user_modified,
+                        ))
+                        .load::<(String, Option<String>, i32)>(tx.conn())
+                        .map_err(StorageError::from)?;
+                    existing_activity_rows.extend(
+                        rows.into_iter()
+                            .map(|(id, key, modified)| (id, (key, modified))),
+                    );
+                }
+                for chunk in chunk_for_sqlite(&idempotency_keys) {
+                    let rows = activities::table
+                        .filter(activities::idempotency_key.eq_any(chunk))
+                        .select((
+                            activities::id,
+                            activities::idempotency_key,
+                            activities::is_user_modified,
+                        ))
+                        .load::<(String, Option<String>, i32)>(tx.conn())
+                        .map_err(StorageError::from)?;
+                    existing_activity_rows.extend(
+                        rows.into_iter()
+                            .map(|(id, key, modified)| (id, (key, modified))),
+                    );
+                }
+
+                let source_identity_chunk_size = SQLITE_MAX_PARAMS_CHUNK / 3;
+                let mut existing_source_rows: HashMap<
+                    String,
+                    (String, Option<String>, Option<String>, i32),
+                > = HashMap::new();
+                for chunk in source_identities.chunks(source_identity_chunk_size) {
+                    let source_systems: Vec<Option<String>> = chunk
+                        .iter()
+                        .map(|(source_system, _, _)| Some(source_system.clone()))
+                        .collect();
+                    let account_ids: Vec<String> = chunk
+                        .iter()
+                        .map(|(_, account_id, _)| account_id.clone())
+                        .collect();
+                    let source_record_ids: Vec<Option<String>> = chunk
+                        .iter()
+                        .map(|(_, _, source_record_id)| Some(source_record_id.clone()))
+                        .collect();
+                    let rows = activities::table
+                        .filter(activities::account_id.eq_any(&account_ids))
+                        .filter(activities::source_system.eq_any(&source_systems))
+                        .filter(activities::source_record_id.eq_any(&source_record_ids))
+                        .select((
+                            activities::id,
+                            activities::account_id,
+                            activities::source_system,
+                            activities::source_record_id,
+                            activities::is_user_modified,
+                        ))
+                        .load::<(String, String, Option<String>, Option<String>, i32)>(tx.conn())
+                        .map_err(StorageError::from)?;
+                    existing_source_rows.extend(rows.into_iter().map(
+                        |(id, account_id, source_system, source_record_id, modified)| {
+                            (
+                                id,
+                                (account_id, source_system, source_record_id, modified),
+                            )
+                        },
+                    ));
+                }
+
+                // Build lookup maps for quick access.
+                let mut existing_by_id: HashMap<String, i32> = HashMap::new();
+                let mut existing_by_idemp: HashMap<String, (String, i32)> = HashMap::new();
+                let mut existing_by_source: HashMap<(String, String, String), (String, i32)> =
+                    HashMap::new();
+
+                for (id, (idemp_key, is_modified)) in existing_activity_rows {
+                    existing_by_id.insert(id.clone(), is_modified);
+                    if let Some(key) = idemp_key {
+                        existing_by_idemp.insert(key, (id, is_modified));
+                    }
+                }
+
+                for (id, (account_id, source_system, source_record_id, is_modified)) in
+                    existing_source_rows
+                {
+                    if let (Some(source_system), Some(source_record_id)) =
+                        (source_system, source_record_id)
+                    {
+                        existing_by_source.insert(
+                            (source_system, account_id, source_record_id),
+                            (id, is_modified),
+                        );
+                    }
+                }
+
+                // Capture pre-images of candidate rows that are effectively SPLIT, so the
+                // service can emit asset-level split events even when the incoming row
+                // reclassifies the activity or moves it to another asset.
+                let candidate_ids: Vec<String> = existing_by_id
+                    .keys()
+                    .cloned()
+                    .chain(existing_by_idemp.values().map(|(id, _)| id.clone()))
+                    .chain(existing_by_source.values().map(|(id, _)| id.clone()))
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let mut existing_candidate_rows = Vec::new();
+                for chunk in chunk_for_sqlite(&candidate_ids) {
+                    existing_candidate_rows.extend(
+                        activities::table
+                        .filter(activities::id.eq_any(chunk))
+                        .select((
+                            activities::id,
+                            activities::asset_id,
+                            activities::activity_type,
+                            activities::activity_type_override,
+                            activities::status,
+                            activities::needs_review,
+                        ))
+                        .load::<(
+                            String,
+                            Option<String>,
+                            String,
+                            Option<String>,
+                            String,
+                            i32,
+                        )>(tx.conn())
+                        .map_err(StorageError::from)?,
+                    );
+                }
+                let mut existing_split_assets = HashMap::new();
+                let mut existing_lifecycle = HashMap::new();
+                for (id, asset_id, activity_type, type_override, status, needs_review) in
+                    existing_candidate_rows
+                {
+                    if type_override.as_deref().unwrap_or(&activity_type) == "SPLIT" {
+                        if let Some(asset_id) = asset_id {
+                            existing_split_assets.insert(id.clone(), asset_id);
+                        }
+                    }
+                    existing_lifecycle.insert(id, (status, needs_review));
+                }
+                let mut updated_split_asset_ids: HashSet<String> = HashSet::new();
+
+                let mut result = BulkUpsertResult::default();
+
+                for mut activity_db in activity_rows {
+                    let now_update = chrono::Utc::now().to_rfc3339();
+                    let activity_id = activity_db.id.clone();
+                    let idempotency_key = activity_db.idempotency_key.clone();
+
+                    let source_identity = activity_db
+                        .source_system
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .zip(
+                            activity_db
+                                .source_record_id
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty()),
+                        )
+                        .map(|(source_system, source_record_id)| {
+                            (
+                                source_system.to_string(),
+                                activity_db.account_id.clone(),
+                                source_record_id.to_string(),
+                            )
+                        });
+                    let mut will_update = false;
+
+                    // Check if this activity exists and is user-modified.
+                    // First check by ID.
+                    if let Some(&is_modified) = existing_by_id.get(&activity_id) {
+                        will_update = true;
+                        if is_modified != 0 {
+                            log::debug!(
+                                "Skipping user-modified activity {} (type={})",
+                                activity_id,
+                                activity_db.activity_type
+                            );
+                            result.skipped += 1;
+                            continue;
+                        }
+                    }
+
+                    // Match by provider identity before falling back to semantic idempotency.
+                    if !will_update {
+                        if let Some(ref source_key) = source_identity {
+                            if let Some((existing_id, is_modified)) = existing_by_source.get(source_key)
+                            {
+                                if *is_modified != 0 {
+                                    log::debug!(
+                                        "Skipping update for user-modified activity (matched by source identity: {} -> {})",
+                                        activity_id,
+                                        existing_id
+                                    );
+                                    result.skipped += 1;
+                                    continue;
+                                }
+                                log::debug!(
+                                    "Activity {} matched existing {} by source identity, updating existing",
+                                    activity_id,
+                                    existing_id
+                                );
+                                activity_db.id = existing_id.clone();
+                                will_update = true;
+                            }
+                        }
+                    }
+
+                    // If still unmatched, fall back to semantic idempotency.
+                    if !will_update {
+                        if let Some(ref key) = idempotency_key {
+                            if let Some((existing_id, is_modified)) = existing_by_idemp.get(key) {
+                                if *is_modified != 0 {
+                                    log::debug!(
+                                        "Skipping update for user-modified activity (matched by idempotency_key: {} -> {})",
+                                        activity_id,
+                                        existing_id
+                                    );
+                                    result.skipped += 1;
+                                    continue;
+                                }
+                                // Found by idempotency_key - update the existing record instead
+                                log::debug!(
+                                    "Activity {} matched existing {} by idempotency_key, updating existing",
+                                    activity_id,
+                                    existing_id
+                                );
+                                activity_db.id = existing_id.clone();
+                                will_update = true;
+                            }
+                        }
+                    }
+
+                    // Provider refreshes may update economics, but only an explicit
+                    // user update may post a Draft or clear a local review flag.
+                    if will_update {
+                        if let Some((status, needs_review)) =
+                            existing_lifecycle.get(&activity_db.id)
+                        {
+                            if status != "POSTED" {
+                                activity_db.status = status.clone();
+                            }
+                            if *needs_review != 0 {
+                                activity_db.needs_review = *needs_review;
+                            }
+                        }
+                    }
+
+                    assert_final_cash_floor(&activity_db)?;
+                    match diesel::insert_into(activities::table)
+                        .values(&activity_db)
+                        .on_conflict(activities::id)
+                        .do_update()
+                        .set((
+                            activities::account_id.eq(excluded(activities::account_id)),
+                            activities::asset_id.eq(excluded(activities::asset_id)),
+                            activities::activity_type.eq(excluded(activities::activity_type)),
+                            activities::subtype.eq(excluded(activities::subtype)),
+                            activities::activity_date.eq(excluded(activities::activity_date)),
+                            activities::quantity.eq(excluded(activities::quantity)),
+                            activities::unit_price.eq(excluded(activities::unit_price)),
+                            activities::currency.eq(excluded(activities::currency)),
+                            activities::fee.eq(excluded(activities::fee)),
+                            activities::tax.eq(excluded(activities::tax)),
+                            activities::amount.eq(excluded(activities::amount)),
+                            activities::status.eq(excluded(activities::status)),
+                            activities::notes.eq(excluded(activities::notes)),
+                            activities::fx_rate.eq(excluded(activities::fx_rate)),
+                            activities::metadata.eq(excluded(activities::metadata)),
+                            activities::source_system.eq(excluded(activities::source_system)),
+                            activities::source_record_id.eq(excluded(activities::source_record_id)),
+                            activities::source_group_id.eq(excluded(activities::source_group_id)),
+                            activities::needs_review.eq(excluded(activities::needs_review)),
+                            activities::idempotency_key.eq(excluded(activities::idempotency_key)),
+                            activities::import_run_id.eq(excluded(activities::import_run_id)),
+                            activities::updated_at.eq(now_update),
+                        ))
+                        .execute(tx.conn())
+                    {
+                        Ok(count) => {
+                            if count > 0 {
+
+                                existing_by_id.insert(activity_db.id.clone(), 0);
+                                if let Some(key) = activity_db.idempotency_key.clone() {
+                                    existing_by_idemp.insert(key, (activity_db.id.clone(), 0));
+                                }
+                                if let Some(source_key) = source_identity.clone() {
+                                    existing_by_source.insert(source_key, (activity_db.id.clone(), 0));
+                                }
+
+                                result.upserted += count;
+                                if will_update {
+                                    result.updated += count;
+                                    if let Some(asset_id) =
+                                        existing_split_assets.get(&activity_db.id)
+                                    {
+                                        updated_split_asset_ids.insert(asset_id.clone());
+                                    }
+                                } else {
+                                    result.created += count;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "Failed to upsert activity {} (type={}): {:?}",
+                                activity_db.id,
+                                activity_db.activity_type,
+                                e
+                            );
+                            return Err(StorageError::from(e).into());
+                        }
+                    }
+                }
+
+
+                if result.skipped > 0 {
+                    log::info!(
+                        "Skipped {} user-modified activities during bulk upsert",
+                        result.skipped
+                    );
+                }
+
+                log::debug!(
+                    "Bulk upsert complete: {} upserted ({} created, {} updated), {} skipped",
+                    result.upserted,
+                    result.created,
+                    result.updated,
+                    result.skipped
+                );
+
+                result.updated_split_asset_ids = updated_split_asset_ids.into_iter().collect();
+                Ok(result)
+            })
+            .await
+    }
+
+    async fn reassign_asset(&self, old_asset_id: &str, new_asset_id: &str) -> Result<u32> {
+        let old_id = old_asset_id.to_string();
+        let new_id = new_asset_id.to_string();
+        self.writer
+            .exec_tx(move |tx| -> Result<u32> {
+                let affected_ids = activities::table
+                    .filter(activities::asset_id.eq(&old_id))
+                    .select(activities::id)
+                    .load::<String>(tx.conn())
+                    .map_err(StorageError::from)?;
+                if affected_ids.is_empty() {
+                    return Ok(0);
+                }
+
+                let now = chrono::Utc::now().to_rfc3339();
+                let count =
+                    diesel::update(activities::table.filter(activities::asset_id.eq(&old_id)))
+                        .set((
+                            activities::asset_id.eq(&new_id),
+                            activities::updated_at.eq(&now),
+                        ))
+                        .execute(tx.conn())
+                        .map_err(StorageError::from)?;
+
+                Ok(count as u32)
+            })
+            .await
+    }
+
+    async fn get_activity_accounts_and_currencies_by_asset_id(
+        &self,
+        asset_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let asset_id_owned = asset_id.to_string();
+        self.writer
+            .exec(
+                move |conn: &mut SqliteConnection| -> Result<(Vec<String>, Vec<String>)> {
+                    let rows: Vec<(String, String)> = activities::table
+                        .filter(activities::asset_id.eq(&asset_id_owned))
+                        .select((activities::account_id, activities::currency))
+                        .distinct()
+                        .load(conn)
+                        .map_err(StorageError::from)?;
+
+                    let mut account_ids: HashSet<String> = HashSet::new();
+                    let mut currencies: HashSet<String> = HashSet::new();
+
+                    for (account_id, currency) in rows {
+                        if !account_id.is_empty() {
+                            account_ids.insert(account_id);
+                        }
+                        if !currency.is_empty() {
+                            currencies.insert(currency);
+                        }
+                    }
+
+                    Ok((
+                        account_ids.into_iter().collect(),
+                        currencies.into_iter().collect(),
+                    ))
+                },
+            )
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{create_pool, get_connection, init, run_migrations, write_actor::spawn_writer};
+    use crate::schema::spending_activity_splits;
+    use rust_decimal::Decimal;
+    use tempfile::tempdir;
+    use wealthfolio_core::activities::{ActivityStatus, ActivityUpsert};
+
+    fn setup_db() -> (Arc<Pool<ConnectionManager<SqliteConnection>>>, WriteHandle) {
+        let app_data = tempdir()
+            .expect("tempdir")
+            .keep()
+            .to_string_lossy()
+            .to_string();
+        let db_path = init(&app_data).expect("init db");
+        run_migrations(&db_path).expect("migrate db");
+        let pool = create_pool(&db_path).expect("create pool");
+        let writer = spawn_writer(pool.as_ref().clone()).expect("spawn writer");
+        (pool, writer)
+    }
+
+    fn insert_account(conn: &mut SqliteConnection, account_id: &str) {
+        insert_account_with_archived(conn, account_id, false);
+    }
+
+    fn insert_account_with_archived(conn: &mut SqliteConnection, account_id: &str, archived: bool) {
+        diesel::sql_query(format!(
+            "INSERT INTO accounts (id, name, account_type, `group`, currency, is_default, is_active, \
+             created_at, updated_at, platform_id, account_number, meta, provider, provider_account_id, \
+             is_archived, tracking_mode) VALUES ('{}', 'Test', 'CASH', NULL, 'USD', 1, 1, \
+             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, NULL, NULL, NULL, NULL, {}, 'portfolio')",
+            account_id,
+            if archived { 1 } else { 0 }
+        ))
+        .execute(conn)
+        .expect("insert account");
+    }
+
+    fn sql_value(value: Option<&str>) -> String {
+        value
+            .map(|value| format!("'{}'", value.replace('\'', "''")))
+            .unwrap_or_else(|| "NULL".to_string())
+    }
+
+    fn insert_broker_account_and_import_run(conn: &mut SqliteConnection) {
+        diesel::sql_query(
+            "INSERT INTO accounts \
+             (id, name, account_type, `group`, currency, is_default, is_active, created_at, updated_at, \
+              platform_id, account_number, meta, provider, provider_account_id, is_archived, tracking_mode) \
+             VALUES ('broker-local-account', 'Broker Account', 'cash', NULL, 'USD', 0, 1, \
+                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL, NULL, NULL, 'SNAPTRADE', \
+                     'provider-account-1', 0, 'portfolio')",
+        )
+        .execute(conn)
+        .expect("insert broker account");
+
+        diesel::sql_query(
+            "INSERT INTO import_runs \
+             (id, account_id, source_system, run_type, mode, status, started_at, finished_at, \
+              review_mode, applied_at, checkpoint_in, checkpoint_out, summary, warnings, error, \
+              created_at, updated_at) \
+             VALUES ('local-import-run', 'broker-local-account', 'SNAPTRADE', 'SYNC', \
+                     'INCREMENTAL', 'COMPLETED', '2026-01-01T00:00:00Z', \
+                     '2026-01-01T00:00:01Z', 'NEVER', '2026-01-01T00:00:01Z', \
+                     NULL, NULL, NULL, NULL, NULL, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z')",
+        )
+        .execute(conn)
+        .expect("insert broker import run");
+    }
+
+    struct BrokerActivitySeed<'a> {
+        id: &'a str,
+        activity_type: &'a str,
+        activity_type_override: Option<&'a str>,
+        source_system: &'a str,
+        source_record_id: &'a str,
+        amount: &'a str,
+        notes: &'a str,
+        subtype: Option<&'a str>,
+    }
+
+    fn insert_broker_activity(conn: &mut SqliteConnection, seed: BrokerActivitySeed<'_>) {
+        diesel::sql_query(format!(
+            "INSERT INTO activities \
+             (id, account_id, asset_id, activity_type, activity_type_override, source_type, subtype, \
+              status, activity_date, settlement_date, quantity, unit_price, amount, fee, currency, \
+              fx_rate, notes, metadata, source_system, source_record_id, source_group_id, \
+              idempotency_key, import_run_id, is_user_modified, needs_review, created_at, updated_at) \
+             VALUES ('{}', 'broker-local-account', NULL, '{}', {}, NULL, {}, \
+                     'POSTED', '2026-01-01T00:00:00Z', NULL, '10', '5', '{}', '1', 'USD', \
+                     NULL, '{}', '{{\"broker\":\"keep\"}}', '{}', '{}', \
+                     NULL, 'local-idempotency-key-{}', 'local-import-run', 0, 0, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            seed.id,
+            seed.activity_type,
+            sql_value(seed.activity_type_override),
+            sql_value(seed.subtype),
+            seed.amount,
+            seed.notes.replace('\'', "''"),
+            seed.source_system,
+            seed.source_record_id,
+            seed.id
+        ))
+        .execute(conn)
+        .expect("insert broker activity");
+    }
+
+    fn insert_holdings_snapshot(
+        conn: &mut SqliteConnection,
+        account_id: &str,
+        snapshot_date: &str,
+        positions: &str,
+    ) {
+        let snapshot_id = format!("{}_{}", account_id, snapshot_date);
+        sql_query(
+            "INSERT INTO holdings_snapshots (
+                id, account_id, snapshot_date, currency, positions, cash_balances, cost_basis,
+                net_contribution, calculated_at, net_contribution_base,
+                cash_total_account_currency, cash_total_base_currency, source
+             ) VALUES (?, ?, ?, 'USD', ?, '{}', '0', '0', '2026-01-01T00:00:00Z', '0', '0', '0', 'CALCULATED')",
+        )
+        .bind::<Text, _>(snapshot_id)
+        .bind::<Text, _>(account_id)
+        .bind::<Text, _>(snapshot_date)
+        .bind::<Text, _>(positions)
+        .execute(conn)
+        .expect("insert holdings snapshot");
+    }
+
+    fn insert_transfer_activity(
+        conn: &mut SqliteConnection,
+        id: &str,
+        account_id: &str,
+        activity_type: &str,
+        source_group_id: Option<&str>,
+        metadata: Option<&str>,
+    ) {
+        insert_transfer_activity_with_currency(
+            conn,
+            id,
+            account_id,
+            activity_type,
+            source_group_id,
+            metadata,
+            "USD",
+        );
+    }
+
+    fn insert_transfer_activity_with_currency(
+        conn: &mut SqliteConnection,
+        id: &str,
+        account_id: &str,
+        activity_type: &str,
+        source_group_id: Option<&str>,
+        metadata: Option<&str>,
+        currency: &str,
+    ) {
+        let activity = ActivityDB {
+            id: id.to_string(),
+            account_id: account_id.to_string(),
+            asset_id: None,
+            activity_type: activity_type.to_string(),
+            activity_type_override: None,
+            source_type: None,
+            subtype: None,
+            status: "POSTED".to_string(),
+            activity_date: "2024-01-15T00:00:00+00:00".to_string(),
+            settlement_date: None,
+            quantity: None,
+            unit_price: None,
+            amount: Some("100".to_string()),
+            fee: Some("0".to_string()),
+            tax: None,
+            currency: currency.to_string(),
+            fx_rate: None,
+            notes: None,
+            metadata: metadata.map(str::to_string),
+            source_system: Some("MANUAL".to_string()),
+            source_record_id: None,
+            source_group_id: source_group_id.map(str::to_string),
+            idempotency_key: Some(format!("{id}-idempotency")),
+            import_run_id: None,
+            is_user_modified: 0,
+            needs_review: 0,
+            created_at: "2024-01-15T00:00:00+00:00".to_string(),
+            updated_at: "2024-01-15T00:00:00+00:00".to_string(),
+            version: 0,
+        };
+
+        diesel::insert_into(activities::table)
+            .values(&activity)
+            .execute(conn)
+            .expect("insert transfer activity");
+    }
+
+    #[tokio::test]
+    async fn search_activities_uses_effective_broker_activity_type() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_broker_account_and_import_run(&mut conn);
+            insert_broker_activity(
+                &mut conn,
+                BrokerActivitySeed {
+                    id: "broker-buy-override",
+                    activity_type: "BUY",
+                    activity_type_override: Some("SELL"),
+                    source_system: "SNAPTRADE",
+                    source_record_id: "broker-record-sell",
+                    amount: "50",
+                    notes: "Broker override",
+                    subtype: Some("INTERNALSECURITYTRANSFER"),
+                },
+            );
+            insert_broker_activity(
+                &mut conn,
+                BrokerActivitySeed {
+                    id: "broker-dividend",
+                    activity_type: "DIVIDEND",
+                    activity_type_override: None,
+                    source_system: "SNAPTRADE",
+                    source_record_id: "broker-record-dividend",
+                    amount: "5",
+                    notes: "Broker dividend",
+                    subtype: None,
+                },
+            );
+            diesel::update(activities::table.find("broker-dividend"))
+                .set((
+                    activities::fee.eq(Some("1".to_string())),
+                    activities::tax.eq(Some("2".to_string())),
+                    activities::needs_review.eq(1),
+                ))
+                .execute(&mut conn)
+                .expect("set dividend charges");
+        }
+
+        let filtered = repo
+            .search_activities(
+                0,
+                10,
+                None,
+                Some(vec!["SELL".to_string()]),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("search by effective type");
+        assert_eq!(filtered.data.len(), 1);
+        assert_eq!(filtered.data[0].id, "broker-buy-override");
+        assert_eq!(filtered.data[0].activity_type, "SELL");
+
+        // Server-side filter by exact activity id returns just that activity,
+        // regardless of other rows or paging.
+        let by_id = repo
+            .search_activities(
+                0,
+                10,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vec!["broker-dividend".to_string()]),
+            )
+            .expect("search by activity id");
+        assert_eq!(by_id.data.len(), 1);
+        assert_eq!(by_id.data[0].id, "broker-dividend");
+        assert_eq!(by_id.data[0].amount.as_deref(), Some("5"));
+
+        let needs_review = repo
+            .search_activities(
+                0,
+                10,
+                None,
+                None,
+                None,
+                None,
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("search by independent review flag");
+        assert_eq!(needs_review.data.len(), 1);
+        assert_eq!(needs_review.data[0].id, "broker-dividend");
+        assert_eq!(needs_review.data[0].status, ActivityStatus::Posted);
+
+        let sorted = repo
+            .search_activities(
+                0,
+                10,
+                None,
+                None,
+                None,
+                Some(Sort {
+                    id: "activityType".to_string(),
+                    desc: false,
+                }),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("sort by effective type");
+        let ids: Vec<&str> = sorted
+            .data
+            .iter()
+            .map(|activity| activity.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["broker-dividend", "broker-buy-override"]);
+
+        let subtype_match = repo
+            .search_activities(
+                0,
+                10,
+                None,
+                None,
+                Some("InternalSecurityTransfer".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("search by subtype keyword");
+        assert_eq!(subtype_match.data.len(), 1);
+        assert_eq!(subtype_match.data[0].id, "broker-buy-override");
+    }
+
+    #[tokio::test]
+    async fn search_activities_returns_the_asset_contract_multiplier() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_account(&mut conn, "option-account");
+            diesel::sql_query(
+                r#"INSERT INTO assets
+                   (id, kind, name, display_code, metadata, is_active, quote_mode, quote_ccy,
+                    instrument_type, instrument_symbol, created_at, updated_at)
+                   VALUES
+                   ('option-mini', 'INVESTMENT', 'Mini option', 'AAPL7',
+                    '{"option":{"underlyingAssetId":"AAPL","expiration":"2026-12-18","right":"CALL","strike":"150","multiplier":"10"}}',
+                    1, 'MARKET', 'USD', 'OPTION', 'AAPL7 261218C00150000', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+                   ('option-standard', 'INVESTMENT', 'Standard option', 'AAPL', NULL,
+                    1, 'MARKET', 'USD', 'OPTION', 'AAPL 261218C00150000', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"#,
+            )
+            .execute(&mut conn)
+            .expect("insert option assets");
+            diesel::sql_query(
+                "INSERT INTO activities
+                 (id, account_id, asset_id, activity_type, status, activity_date, quantity,
+                  unit_price, amount, currency, is_user_modified, needs_review, created_at, updated_at)
+                 VALUES
+                 ('mini-buy', 'option-account', 'option-mini', 'BUY', 'POSTED',
+                  '2026-01-01T00:00:00Z', '1', '5', '50', 'USD', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+                 ('standard-buy', 'option-account', 'option-standard', 'BUY', 'POSTED',
+                  '2026-01-02T00:00:00Z', '1', '5', '500', 'USD', 0, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .execute(&mut conn)
+            .expect("insert option activities");
+        }
+
+        let results = repo
+            .search_activities(
+                0,
+                10,
+                Some(vec!["option-account".to_string()]),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("search option activities");
+
+        let multipliers: HashMap<&str, Option<&str>> = results
+            .data
+            .iter()
+            .map(|activity| {
+                (
+                    activity.id.as_str(),
+                    activity.asset_contract_multiplier.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(multipliers.get("mini-buy"), Some(&Some("10")));
+        assert_eq!(multipliers.get("standard-buy"), Some(&Some("100")));
+    }
+
+    #[tokio::test]
+    async fn category_queries_use_effective_broker_activity_type() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_broker_account_and_import_run(&mut conn);
+            insert_broker_activity(
+                &mut conn,
+                BrokerActivitySeed {
+                    id: "effective-buy",
+                    activity_type: "FEE",
+                    activity_type_override: Some("BUY"),
+                    source_system: "SNAPTRADE",
+                    source_record_id: "broker-record-buy",
+                    amount: "50",
+                    notes: "Effective buy",
+                    subtype: None,
+                },
+            );
+            insert_broker_activity(
+                &mut conn,
+                BrokerActivitySeed {
+                    id: "effective-dividend",
+                    activity_type: "BUY",
+                    activity_type_override: Some("DIVIDEND"),
+                    source_system: "SNAPTRADE",
+                    source_record_id: "broker-record-income",
+                    amount: "5",
+                    notes: "Effective dividend",
+                    subtype: None,
+                },
+            );
+        }
+
+        let trading_ids: Vec<String> = repo
+            .get_trading_activities()
+            .expect("trading activities")
+            .into_iter()
+            .map(|activity| activity.id)
+            .collect();
+        let income_ids: Vec<String> = repo
+            .get_income_activities()
+            .expect("income activities")
+            .into_iter()
+            .map(|activity| activity.id)
+            .collect();
+
+        assert_eq!(trading_ids, vec!["effective-buy"]);
+        assert_eq!(income_ids, vec!["effective-dividend"]);
+    }
+
+    #[tokio::test]
+    async fn search_activities_in_utc_range_uses_exact_timestamp_bounds() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_broker_account_and_import_run(&mut conn);
+            diesel::sql_query(
+                "INSERT INTO activities \
+                 (id, account_id, asset_id, activity_type, activity_type_override, source_type, subtype, \
+                  status, activity_date, settlement_date, quantity, unit_price, amount, fee, currency, \
+                  fx_rate, notes, metadata, source_system, source_record_id, source_group_id, \
+                  idempotency_key, import_run_id, is_user_modified, needs_review, created_at, updated_at) \
+                 VALUES \
+                 ('local-evening-transfer', 'broker-local-account', NULL, 'TRANSFER_IN', NULL, NULL, NULL, \
+                  'POSTED', '2024-01-04T02:13:00+00:00', NULL, NULL, NULL, '1685.43', NULL, 'USD', \
+                  NULL, 'Belongs to Jan 3 in Toronto', NULL, 'CSV', 'range-1', NULL, \
+                  'local-evening-transfer-key', 'local-import-run', 0, 0, \
+                  '2024-01-04T02:13:00+00:00', '2024-01-04T02:13:00+00:00'), \
+                 ('next-local-day-transfer', 'broker-local-account', NULL, 'TRANSFER_IN', NULL, NULL, NULL, \
+                  'POSTED', '2024-01-04T05:30:00+00:00', NULL, NULL, NULL, '10', NULL, 'USD', \
+                  NULL, 'Belongs to Jan 4 in Toronto', NULL, 'CSV', 'range-2', NULL, \
+                  'next-local-day-transfer-key', 'local-import-run', 0, 0, \
+                  '2024-01-04T05:30:00+00:00', '2024-01-04T05:30:00+00:00')",
+            )
+            .execute(&mut conn)
+            .expect("insert activities");
+        }
+
+        let date_from_utc = DateTime::parse_from_rfc3339("2024-01-03T05:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let date_to_utc_exclusive = DateTime::parse_from_rfc3339("2024-01-04T05:00:00+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let response = repo
+            .search_activities_in_utc_range(
+                0,
+                10,
+                None,
+                Some(vec!["TRANSFER_IN".to_string()]),
+                None,
+                Some(Sort {
+                    id: "date".to_string(),
+                    desc: true,
+                }),
+                None,
+                Some(date_from_utc),
+                Some(date_to_utc_exclusive),
+                None,
+                None,
+            )
+            .expect("search by utc range");
+
+        assert_eq!(response.meta.total_row_count, 1);
+        assert_eq!(response.data[0].id, "local-evening-transfer");
+    }
+
+    #[tokio::test]
+    async fn notes_only_broker_edit_preserves_type_override_and_base_type_clears_it() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_broker_account_and_import_run(&mut conn);
+            insert_broker_activity(
+                &mut conn,
+                BrokerActivitySeed {
+                    id: "broker-activity-with-override",
+                    activity_type: "BUY",
+                    activity_type_override: Some("SELL"),
+                    source_system: "SNAPTRADE",
+                    source_record_id: "broker-record-override",
+                    amount: "50",
+                    notes: "Old note",
+                    subtype: None,
+                },
+            );
+        }
+
+        repo.update_activity(ActivityUpdate {
+            id: "broker-activity-with-override".to_string(),
+            account_id: "broker-local-account".to_string(),
+            asset: None,
+            activity_type: "SELL".to_string(),
+            subtype: None,
+            activity_date: "2026-01-01T00:00:00Z".to_string(),
+            quantity: None,
+            unit_price: None,
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: None,
+            status: Some(ActivityStatus::Posted),
+            needs_review: None,
+            notes: Some("New note".to_string()),
+            fx_rate: None,
+            metadata: None,
+        })
+        .await
+        .expect("notes-only update");
+
+        let mut conn = get_connection(&pool).expect("conn");
+        let type_row = activities::table
+            .find("broker-activity-with-override")
+            .select((
+                activities::activity_type,
+                activities::activity_type_override,
+                activities::notes,
+            ))
+            .first::<(String, Option<String>, Option<String>)>(&mut conn)
+            .expect("activity type row");
+        assert_eq!(type_row.0, "BUY");
+        assert_eq!(type_row.1.as_deref(), Some("SELL"));
+        assert_eq!(type_row.2.as_deref(), Some("New note"));
+
+        repo.update_activity(ActivityUpdate {
+            id: "broker-activity-with-override".to_string(),
+            account_id: "broker-local-account".to_string(),
+            asset: None,
+            activity_type: "BUY".to_string(),
+            subtype: None,
+            activity_date: "2026-01-01T00:00:00Z".to_string(),
+            quantity: None,
+            unit_price: None,
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: None,
+            status: Some(ActivityStatus::Posted),
+            needs_review: None,
+            notes: Some("New note".to_string()),
+            fx_rate: None,
+            metadata: None,
+        })
+        .await
+        .expect("clear override update");
+
+        let cleared_override = activities::table
+            .find("broker-activity-with-override")
+            .select(activities::activity_type_override)
+            .first::<Option<String>>(&mut conn)
+            .expect("cleared override");
+        assert_eq!(cleared_override, None);
+    }
+
+    fn insert_activity_with_subtype(
+        conn: &mut SqliteConnection,
+        id: &str,
+        account_id: &str,
+        activity_type: &str,
+        asset_id: Option<&str>,
+        subtype: Option<&str>,
+    ) {
+        let activity = ActivityDB {
+            id: id.to_string(),
+            account_id: account_id.to_string(),
+            asset_id: asset_id.map(str::to_string),
+            activity_type: activity_type.to_string(),
+            activity_type_override: None,
+            source_type: None,
+            subtype: subtype.map(str::to_string),
+            status: "POSTED".to_string(),
+            activity_date: "2024-01-15T00:00:00+00:00".to_string(),
+            settlement_date: None,
+            quantity: Some("1".to_string()),
+            unit_price: Some("100".to_string()),
+            amount: Some("100".to_string()),
+            fee: Some("0".to_string()),
+            tax: None,
+            currency: "USD".to_string(),
+            fx_rate: None,
+            notes: None,
+            metadata: None,
+            source_system: Some("MANUAL".to_string()),
+            source_record_id: None,
+            source_group_id: None,
+            idempotency_key: Some(format!("{id}-idempotency")),
+            import_run_id: None,
+            is_user_modified: 0,
+            needs_review: 0,
+            created_at: "2024-01-15T00:00:00+00:00".to_string(),
+            updated_at: "2024-01-15T00:00:00+00:00".to_string(),
+            version: 0,
+        };
+
+        diesel::insert_into(activities::table)
+            .values(&activity)
+            .execute(conn)
+            .expect("insert activity with subtype");
+    }
+
+    fn insert_spending_split(conn: &mut SqliteConnection, id: &str, activity_id: &str) {
+        diesel::sql_query(format!(
+            "INSERT INTO spending_activity_splits \
+             (id, activity_id, taxonomy_id, category_id, amount, note, sort_order, created_at, updated_at) \
+             VALUES ('{}', '{}', 'spending_categories', 'cat_food', '100', NULL, 0, \
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            id, activity_id
+        ))
+        .execute(conn)
+        .expect("insert spending split");
+    }
+
+    fn activity_metadata(conn: &mut SqliteConnection, id: &str) -> serde_json::Value {
+        let metadata: Option<String> = activities::table
+            .filter(activities::id.eq(id))
+            .select(activities::metadata)
+            .first(conn)
+            .expect("activity metadata");
+        serde_json::from_str(metadata.as_deref().expect("metadata should be set"))
+            .expect("valid metadata")
+    }
+
+    fn activity_user_modified(conn: &mut SqliteConnection, id: &str) -> i32 {
+        activities::table
+            .filter(activities::id.eq(id))
+            .select(activities::is_user_modified)
+            .first(conn)
+            .expect("activity is_user_modified")
+    }
+
+    #[tokio::test]
+    async fn get_activities_by_ids_filters_missing_and_archived_accounts() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_account(&mut conn, "acc-active");
+        insert_account_with_archived(&mut conn, "acc-archived", true);
+        insert_activity_with_subtype(&mut conn, "act-active", "acc-active", "DEPOSIT", None, None);
+        insert_activity_with_subtype(
+            &mut conn,
+            "act-archived",
+            "acc-archived",
+            "DEPOSIT",
+            None,
+            None,
+        );
+        drop(conn);
+
+        let ids = vec![
+            "act-archived".to_string(),
+            "missing".to_string(),
+            "act-active".to_string(),
+        ];
+        let activities = repo.get_activities_by_ids(&ids).expect("activities");
+        let activity_ids = activities
+            .iter()
+            .map(|activity| activity.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(activity_ids, vec!["act-active"]);
+
+        let all_activity_ids: HashSet<String> = repo
+            .get_activities_including_archived_accounts()
+            .expect("all activities")
+            .into_iter()
+            .map(|activity| activity.id)
+            .collect();
+        assert_eq!(
+            all_activity_ids,
+            HashSet::from(["act-active".to_string(), "act-archived".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn split_activities_by_asset_cover_every_account_and_the_effective_type() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_account(&mut conn, "acc-active");
+        insert_account_with_archived(&mut conn, "acc-archived", true);
+        for asset in ["asset-aapl", "asset-msft"] {
+            diesel::insert_into(assets::table)
+                .values((
+                    assets::id.eq(asset),
+                    assets::kind.eq("INVESTMENT"),
+                    assets::is_active.eq(1),
+                    assets::quote_mode.eq("MARKET"),
+                    assets::quote_ccy.eq("USD"),
+                    assets::created_at.eq("2024-01-15T00:00:00+00:00"),
+                    assets::updated_at.eq("2024-01-15T00:00:00+00:00"),
+                ))
+                .execute(&mut conn)
+                .expect("insert asset");
+        }
+        let rows = [
+            ("split-archived", "acc-archived", "SPLIT", "asset-aapl"),
+            ("split-override", "acc-active", "ADJUSTMENT", "asset-aapl"),
+            ("buy", "acc-active", "BUY", "asset-aapl"),
+            ("split-other-asset", "acc-active", "SPLIT", "asset-msft"),
+        ];
+        for (id, account, kind, asset) in rows {
+            insert_activity_with_subtype(&mut conn, id, account, kind, Some(asset), None);
+        }
+        diesel::update(activities::table.filter(activities::id.eq("split-override")))
+            .set(activities::activity_type_override.eq(Some("SPLIT")))
+            .execute(&mut conn)
+            .expect("override");
+        drop(conn);
+
+        let mut ids: Vec<String> = repo
+            .get_split_activities_by_asset_ids(&["asset-aapl".to_string()])
+            .expect("splits")
+            .into_iter()
+            .map(|activity| activity.id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["split-archived", "split-override"]);
+        assert!(repo
+            .get_split_activities_by_asset_ids(&[])
+            .expect("empty")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_activities_by_ids_empty_input_returns_empty() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool, writer);
+
+        let activities = repo
+            .get_activities_by_ids(&[])
+            .expect("empty activity lookup");
+
+        assert!(activities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn holdings_snapshot_bounds_ignore_zero_quantity_and_archived_accounts() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_account(&mut conn, "acc-open");
+        insert_account_with_archived(&mut conn, "acc-archived", true);
+
+        insert_holdings_snapshot(
+            &mut conn,
+            "acc-open",
+            "2026-01-01",
+            r#"{"AAPL":{"quantity":"3"},"MSFT":{"quantity":"0"}}"#,
+        );
+        insert_holdings_snapshot(
+            &mut conn,
+            "acc-open",
+            "2026-02-01",
+            r#"{"AAPL":{"quantity":"0"},"MSFT":{"quantity":"4"}}"#,
+        );
+        insert_holdings_snapshot(
+            &mut conn,
+            "acc-open",
+            "2026-03-01",
+            r#"{"AAPL":{"quantity":"2"}}"#,
+        );
+        insert_holdings_snapshot(
+            &mut conn,
+            "acc-archived",
+            "2026-01-01",
+            r#"{"ARCH":{"quantity":"5"}}"#,
+        );
+
+        let asset_ids = vec![
+            "AAPL".to_string(),
+            "MSFT".to_string(),
+            "ARCH".to_string(),
+            "NONE".to_string(),
+        ];
+        let bounds = repo
+            .get_holdings_snapshot_bounds_for_assets(&asset_ids)
+            .expect("holdings bounds");
+
+        assert_eq!(
+            bounds.get("AAPL"),
+            Some(&(
+                Some(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+                Some(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap())
+            ))
+        );
+        assert_eq!(
+            bounds.get("MSFT"),
+            Some(&(
+                Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap()),
+                Some(NaiveDate::from_ymd_opt(2026, 2, 1).unwrap())
+            ))
+        );
+        assert!(!bounds.contains_key("ARCH"));
+        assert!(!bounds.contains_key("NONE"));
+    }
+
+    #[tokio::test]
+    async fn update_activity_patches_subtype_and_review_independently() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-subtype");
+        insert_activity_with_subtype(
+            &mut conn,
+            "activity-subtype",
+            "acc-subtype",
+            "DIVIDEND",
+            None,
+            Some("DRIP"),
+        );
+        diesel::update(activities::table.find("activity-subtype"))
+            .set((
+                activities::status.eq("DRAFT"),
+                activities::needs_review.eq(1),
+            ))
+            .execute(&mut conn)
+            .expect("flag activity for review");
+
+        let mut patch = ActivityUpdate {
+            id: "activity-subtype".to_string(),
+            account_id: "acc-subtype".to_string(),
+            asset: None,
+            activity_type: "DIVIDEND".to_string(),
+            subtype: Some(String::new()),
+            activity_date: "2024-01-15".to_string(),
+            quantity: None,
+            unit_price: None,
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: None,
+            status: None,
+            needs_review: None,
+            notes: None,
+            fx_rate: None,
+            metadata: None,
+        };
+        let updated = repo
+            .update_activity(patch.clone())
+            .await
+            .expect("update activity");
+
+        assert_eq!(updated.subtype, None);
+        assert_eq!(updated.status, ActivityStatus::Draft);
+        assert!(updated.needs_review);
+
+        let bulk_updated = repo
+            .bulk_mutate_activities(Vec::new(), vec![patch.clone()], Vec::new())
+            .await
+            .expect("bulk update activity")
+            .updated
+            .into_iter()
+            .next()
+            .expect("bulk update result");
+        assert_eq!(bulk_updated.status, ActivityStatus::Draft);
+        assert!(bulk_updated.needs_review);
+
+        patch.status = Some(ActivityStatus::Posted);
+        patch.needs_review = Some(false);
+        let approved = repo.update_activity(patch).await.expect("approve activity");
+        assert_eq!(approved.status, ActivityStatus::Posted);
+        assert!(!approved.needs_review);
+    }
+
+    #[tokio::test]
+    async fn update_activity_preserves_omitted_asset_and_clears_explicit_patch() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-adjustment");
+        diesel::insert_into(assets::table)
+            .values((
+                assets::id.eq("asset-aapl"),
+                assets::kind.eq("INVESTMENT"),
+                assets::is_active.eq(1),
+                assets::quote_mode.eq("MARKET"),
+                assets::quote_ccy.eq("USD"),
+                assets::created_at.eq("2024-01-15T00:00:00+00:00"),
+                assets::updated_at.eq("2024-01-15T00:00:00+00:00"),
+            ))
+            .execute(&mut conn)
+            .expect("insert asset");
+        insert_activity_with_subtype(
+            &mut conn,
+            "security-adjustment",
+            "acc-adjustment",
+            "ADJUSTMENT",
+            Some("asset-aapl"),
+            Some("CASH_SWEEP"),
+        );
+        drop(conn);
+
+        let omitted_update = || ActivityUpdate {
+            id: "security-adjustment".to_string(),
+            account_id: "acc-adjustment".to_string(),
+            asset: None,
+            activity_type: "ADJUSTMENT".to_string(),
+            subtype: Some("CASH_SWEEP".to_string()),
+            activity_date: "2024-01-15".to_string(),
+            quantity: Some(None),
+            unit_price: Some(None),
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: Some(Some(Decimal::new(25, 0))),
+            status: None,
+            needs_review: Some(false),
+            notes: None,
+            fx_rate: None,
+            metadata: None,
+        };
+
+        let preserved = repo
+            .update_activity(omitted_update())
+            .await
+            .expect("preserve omitted adjustment asset");
+
+        assert_eq!(preserved.asset_id.as_deref(), Some("asset-aapl"));
+
+        let bulk_preserved = repo
+            .bulk_mutate_activities(Vec::new(), vec![omitted_update()], Vec::new())
+            .await
+            .expect("bulk preserve omitted adjustment asset")
+            .updated
+            .into_iter()
+            .next()
+            .expect("bulk update result");
+        assert_eq!(bulk_preserved.asset_id.as_deref(), Some("asset-aapl"));
+
+        let updated = repo
+            .update_activity(ActivityUpdate {
+                id: "security-adjustment".to_string(),
+                account_id: "acc-adjustment".to_string(),
+                asset: Some(wealthfolio_core::activities::AssetResolutionInput::default()),
+                activity_type: "ADJUSTMENT".to_string(),
+                subtype: Some("CASH_SWEEP".to_string()),
+                activity_date: "2024-01-15".to_string(),
+                quantity: Some(None),
+                unit_price: Some(None),
+                currency: "USD".to_string(),
+                fee: None,
+                tax: None,
+                amount: Some(Some(Decimal::new(25, 0))),
+                status: None,
+                needs_review: Some(false),
+                notes: None,
+                fx_rate: None,
+                metadata: None,
+            })
+            .await
+            .expect("clear explicit adjustment asset patch");
+
+        assert_eq!(updated.asset_id, None);
+        assert_eq!(updated.quantity, None);
+        assert_eq!(updated.unit_price, None);
+        assert_eq!(updated.amount, Some(Decimal::new(25, 0)));
+    }
+
+    #[tokio::test]
+    async fn final_cash_migration_updates_are_local_only() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_account(&mut conn, "acc-migration");
+            insert_activity_with_subtype(
+                &mut conn,
+                "activity-migration",
+                "acc-migration",
+                "DIVIDEND",
+                None,
+                None,
+            );
+        }
+
+        let updates = vec![ActivityFinalCashMigrationUpdate {
+            id: "activity-migration".to_string(),
+            amount: Some(Decimal::new(125, 0)),
+            needs_review: true,
+        }];
+        let result = repo
+            .update_activities_for_final_cash_migration(updates.clone())
+            .await
+            .expect("migration update");
+        assert_eq!(result.changed, 1);
+        assert!(result.unapplied_amount_update_ids.is_empty());
+
+        let mut conn = get_connection(&pool).expect("conn");
+        let (amount, unit_price, needs_review, metadata): (
+            Option<String>,
+            Option<String>,
+            i32,
+            Option<String>,
+        ) = activities::table
+            .find("activity-migration")
+            .select((
+                activities::amount,
+                activities::unit_price,
+                activities::needs_review,
+                activities::metadata,
+            ))
+            .first(&mut conn)
+            .expect("migrated activity");
+        assert_eq!(amount.as_deref(), Some("125"));
+        assert_eq!(unit_price.as_deref(), Some("100"));
+        assert_eq!(needs_review, 1);
+        let metadata: serde_json::Value =
+            serde_json::from_str(metadata.as_deref().expect("breadcrumb metadata"))
+                .expect("valid metadata json");
+        assert_eq!(
+            metadata["final_cash_migration"]["legacy_amount"],
+            serde_json::json!("100"),
+            "the replaced amount is preserved on the row"
+        );
+
+        drop(conn);
+
+        let result = repo
+            .update_activities_for_final_cash_migration(updates)
+            .await
+            .expect("idempotent migration update");
+        assert_eq!(result.changed, 0);
+        assert!(result.unapplied_amount_update_ids.is_empty());
+
+        // A review-only update (draft backfill) keeps the amount and writes
+        // no breadcrumb.
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_activity_with_subtype(
+            &mut conn,
+            "activity-review-only",
+            "acc-migration",
+            "SPLIT",
+            None,
+            None,
+        );
+        drop(conn);
+        let result = repo
+            .update_activities_for_final_cash_migration(vec![ActivityFinalCashMigrationUpdate {
+                id: "activity-review-only".to_string(),
+                amount: Some(Decimal::new(100, 0)),
+                needs_review: true,
+            }])
+            .await
+            .expect("review-only update");
+        assert_eq!(result.changed, 1);
+        assert!(result.unapplied_amount_update_ids.is_empty());
+        let mut conn = get_connection(&pool).expect("conn");
+        let (amount, metadata): (Option<String>, Option<String>) = activities::table
+            .find("activity-review-only")
+            .select((activities::amount, activities::metadata))
+            .first(&mut conn)
+            .expect("review-only activity");
+        assert_eq!(amount.as_deref(), Some("100"));
+        assert!(metadata.is_none(), "unchanged amount writes no breadcrumb");
+    }
+
+    #[tokio::test]
+    async fn final_cash_migration_reports_amounts_it_cannot_safely_replace() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_account(&mut conn, "acc-unrecordable");
+            insert_activity_with_subtype(
+                &mut conn,
+                "activity-unrecordable",
+                "acc-unrecordable",
+                "BUY",
+                None,
+                None,
+            );
+            diesel::update(activities::table.find("activity-unrecordable"))
+                .set(activities::metadata.eq(serde_json::json!("opaque").to_string()))
+                .execute(&mut conn)
+                .expect("set non-object metadata");
+        }
+
+        let result = repo
+            .update_activities_for_final_cash_migration(vec![ActivityFinalCashMigrationUpdate {
+                id: "activity-unrecordable".to_string(),
+                amount: Some(Decimal::new(125, 0)),
+                needs_review: false,
+            }])
+            .await
+            .expect("migration update");
+
+        assert_eq!(result.changed, 1);
+        assert_eq!(
+            result.unapplied_amount_update_ids,
+            vec!["activity-unrecordable"]
+        );
+
+        let mut conn = get_connection(&pool).expect("conn");
+        let (amount, needs_review, metadata): (Option<String>, i32, Option<String>) =
+            activities::table
+                .find("activity-unrecordable")
+                .select((
+                    activities::amount,
+                    activities::needs_review,
+                    activities::metadata,
+                ))
+                .first(&mut conn)
+                .expect("preserved activity");
+        assert_eq!(amount.as_deref(), Some("100"));
+        assert_eq!(needs_review, 1);
+        assert_eq!(metadata.as_deref(), Some("\"opaque\""));
+    }
+
+    #[tokio::test]
+    async fn single_and_bulk_amount_updates_clear_spending_splits() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_account(&mut conn, "acc-splits");
+            insert_activity_with_subtype(
+                &mut conn,
+                "activity-with-splits",
+                "acc-splits",
+                "WITHDRAWAL",
+                None,
+                None,
+            );
+            insert_spending_split(&mut conn, "split-before-edit", "activity-with-splits");
+        }
+
+        let mut amount_update = ActivityUpdate {
+            id: "activity-with-splits".to_string(),
+            account_id: "acc-splits".to_string(),
+            asset: None,
+            activity_type: "WITHDRAWAL".to_string(),
+            subtype: None,
+            activity_date: "2024-01-15T00:00:00+00:00".to_string(),
+            quantity: None,
+            unit_price: None,
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: Some(Some(Decimal::new(125, 0))),
+            status: None,
+            needs_review: None,
+            notes: None,
+            fx_rate: None,
+            metadata: None,
+        };
+        repo.update_activity(amount_update.clone())
+            .await
+            .expect("update activity");
+
+        let mut conn = get_connection(&pool).expect("conn");
+        assert_eq!(
+            spending_activity_splits::table
+                .count()
+                .get_result::<i64>(&mut conn)
+                .expect("count splits"),
+            0
+        );
+
+        insert_spending_split(&mut conn, "split-before-bulk-edit", "activity-with-splits");
+        drop(conn);
+        amount_update.amount = Some(Some(Decimal::new(150, 0)));
+        repo.bulk_mutate_activities(Vec::new(), vec![amount_update], Vec::new())
+            .await
+            .expect("bulk update activity");
+
+        let mut conn = get_connection(&pool).expect("conn");
+        assert_eq!(
+            spending_activity_splits::table
+                .count()
+                .get_result::<i64>(&mut conn)
+                .expect("count splits after bulk edit"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn income_report_treats_explicit_zero_as_final_for_asset_backed_income() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-income");
+        insert_activity_with_subtype(
+            &mut conn,
+            "valid-staking",
+            "acc-income",
+            "INTEREST",
+            None,
+            Some("STAKING_REWARD"),
+        );
+        insert_activity_with_subtype(
+            &mut conn,
+            "metadata-only",
+            "acc-income",
+            "DIVIDEND",
+            None,
+            Some("STAKING_REWARD"),
+        );
+        insert_activity_with_subtype(
+            &mut conn,
+            "draft-income",
+            "acc-income",
+            "DIVIDEND",
+            None,
+            None,
+        );
+        insert_activity_with_subtype(
+            &mut conn,
+            "effective-income",
+            "acc-income",
+            "FEE",
+            None,
+            None,
+        );
+        insert_activity_with_subtype(
+            &mut conn,
+            "overridden-income",
+            "acc-income",
+            "DIVIDEND",
+            None,
+            None,
+        );
+
+        diesel::sql_query(
+            "UPDATE activities SET amount = '0', quantity = '2', unit_price = '50' \
+             WHERE id IN ('valid-staking', 'metadata-only')",
+        )
+        .execute(&mut conn)
+        .expect("zero income amounts");
+        diesel::update(activities::table.find("draft-income"))
+            .set((
+                activities::status.eq("DRAFT"),
+                activities::amount.eq(Some("999".to_string())),
+            ))
+            .execute(&mut conn)
+            .expect("draft income");
+        diesel::update(activities::table.find("effective-income"))
+            .set((
+                activities::activity_type_override.eq(Some("DIVIDEND".to_string())),
+                activities::amount.eq(Some("7".to_string())),
+            ))
+            .execute(&mut conn)
+            .expect("set effective income");
+        diesel::update(activities::table.find("overridden-income"))
+            .set((
+                activities::activity_type_override.eq(Some("FEE".to_string())),
+                activities::amount.eq(Some("11".to_string())),
+            ))
+            .execute(&mut conn)
+            .expect("override income out of report scope");
+
+        let rows = repo
+            .get_income_activities_data(Some(&[String::from("acc-income")]))
+            .expect("income data");
+        let staking_amount = rows
+            .iter()
+            .find(|row| row.income_type == "INTEREST")
+            .map(|row| row.amount);
+        let mut dividend_amounts = rows
+            .iter()
+            .filter(|row| row.income_type == "DIVIDEND")
+            .map(|row| row.amount)
+            .collect::<Vec<_>>();
+        dividend_amounts.sort();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(staking_amount, Some(Decimal::ZERO));
+        assert_eq!(dividend_amounts, vec![Decimal::ZERO, Decimal::from(7)]);
+        assert_eq!(
+            rows.iter().map(|row| row.amount).sum::<Decimal>(),
+            Decimal::from(7)
+        );
+
+        insert_activity_with_subtype(
+            &mut conn,
+            "missing-income",
+            "acc-income",
+            "DIVIDEND",
+            None,
+            None,
+        );
+        diesel::update(activities::table.find("missing-income"))
+            .set(activities::amount.eq::<Option<String>>(None))
+            .execute(&mut conn)
+            .expect("missing final income amount");
+
+        // A legacy row without a final amount stays in the review queue; it
+        // is skipped here so one bad row cannot take down the whole report.
+        let rows = repo
+            .get_income_activities_data(Some(&[String::from("acc-income")]))
+            .expect("a missing final amount must not fail the income report");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|row| row.amount).sum::<Decimal>(),
+            Decimal::from(7)
+        );
+    }
+
+    /// Engine rules §5: SQL reads every override in core's shared cases as
+    /// core and the engine do, in the repository's queries and the triggers.
+    #[test]
+    fn sql_reads_type_overrides_as_core_does() {
+        use diesel::Connection;
+        // The SQL list is exactly what Rust's `str::trim` strips.
+        let listed: Vec<u32> = SQL_WHITESPACE
+            .trim_start_matches("char(")
+            .trim_end_matches(')')
+            .split(',')
+            .map(|code| code.trim().parse().unwrap())
+            .collect();
+        let rust: Vec<u32> = (0..=0x10FFFF)
+            .filter_map(char::from_u32)
+            .filter(|c| c.is_whitespace())
+            .map(u32::from)
+            .collect();
+        assert_eq!(listed, rust);
+        // The triggers trim that list too.
+        let triggers = include_str!("../../migrations/2026-09-28-000001_projection_state/up.sql");
+        assert_eq!(
+            triggers.matches("trim(").count(),
+            triggers.matches(&format!(", {SQL_WHITESPACE})")).count()
+        );
+
+        let cases: Vec<(String, String)> = serde_json::from_str(include_str!(
+            "../../../core/src/activities/type_override_cases.json"
+        ))
+        .unwrap();
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        diesel::sql_query(
+            "CREATE TABLE activities (activity_type TEXT, activity_type_override TEXT)",
+        )
+        .execute(&mut conn)
+        .unwrap();
+        #[derive(QueryableByName)]
+        struct Type {
+            #[diesel(sql_type = Text)]
+            effective: String,
+        }
+        for (override_, expected) in cases {
+            diesel::sql_query("DELETE FROM activities")
+                .execute(&mut conn)
+                .unwrap();
+            diesel::sql_query("INSERT INTO activities VALUES ('DIVIDEND', ?)")
+                .bind::<Text, _>(&override_)
+                .execute(&mut conn)
+                .unwrap();
+            let read = diesel::sql_query(format!(
+                "SELECT {} AS effective FROM activities",
+                effective_type_sql("activities")
+            ))
+            .get_result::<Type>(&mut conn)
+            .unwrap();
+            assert_eq!(read.effective, expected, "{override_:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn income_report_reads_a_blank_override_as_none() {
+        // Engine rules §5: a blank override is none wherever the type is read.
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_account(&mut conn, "acc-income");
+        insert_activity_with_subtype(&mut conn, "blank", "acc-income", "DIVIDEND", None, None);
+        diesel::update(activities::table.find("blank"))
+            .set((
+                activities::activity_type_override.eq(Some(" ".to_string())),
+                activities::amount.eq(Some("10".to_string())),
+            ))
+            .execute(&mut conn)
+            .expect("blank override");
+
+        let rows = repo
+            .get_income_activities_data(Some(&[String::from("acc-income")]))
+            .expect("income data");
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.income_type.as_str(), row.amount))
+                .collect::<Vec<_>>(),
+            vec![("DIVIDEND", Decimal::from(10))]
+        );
+    }
+
+    #[tokio::test]
+    async fn income_report_leaves_out_a_dividend_of_capital() {
+        // Engine rules R7.4: a return of capital is no income.
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_account(&mut conn, "acc-income");
+        insert_activity_with_subtype(&mut conn, "plain", "acc-income", "DIVIDEND", None, None);
+        insert_activity_with_subtype(
+            &mut conn,
+            "capital",
+            "acc-income",
+            "DIVIDEND",
+            None,
+            Some("return_of_capital"),
+        );
+        // Legacy labels are normalized by readers without rewriting stored rows.
+        for (id, label) in [
+            ("spaced", "Return of Capital"),
+            ("hyphenated", "return-of-capital"),
+        ] {
+            insert_activity_with_subtype(
+                &mut conn,
+                id,
+                "acc-income",
+                "DIVIDEND",
+                None,
+                Some(label),
+            );
+        }
+        insert_activity_with_subtype(
+            &mut conn,
+            "drip",
+            "acc-income",
+            "DIVIDEND",
+            None,
+            Some("DRIP"),
+        );
+
+        for (id, amount) in [("capital", "7"), ("drip", "3")] {
+            diesel::update(activities::table.find(id))
+                .set(activities::amount.eq(Some(amount.to_string())))
+                .execute(&mut conn)
+                .expect("amount");
+        }
+
+        let rows = repo
+            .get_income_activities_data(Some(&[String::from("acc-income")]))
+            .expect("income data");
+        let mut amounts: Vec<Decimal> = rows.iter().map(|row| row.amount).collect();
+        amounts.sort_unstable();
+        assert_eq!(amounts, vec![Decimal::from(3), Decimal::from(100)]);
+    }
+
+    #[tokio::test]
+    async fn edits_store_type_overrides_as_they_read() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_account(&mut conn, "acc-override");
+        // (row, override stored before the edit, override stored after it)
+        let rows = [
+            ("single-blank", "\u{a0}", None),
+            ("single-padded", "\u{2003}INTEREST ", Some("INTEREST")),
+            ("bulk-blank", "\u{a0}", None),
+            ("bulk-padded", " INTEREST\t", Some("INTEREST")),
+        ];
+        for (id, before, _) in rows {
+            insert_activity_with_subtype(&mut conn, id, "acc-override", "DIVIDEND", None, None);
+            diesel::update(activities::table.find(id))
+                .set(activities::activity_type_override.eq(Some(before.to_string())))
+                .execute(&mut conn)
+                .expect("stored override");
+            insert_spending_split(&mut conn, &format!("{id}-split"), id);
+        }
+        let notes_edit = |id: &str| ActivityUpdate {
+            id: id.to_string(),
+            account_id: "acc-override".to_string(),
+            asset: None,
+            activity_type: "DIVIDEND".to_string(),
+            subtype: None,
+            activity_date: "2024-01-15T00:00:00Z".to_string(),
+            quantity: None,
+            unit_price: None,
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: None,
+            status: None,
+            needs_review: None,
+            notes: Some("Edited".to_string()),
+            fx_rate: None,
+            metadata: None,
+        };
+
+        for id in ["single-blank", "single-padded"] {
+            repo.update_activity(notes_edit(id)).await.expect("update");
+        }
+        repo.bulk_mutate_activities(
+            Vec::new(),
+            vec![notes_edit("bulk-blank"), notes_edit("bulk-padded")],
+            Vec::new(),
+        )
+        .await
+        .expect("bulk update");
+
+        for (id, _, after) in rows {
+            let stored = activities::table
+                .find(id)
+                .select(activities::activity_type_override)
+                .first::<Option<String>>(&mut conn)
+                .expect("override");
+            assert_eq!(stored.as_deref(), after, "{id}");
+            // The type read did not change, so the edit keeps the splits.
+            let splits = spending_activity_splits::table
+                .filter(spending_activity_splits::activity_id.eq(id))
+                .count()
+                .get_result::<i64>(&mut conn)
+                .expect("count splits");
+            assert_eq!(splits, 1, "{id}");
+        }
+    }
+
+    /// Regression: re-linking the same (account_id, context_kind, source_system) must preserve the row `id`
+    /// so that sync outbox events keep a stable subject_id across updates. Generating a new UUID
+    /// on every upsert causes remote devices to receive a different subject_id and fail with a
+    /// UNIQUE(account_id, context_kind, source_system) constraint error on replay.
+
+    #[tokio::test]
+    async fn link_transfer_activities_marks_user_modified_and_allows_same_account_cash_fx() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-a");
+        insert_account(&mut conn, "acc-b");
+        insert_transfer_activity(
+            &mut conn,
+            "transfer-out",
+            "acc-a",
+            "TRANSFER_OUT",
+            None,
+            Some(r#"{"source":{"id":"manual"}}"#),
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "transfer-in",
+            "acc-b",
+            "TRANSFER_IN",
+            None,
+            Some(r#"{"flow":{"is_external":true}}"#),
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "same-account-in",
+            "acc-a",
+            "TRANSFER_IN",
+            None,
+            None,
+        );
+        insert_transfer_activity_with_currency(
+            &mut conn,
+            "same-account-fx-out",
+            "acc-a",
+            "TRANSFER_OUT",
+            None,
+            Some(r#"{"flow":{"is_external":true}}"#),
+            "USD",
+        );
+        insert_transfer_activity_with_currency(
+            &mut conn,
+            "same-account-fx-in",
+            "acc-a",
+            "TRANSFER_IN",
+            None,
+            Some(r#"{"flow":{"is_external":true}}"#),
+            "CAD",
+        );
+
+        let same_account = repo
+            .link_transfer_activities("same-account-in".to_string(), "transfer-out".to_string())
+            .await;
+        assert!(same_account.is_err());
+        let same_account_group: Option<String> = activities::table
+            .filter(activities::id.eq("same-account-in"))
+            .select(activities::source_group_id)
+            .first(&mut conn)
+            .expect("same-account-in group");
+        assert_eq!(same_account_group, None);
+
+        let (same_account_fx_in, same_account_fx_out) = repo
+            .link_transfer_activities(
+                "same-account-fx-in".to_string(),
+                "same-account-fx-out".to_string(),
+            )
+            .await
+            .expect("same-account cash FX link should succeed");
+        assert_eq!(same_account_fx_in.account_id, "acc-a");
+        assert_eq!(same_account_fx_out.account_id, "acc-a");
+        assert_eq!(
+            same_account_fx_in.source_group_id,
+            same_account_fx_out.source_group_id
+        );
+        assert_eq!(
+            same_account_fx_in.metadata.as_ref().and_then(|m| {
+                m.get("flow")
+                    .and_then(|flow| flow.get("is_external"))
+                    .and_then(|value| value.as_bool())
+            }),
+            Some(false)
+        );
+        assert_eq!(activity_user_modified(&mut conn, "same-account-fx-in"), 1);
+        assert_eq!(activity_user_modified(&mut conn, "same-account-fx-out"), 1);
+
+        let (transfer_in, transfer_out) = repo
+            .link_transfer_activities("transfer-in".to_string(), "transfer-out".to_string())
+            .await
+            .expect("link should succeed");
+
+        assert!(transfer_in.is_user_modified);
+        assert!(transfer_out.is_user_modified);
+        assert!(transfer_in.source_group_id.is_some());
+        assert_eq!(transfer_in.source_group_id, transfer_out.source_group_id);
+        assert_eq!(
+            transfer_in.metadata.as_ref().and_then(|m| {
+                m.get("flow")
+                    .and_then(|flow| flow.get("is_external"))
+                    .and_then(|value| value.as_bool())
+            }),
+            Some(false)
+        );
+        assert_eq!(
+            transfer_out
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("source"))
+                .and_then(|source| source.get("id"))
+                .and_then(|value| value.as_str()),
+            Some("manual"),
+            "link should preserve unrelated metadata"
+        );
+        assert_eq!(activity_user_modified(&mut conn, "transfer-in"), 1);
+        assert_eq!(activity_user_modified(&mut conn, "transfer-out"), 1);
+    }
+
+    #[tokio::test]
+    async fn link_transfer_activities_repairs_orphan_source_group() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-a");
+        insert_account(&mut conn, "acc-b");
+        insert_transfer_activity(
+            &mut conn,
+            "orphan-in",
+            "acc-a",
+            "TRANSFER_IN",
+            Some("orphan-group"),
+            Some(r#"{"flow":{"is_external":false}}"#),
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "transfer-out",
+            "acc-b",
+            "TRANSFER_OUT",
+            None,
+            None,
+        );
+
+        let (transfer_in, transfer_out) = repo
+            .link_transfer_activities("orphan-in".to_string(), "transfer-out".to_string())
+            .await
+            .expect("orphaned transfer should be repairable");
+
+        assert_eq!(transfer_in.id, "orphan-in");
+        assert_eq!(transfer_out.id, "transfer-out");
+        assert_ne!(transfer_in.source_group_id.as_deref(), Some("orphan-group"));
+        assert!(transfer_in.source_group_id.is_some());
+        assert_eq!(transfer_in.source_group_id, transfer_out.source_group_id);
+        assert_eq!(
+            transfer_in.metadata.as_ref().and_then(|m| {
+                m.get("flow")
+                    .and_then(|flow| flow.get("is_external"))
+                    .and_then(|value| value.as_bool())
+            }),
+            Some(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn link_transfer_activities_repairs_a_pair_already_linked_to_each_other() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-a");
+        insert_account(&mut conn, "acc-b");
+        insert_account(&mut conn, "acc-c");
+        insert_transfer_activity(
+            &mut conn,
+            "pair-out",
+            "acc-a",
+            "TRANSFER_OUT",
+            Some("pair-group"),
+            Some(r#"{"flow":{"is_external":false}}"#),
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "pair-in",
+            "acc-b",
+            "TRANSFER_IN",
+            Some("pair-group"),
+            Some(r#"{"flow":{"is_external":true}}"#),
+        );
+        insert_transfer_activity(&mut conn, "other-in", "acc-c", "TRANSFER_IN", None, None);
+
+        let (transfer_in, transfer_out) = repo
+            .link_transfer_activities("pair-out".to_string(), "pair-in".to_string())
+            .await
+            .expect("re-linking a linked pair should repair it");
+
+        assert_eq!(transfer_in.id, "pair-in");
+        assert_eq!(transfer_out.id, "pair-out");
+        assert_eq!(transfer_in.source_group_id.as_deref(), Some("pair-group"));
+        assert_eq!(transfer_out.source_group_id.as_deref(), Some("pair-group"));
+        assert_eq!(
+            transfer_in.metadata.as_ref().and_then(|m| {
+                m.get("flow")
+                    .and_then(|flow| flow.get("is_external"))
+                    .and_then(|value| value.as_bool())
+            }),
+            Some(false)
+        );
+        assert_eq!(activity_user_modified(&mut conn, "pair-in"), 1);
+        assert_eq!(activity_user_modified(&mut conn, "pair-out"), 1);
+
+        let error = repo
+            .link_transfer_activities("pair-out".to_string(), "other-in".to_string())
+            .await
+            .expect_err("a leg linked to another transfer cannot be linked again");
+        assert!(
+            error
+                .to_string()
+                .contains("already linked to another transfer"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_transfer_activities_does_not_merge_pairs_whose_groups_differ_by_whitespace() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-a");
+        insert_account(&mut conn, "acc-b");
+        let internal = Some(r#"{"flow":{"is_external":false}}"#);
+        insert_transfer_activity(
+            &mut conn,
+            "out-1",
+            "acc-a",
+            "TRANSFER_OUT",
+            Some("g"),
+            internal,
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "in-1",
+            "acc-b",
+            "TRANSFER_IN",
+            Some("g"),
+            internal,
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "out-2",
+            "acc-a",
+            "TRANSFER_OUT",
+            Some(" g "),
+            internal,
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "in-2",
+            "acc-b",
+            "TRANSFER_IN",
+            Some(" g "),
+            internal,
+        );
+
+        let error = repo
+            .link_transfer_activities("in-1".to_string(), "out-2".to_string())
+            .await
+            .expect_err("legs of two different pairs are not linked to each other");
+        assert!(
+            error
+                .to_string()
+                .contains("already linked to another transfer"),
+            "{error}"
+        );
+        for (id, group) in [
+            ("out-1", "g"),
+            ("in-1", "g"),
+            ("out-2", " g "),
+            ("in-2", " g "),
+        ] {
+            let stored: Option<String> = activities::table
+                .filter(activities::id.eq(id))
+                .select(activities::source_group_id)
+                .first(&mut conn)
+                .expect("stored source group");
+            assert_eq!(stored.as_deref(), Some(group), "{id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn update_external_transfer_clears_invalid_source_group() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-a");
+        insert_transfer_activity(
+            &mut conn,
+            "orphan-in",
+            "acc-a",
+            "TRANSFER_IN",
+            Some("orphan-group"),
+            Some(r#"{"flow":{"is_external":false}}"#),
+        );
+
+        let updated = repo
+            .update_activity(ActivityUpdate {
+                id: "orphan-in".to_string(),
+                account_id: "acc-a".to_string(),
+                asset: None,
+                activity_type: "TRANSFER_IN".to_string(),
+                subtype: None,
+                activity_date: "2024-01-15T00:00:00Z".to_string(),
+                quantity: Some(None),
+                unit_price: Some(None),
+                currency: "USD".to_string(),
+                fee: Some(None),
+                tax: None,
+                amount: Some(Some(Decimal::new(100, 0))),
+                status: Some(ActivityStatus::Posted),
+                needs_review: None,
+                notes: None,
+                fx_rate: None,
+                metadata: Some(r#"{"flow":{"is_external":true}}"#.to_string()),
+            })
+            .await
+            .expect("external transfer update should succeed");
+
+        assert_eq!(updated.source_group_id, None);
+        assert_eq!(
+            updated.metadata.as_ref().and_then(|m| {
+                m.get("flow")
+                    .and_then(|flow| flow.get("is_external"))
+                    .and_then(|value| value.as_bool())
+            }),
+            Some(true)
+        );
+        let stored_group: Option<String> = activities::table
+            .filter(activities::id.eq("orphan-in"))
+            .select(activities::source_group_id)
+            .first(&mut conn)
+            .expect("stored source group");
+        assert_eq!(stored_group, None);
+    }
+
+    #[tokio::test]
+    async fn link_transfer_activities_rejects_security_asset_or_quantity_mismatch() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-a");
+        insert_account(&mut conn, "acc-b");
+
+        let insert_asset = |conn: &mut SqliteConnection, id: &str| {
+            diesel::insert_into(assets::table)
+                .values((
+                    assets::id.eq(id.to_string()),
+                    assets::kind.eq("INVESTMENT".to_string()),
+                    assets::is_active.eq(1),
+                    assets::quote_mode.eq("MANUAL".to_string()),
+                    assets::quote_ccy.eq("USD".to_string()),
+                    assets::created_at.eq("2024-01-15T00:00:00+00:00".to_string()),
+                    assets::updated_at.eq("2024-01-15T00:00:00+00:00".to_string()),
+                ))
+                .execute(conn)
+                .expect("insert asset");
+        };
+        insert_asset(&mut conn, "SEC:AAPL:XNAS");
+        insert_asset(&mut conn, "SEC:MSFT:XNAS");
+
+        let set_security_fields =
+            |conn: &mut SqliteConnection, id: &str, asset_id: &str, quantity: &str| {
+                diesel::update(activities::table.find(id))
+                    .set((
+                        activities::asset_id.eq(Some(asset_id.to_string())),
+                        activities::quantity.eq(Some(quantity.to_string())),
+                        activities::unit_price.eq(Some("100".to_string())),
+                        activities::amount.eq(None::<String>),
+                    ))
+                    .execute(conn)
+                    .expect("set security transfer fields");
+            };
+
+        insert_transfer_activity(&mut conn, "asset-out", "acc-a", "TRANSFER_OUT", None, None);
+        insert_transfer_activity(&mut conn, "asset-in", "acc-b", "TRANSFER_IN", None, None);
+        set_security_fields(&mut conn, "asset-out", "SEC:AAPL:XNAS", "10");
+        set_security_fields(&mut conn, "asset-in", "SEC:MSFT:XNAS", "10");
+
+        let asset_mismatch = repo
+            .link_transfer_activities("asset-in".to_string(), "asset-out".to_string())
+            .await;
+        assert!(asset_mismatch.is_err());
+
+        insert_transfer_activity(
+            &mut conn,
+            "quantity-out",
+            "acc-a",
+            "TRANSFER_OUT",
+            None,
+            None,
+        );
+        insert_transfer_activity(&mut conn, "quantity-in", "acc-b", "TRANSFER_IN", None, None);
+        set_security_fields(&mut conn, "quantity-out", "SEC:AAPL:XNAS", "10");
+        set_security_fields(&mut conn, "quantity-in", "SEC:AAPL:XNAS", "9");
+
+        let quantity_mismatch = repo
+            .link_transfer_activities("quantity-in".to_string(), "quantity-out".to_string())
+            .await;
+        assert!(quantity_mismatch.is_err());
+
+        let groups: Vec<Option<String>> = activities::table
+            .filter(activities::id.eq_any(["asset-out", "asset-in", "quantity-out", "quantity-in"]))
+            .select(activities::source_group_id)
+            .load(&mut conn)
+            .expect("load source groups");
+        assert!(groups.iter().all(Option::is_none));
+    }
+
+    #[tokio::test]
+    async fn link_and_unlink_transfer_activities_use_effective_activity_type() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-a");
+        insert_account(&mut conn, "acc-b");
+        insert_transfer_activity(&mut conn, "override-out", "acc-a", "FEE", None, None);
+        diesel::update(activities::table.find("override-out"))
+            .set(activities::activity_type_override.eq(Some("TRANSFER_OUT".to_string())))
+            .execute(&mut conn)
+            .expect("set transfer override");
+        insert_transfer_activity(&mut conn, "override-in", "acc-b", "TRANSFER_IN", None, None);
+
+        let (transfer_in, transfer_out) = repo
+            .link_transfer_activities("override-out".to_string(), "override-in".to_string())
+            .await
+            .expect("link effective transfer pair");
+
+        assert_eq!(transfer_in.id, "override-in");
+        assert_eq!(transfer_out.id, "override-out");
+        assert_eq!(
+            transfer_out.activity_type_override.as_deref(),
+            Some("TRANSFER_OUT")
+        );
+        assert!(transfer_in.source_group_id.is_some());
+        assert_eq!(transfer_in.source_group_id, transfer_out.source_group_id);
+
+        let (unlinked_in, unlinked_out) = repo
+            .unlink_transfer_activities("override-out".to_string(), "override-in".to_string())
+            .await
+            .expect("unlink effective transfer pair");
+
+        assert_eq!(unlinked_in.id, "override-in");
+        assert_eq!(unlinked_out.id, "override-out");
+        assert!(unlinked_in.source_group_id.is_none());
+        assert!(unlinked_out.source_group_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn mixed_broker_manual_transfer_link_is_local_only() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_broker_account_and_import_run(&mut conn);
+        insert_account(&mut conn, "manual-transfer-account");
+        insert_broker_activity(
+            &mut conn,
+            BrokerActivitySeed {
+                id: "broker-transfer-in",
+                activity_type: "TRANSFER_IN",
+                activity_type_override: None,
+                source_system: "SNAPTRADE",
+                source_record_id: "broker-transfer-record-in",
+                amount: "100",
+                notes: "Broker transfer in",
+                subtype: None,
+            },
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "manual-transfer-out",
+            "manual-transfer-account",
+            "TRANSFER_OUT",
+            None,
+            None,
+        );
+
+        let (transfer_in, transfer_out) = repo
+            .link_transfer_activities(
+                "broker-transfer-in".to_string(),
+                "manual-transfer-out".to_string(),
+            )
+            .await
+            .expect("link mixed broker/manual transfer");
+
+        assert_eq!(transfer_in.id, "broker-transfer-in");
+        assert_eq!(transfer_out.id, "manual-transfer-out");
+        assert!(transfer_in.source_group_id.is_some());
+        assert_eq!(transfer_in.source_group_id, transfer_out.source_group_id);
+        assert_eq!(activity_user_modified(&mut conn, "broker-transfer-in"), 1);
+        assert_eq!(activity_user_modified(&mut conn, "manual-transfer-out"), 1);
+    }
+
+    #[tokio::test]
+    async fn transfer_scope_query_fetches_touching_rows_and_counterparts() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-a");
+        insert_account(&mut conn, "acc-b");
+        insert_account(&mut conn, "acc-c");
+        insert_transfer_activity(
+            &mut conn,
+            "out-a",
+            "acc-a",
+            "TRANSFER_OUT",
+            Some("g1"),
+            None,
+        );
+        insert_transfer_activity(&mut conn, "in-b", "acc-b", "TRANSFER_IN", Some("g1"), None);
+        insert_transfer_activity(&mut conn, "ungrouped-a", "acc-a", "TRANSFER_IN", None, None);
+        insert_transfer_activity(
+            &mut conn,
+            "out-c",
+            "acc-c",
+            "TRANSFER_OUT",
+            Some("g2"),
+            None,
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "in-b-g2",
+            "acc-b",
+            "TRANSFER_IN",
+            Some("g2"),
+            None,
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "override-out-a",
+            "acc-a",
+            "FEE",
+            Some("g3"),
+            None,
+        );
+        diesel::update(activities::table.filter(activities::id.eq("override-out-a")))
+            .set(activities::activity_type_override.eq(Some("TRANSFER_OUT".to_string())))
+            .execute(&mut conn)
+            .expect("set transfer override");
+        insert_transfer_activity(
+            &mut conn,
+            "override-in-b",
+            "acc-b",
+            "TRANSFER_IN",
+            Some("g3"),
+            None,
+        );
+
+        let start = DateTime::parse_from_rfc3339("2024-01-14T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2024-01-16T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let rows = repo
+            .get_transfer_activities_touching_account_ids_in_date_range(
+                &["acc-a".to_string()],
+                Some(start),
+                Some(end),
+            )
+            .expect("transfer rows");
+        let ids: HashSet<_> = rows.into_iter().map(|activity| activity.id).collect();
+
+        assert!(ids.contains("out-a"));
+        assert!(ids.contains("in-b"));
+        assert!(ids.contains("ungrouped-a"));
+        assert!(ids.contains("override-out-a"));
+        assert!(ids.contains("override-in-b"));
+        assert!(!ids.contains("out-c"));
+        assert!(!ids.contains("in-b-g2"));
+    }
+
+    #[tokio::test]
+    async fn unlink_transfer_activities_clears_pair_and_marks_external() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-in");
+        insert_account(&mut conn, "acc-out");
+        insert_transfer_activity(
+            &mut conn,
+            "transfer-in",
+            "acc-in",
+            "TRANSFER_IN",
+            Some("transfer-group"),
+            Some(r#"{"flow":{"is_external":false},"source":{"id":"snaptrade"}}"#),
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "transfer-out",
+            "acc-out",
+            "TRANSFER_OUT",
+            Some("transfer-group"),
+            Some(r#"{"flow":{"is_external":false}}"#),
+        );
+
+        let (transfer_in, transfer_out) = repo
+            .unlink_transfer_activities("transfer-in".to_string(), "transfer-out".to_string())
+            .await
+            .expect("unlink should succeed");
+
+        assert_eq!(transfer_in.id, "transfer-in");
+        assert_eq!(transfer_out.id, "transfer-out");
+        assert_eq!(transfer_in.source_group_id, None);
+        assert_eq!(transfer_out.source_group_id, None);
+        assert!(transfer_in.is_user_modified);
+        assert!(transfer_out.is_user_modified);
+        assert_eq!(
+            transfer_in.metadata.as_ref().and_then(|m| {
+                m.get("flow")
+                    .and_then(|flow| flow.get("is_external"))
+                    .and_then(|value| value.as_bool())
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            transfer_out.metadata.as_ref().and_then(|m| {
+                m.get("flow")
+                    .and_then(|flow| flow.get("is_external"))
+                    .and_then(|value| value.as_bool())
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            transfer_in
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("source"))
+                .and_then(|source| source.get("id"))
+                .and_then(|value| value.as_str()),
+            Some("snaptrade"),
+            "unlink should preserve unrelated metadata"
+        );
+
+        let source_group_ids: Vec<Option<String>> = activities::table
+            .filter(activities::id.eq_any(["transfer-in", "transfer-out"]))
+            .select(activities::source_group_id)
+            .load(&mut conn)
+            .expect("source group ids");
+        assert_eq!(source_group_ids, vec![None, None]);
+
+        assert_eq!(
+            activity_metadata(&mut conn, "transfer-in")["flow"]["is_external"],
+            true
+        );
+        assert_eq!(
+            activity_metadata(&mut conn, "transfer-out")["flow"]["is_external"],
+            true
+        );
+        assert_eq!(activity_user_modified(&mut conn, "transfer-in"), 1);
+        assert_eq!(activity_user_modified(&mut conn, "transfer-out"), 1);
+    }
+
+    #[tokio::test]
+    async fn mixed_broker_manual_transfer_unlink_is_local_only() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_broker_account_and_import_run(&mut conn);
+        insert_account(&mut conn, "manual-transfer-account");
+        insert_broker_activity(
+            &mut conn,
+            BrokerActivitySeed {
+                id: "broker-transfer-in",
+                activity_type: "TRANSFER_IN",
+                activity_type_override: None,
+                source_system: "SNAPTRADE",
+                source_record_id: "broker-transfer-record-in",
+                amount: "100",
+                notes: "Broker transfer in",
+                subtype: None,
+            },
+        );
+        diesel::update(activities::table.find("broker-transfer-in"))
+            .set(activities::source_group_id.eq(Some("mixed-transfer-group".to_string())))
+            .execute(&mut conn)
+            .expect("set broker transfer group");
+        insert_transfer_activity(
+            &mut conn,
+            "manual-transfer-out",
+            "manual-transfer-account",
+            "TRANSFER_OUT",
+            Some("mixed-transfer-group"),
+            Some(r#"{"flow":{"is_external":false}}"#),
+        );
+
+        let (transfer_in, transfer_out) = repo
+            .unlink_transfer_activities(
+                "broker-transfer-in".to_string(),
+                "manual-transfer-out".to_string(),
+            )
+            .await
+            .expect("unlink mixed broker/manual transfer");
+
+        assert_eq!(transfer_in.id, "broker-transfer-in");
+        assert_eq!(transfer_out.id, "manual-transfer-out");
+        assert_eq!(transfer_in.source_group_id, None);
+        assert_eq!(transfer_out.source_group_id, None);
+        assert_eq!(activity_user_modified(&mut conn, "broker-transfer-in"), 1);
+        assert_eq!(activity_user_modified(&mut conn, "manual-transfer-out"), 1);
+    }
+
+    #[tokio::test]
+    async fn unlink_transfer_activities_rejects_unlinked_or_mismatched_pairs() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-in");
+        insert_account(&mut conn, "acc-out");
+        insert_transfer_activity(
+            &mut conn,
+            "linked-in",
+            "acc-in",
+            "TRANSFER_IN",
+            Some("group-a"),
+            Some(r#"{"flow":{"is_external":false}}"#),
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "linked-out",
+            "acc-out",
+            "TRANSFER_OUT",
+            Some("group-b"),
+            Some(r#"{"flow":{"is_external":false}}"#),
+        );
+        insert_transfer_activity(
+            &mut conn,
+            "unlinked-out",
+            "acc-out",
+            "TRANSFER_OUT",
+            None,
+            Some(r#"{"flow":{"is_external":true}}"#),
+        );
+        insert_transfer_activity(&mut conn, "buy-row", "acc-in", "BUY", Some("group-a"), None);
+
+        let mismatched = repo
+            .unlink_transfer_activities("linked-in".to_string(), "linked-out".to_string())
+            .await;
+        assert!(mismatched.is_err());
+
+        let unlinked = repo
+            .unlink_transfer_activities("linked-in".to_string(), "unlinked-out".to_string())
+            .await;
+        assert!(unlinked.is_err());
+
+        let non_transfer = repo
+            .unlink_transfer_activities("linked-in".to_string(), "buy-row".to_string())
+            .await;
+        assert!(non_transfer.is_err());
+
+        let linked_in_group: Option<String> = activities::table
+            .filter(activities::id.eq("linked-in"))
+            .select(activities::source_group_id)
+            .first(&mut conn)
+            .expect("linked-in group");
+        let linked_out_group: Option<String> = activities::table
+            .filter(activities::id.eq("linked-out"))
+            .select(activities::source_group_id)
+            .first(&mut conn)
+            .expect("linked-out group");
+        let unlinked_out_group: Option<String> = activities::table
+            .filter(activities::id.eq("unlinked-out"))
+            .select(activities::source_group_id)
+            .first(&mut conn)
+            .expect("unlinked-out group");
+
+        assert_eq!(linked_in_group.as_deref(), Some("group-a"));
+        assert_eq!(linked_out_group.as_deref(), Some("group-b"));
+        assert_eq!(unlinked_out_group, None);
+        assert_eq!(
+            activity_metadata(&mut conn, "linked-in")["flow"]["is_external"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_prefers_source_identity_over_idempotency_fallback() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-sync");
+
+        let first = ActivityUpsert {
+            id: "provider-id-1".to_string(),
+            account_id: "acc-sync".to_string(),
+            asset_id: None,
+            activity_type: "BUY".to_string(),
+            subtype: None,
+            activity_date: "2024-01-15".to_string(),
+            quantity: Some(Decimal::ONE),
+            unit_price: Some(Decimal::from(100)),
+            currency: "USD".to_string(),
+            fee: Some(Decimal::ZERO),
+            tax: None,
+            amount: Some(Decimal::from(100)),
+            status: None,
+            notes: Some("first import".to_string()),
+            fx_rate: None,
+            metadata: None,
+            needs_review: None,
+            source_system: Some("SNAPTRADE".to_string()),
+            source_record_id: Some("txn-1".to_string()),
+            source_group_id: None,
+            idempotency_key: Some("idemp-1".to_string()),
+        };
+
+        let second = ActivityUpsert {
+            id: "provider-id-2".to_string(),
+            account_id: "acc-sync".to_string(),
+            asset_id: None,
+            activity_type: "BUY".to_string(),
+            subtype: None,
+            activity_date: "2024-01-15".to_string(),
+            quantity: Some(Decimal::ONE),
+            unit_price: Some(Decimal::from(101)),
+            currency: "USD".to_string(),
+            fee: Some(Decimal::ZERO),
+            tax: None,
+            amount: Some(Decimal::from(101)),
+            status: None,
+            notes: Some("updated import".to_string()),
+            fx_rate: None,
+            metadata: None,
+            needs_review: None,
+            source_system: Some("SNAPTRADE".to_string()),
+            source_record_id: Some("txn-1".to_string()),
+            source_group_id: None,
+            idempotency_key: Some("idemp-2".to_string()),
+        };
+
+        let first_result = repo
+            .bulk_upsert(vec![first])
+            .await
+            .expect("first upsert succeeds");
+        assert_eq!(first_result.created, 1);
+        assert_eq!(first_result.updated, 0);
+
+        let second_result = repo
+            .bulk_upsert(vec![second])
+            .await
+            .expect("second upsert succeeds");
+        assert_eq!(second_result.created, 0);
+        assert_eq!(second_result.updated, 1);
+
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = activities::table
+            .filter(activities::account_id.eq("acc-sync"))
+            .select((
+                activities::id,
+                activities::amount,
+                activities::source_system,
+                activities::source_record_id,
+                activities::idempotency_key,
+            ))
+            .load(&mut conn)
+            .expect("load synced activities");
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "source identity should collapse provider-id churn"
+        );
+        assert_eq!(
+            rows[0].0, "provider-id-1",
+            "existing row id should be preserved"
+        );
+        assert_eq!(
+            rows[0].1,
+            Some("101".to_string()),
+            "latest economics should win"
+        );
+        assert_eq!(rows[0].2.as_deref(), Some("SNAPTRADE"));
+        assert_eq!(rows[0].3.as_deref(), Some("txn-1"));
+        assert_eq!(rows[0].4.as_deref(), Some("idemp-2"));
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_preserves_existing_draft_review_state() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-sync-draft");
+        diesel::sql_query(
+            "INSERT INTO activities
+             (id, account_id, activity_type, status, activity_date, amount, currency,
+              source_system, source_record_id, idempotency_key, is_user_modified, needs_review,
+              created_at, updated_at)
+             VALUES ('provider-draft', 'acc-sync-draft', 'DIVIDEND', 'DRAFT',
+                     '2024-01-15T00:00:00Z', '100', 'USD', 'SNAPTRADE', 'txn-draft',
+                     'idemp-draft', 0, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut conn)
+        .expect("insert draft activity");
+        drop(conn);
+
+        let result = repo
+            .bulk_upsert(vec![ActivityUpsert {
+                id: "changed-provider-id".to_string(),
+                account_id: "acc-sync-draft".to_string(),
+                asset_id: None,
+                activity_type: "DIVIDEND".to_string(),
+                subtype: None,
+                activity_date: "2024-01-15".to_string(),
+                quantity: None,
+                unit_price: None,
+                currency: "USD".to_string(),
+                fee: None,
+                tax: None,
+                amount: Some(Decimal::from(105)),
+                status: Some(ActivityStatus::Posted),
+                notes: Some("provider refresh".to_string()),
+                fx_rate: None,
+                metadata: None,
+                needs_review: Some(false),
+                source_system: Some("SNAPTRADE".to_string()),
+                source_record_id: Some("txn-draft".to_string()),
+                source_group_id: None,
+                idempotency_key: Some("idemp-draft-new".to_string()),
+            }])
+            .await
+            .expect("refresh draft activity");
+
+        assert_eq!(result.updated, 1);
+        let mut conn = get_connection(&pool).expect("conn");
+        let (status, needs_review, amount): (String, i32, Option<String>) = activities::table
+            .find("provider-draft")
+            .select((
+                activities::status,
+                activities::needs_review,
+                activities::amount,
+            ))
+            .first(&mut conn)
+            .expect("load refreshed draft activity");
+        assert_eq!(status, "DRAFT");
+        assert_eq!(needs_review, 1);
+        assert_eq!(amount.as_deref(), Some("105"));
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_preserves_existing_posted_review_flag() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-sync-review");
+        diesel::sql_query(
+            "INSERT INTO activities
+             (id, account_id, activity_type, status, activity_date, amount, currency,
+              source_system, source_record_id, idempotency_key, is_user_modified, needs_review,
+              created_at, updated_at)
+             VALUES ('provider-review', 'acc-sync-review', 'DIVIDEND', 'POSTED',
+                     '2024-01-15T00:00:00Z', '100', 'USD', 'SNAPTRADE', 'txn-review',
+                     'idemp-review', 0, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .execute(&mut conn)
+        .expect("insert review activity");
+        drop(conn);
+
+        repo.bulk_upsert(vec![ActivityUpsert {
+            id: "changed-provider-id".to_string(),
+            account_id: "acc-sync-review".to_string(),
+            asset_id: None,
+            activity_type: "DIVIDEND".to_string(),
+            subtype: None,
+            activity_date: "2024-01-15".to_string(),
+            quantity: None,
+            unit_price: None,
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: Some(Decimal::from(105)),
+            status: Some(ActivityStatus::Posted),
+            notes: Some("provider refresh".to_string()),
+            fx_rate: None,
+            metadata: None,
+            needs_review: Some(false),
+            source_system: Some("SNAPTRADE".to_string()),
+            source_record_id: Some("txn-review".to_string()),
+            source_group_id: None,
+            idempotency_key: Some("idemp-review-new".to_string()),
+        }])
+        .await
+        .expect("refresh review activity");
+
+        let mut conn = get_connection(&pool).expect("conn");
+        let (status, needs_review): (String, i32) = activities::table
+            .find("provider-review")
+            .select((activities::status, activities::needs_review))
+            .first(&mut conn)
+            .expect("load refreshed review activity");
+        assert_eq!(status, "POSTED");
+        assert_eq!(needs_review, 1);
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_reports_overwritten_split_asset_ids() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_account(&mut conn, "acc-sync");
+            diesel::sql_query(
+                "INSERT INTO assets
+                 (id, kind, name, display_code, is_active, quote_mode, quote_ccy,
+                  instrument_type, instrument_symbol, created_at, updated_at)
+                 VALUES ('asset-vgt', 'INVESTMENT', 'VGT', 'VGT', 1, 'MARKET', 'USD',
+                         'EQUITY', 'VGT', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            )
+            .execute(&mut conn)
+            .expect("insert asset");
+        }
+
+        let split = ActivityUpsert {
+            id: "provider-id-1".to_string(),
+            account_id: "acc-sync".to_string(),
+            asset_id: Some("asset-vgt".to_string()),
+            activity_type: "SPLIT".to_string(),
+            subtype: None,
+            activity_date: "2024-01-15".to_string(),
+            quantity: None,
+            unit_price: None,
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: Some(Decimal::from(4)),
+            status: None,
+            notes: None,
+            fx_rate: None,
+            metadata: None,
+            needs_review: None,
+            source_system: Some("SNAPTRADE".to_string()),
+            source_record_id: Some("txn-split".to_string()),
+            source_group_id: None,
+            idempotency_key: Some("idemp-1".to_string()),
+        };
+        let mut reclassified_to_buy = split.clone();
+        reclassified_to_buy.id = "provider-id-2".to_string();
+        reclassified_to_buy.activity_type = "BUY".to_string();
+        reclassified_to_buy.quantity = Some(Decimal::ONE);
+        reclassified_to_buy.unit_price = Some(Decimal::from(100));
+        reclassified_to_buy.amount = Some(Decimal::from(100));
+        reclassified_to_buy.idempotency_key = Some("idemp-2".to_string());
+
+        let first_result = repo
+            .bulk_upsert(vec![split])
+            .await
+            .expect("split upsert succeeds");
+        assert_eq!(first_result.created, 1);
+        assert!(first_result.updated_split_asset_ids.is_empty());
+
+        let second_result = repo
+            .bulk_upsert(vec![reclassified_to_buy])
+            .await
+            .expect("reclassifying upsert succeeds");
+        assert_eq!(second_result.updated, 1);
+        assert_eq!(
+            second_result.updated_split_asset_ids,
+            vec!["asset-vgt".to_string()],
+            "overwriting an existing SPLIT row must surface its asset id"
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_upsert_collapses_duplicate_source_identity_within_same_batch() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+
+        insert_account(&mut conn, "acc-sync");
+
+        let first = ActivityUpsert {
+            id: "provider-id-1".to_string(),
+            account_id: "acc-sync".to_string(),
+            asset_id: None,
+            activity_type: "BUY".to_string(),
+            subtype: None,
+            activity_date: "2024-01-15".to_string(),
+            quantity: Some(Decimal::ONE),
+            unit_price: Some(Decimal::from(100)),
+            currency: "USD".to_string(),
+            fee: Some(Decimal::ZERO),
+            tax: None,
+            amount: Some(Decimal::from(100)),
+            status: None,
+            notes: Some("first import".to_string()),
+            fx_rate: None,
+            metadata: None,
+            needs_review: None,
+            source_system: Some("SNAPTRADE".to_string()),
+            source_record_id: Some("txn-1".to_string()),
+            source_group_id: None,
+            idempotency_key: Some("idemp-1".to_string()),
+        };
+
+        let second = ActivityUpsert {
+            id: "provider-id-2".to_string(),
+            account_id: "acc-sync".to_string(),
+            asset_id: None,
+            activity_type: "BUY".to_string(),
+            subtype: None,
+            activity_date: "2024-01-15".to_string(),
+            quantity: Some(Decimal::ONE),
+            unit_price: Some(Decimal::from(101)),
+            currency: "USD".to_string(),
+            fee: Some(Decimal::ZERO),
+            tax: None,
+            amount: Some(Decimal::from(101)),
+            status: None,
+            notes: Some("updated import".to_string()),
+            fx_rate: None,
+            metadata: None,
+            needs_review: None,
+            source_system: Some("SNAPTRADE".to_string()),
+            source_record_id: Some("txn-1".to_string()),
+            source_group_id: None,
+            idempotency_key: Some("idemp-2".to_string()),
+        };
+
+        let result = repo
+            .bulk_upsert(vec![first, second])
+            .await
+            .expect("batched upsert succeeds");
+
+        assert_eq!(result.created, 1);
+        assert_eq!(result.updated, 1);
+
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = activities::table
+            .filter(activities::account_id.eq("acc-sync"))
+            .select((
+                activities::id,
+                activities::amount,
+                activities::source_system,
+                activities::source_record_id,
+                activities::idempotency_key,
+            ))
+            .load(&mut conn)
+            .expect("load synced activities");
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "batch should collapse to a single provider row"
+        );
+        assert_eq!(
+            rows[0].0, "provider-id-1",
+            "first inserted row id should remain authoritative"
+        );
+        assert_eq!(rows[0].1, Some("101".to_string()));
+        assert_eq!(rows[0].2.as_deref(), Some("SNAPTRADE"));
+        assert_eq!(rows[0].3.as_deref(), Some("txn-1"));
+        assert_eq!(rows[0].4.as_deref(), Some("idemp-2"));
+    }
+    fn qa_floor_new_activity(activity_type: &str) -> NewActivity {
+        NewActivity {
+            id: None,
+            account_id: "acc-floor".to_string(),
+            asset: None,
+            activity_type: activity_type.to_string(),
+            subtype: None,
+            activity_date: "2024-03-01T00:00:00Z".to_string(),
+            quantity: Some(Decimal::new(10, 0)),
+            unit_price: Some(Decimal::new(50, 0)),
+            currency: "USD".to_string(),
+            fee: None,
+            tax: None,
+            amount: None,
+            status: None,
+            notes: None,
+            fx_rate: None,
+            metadata: None,
+            needs_review: None,
+            source_system: None,
+            source_record_id: None,
+            source_group_id: None,
+            idempotency_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_refuses_cost_adjustments_without_an_asset() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        insert_account(&mut get_connection(&pool).expect("conn"), "acc-floor");
+        for subtype in [
+            "RETURN_OF_CAPITAL",
+            "Return of Capital",
+            "notional-distribution",
+        ] {
+            let mut activity = qa_floor_new_activity("ADJUSTMENT");
+            activity.subtype = Some(subtype.to_string());
+            activity.amount = Some(Decimal::new(20, 0));
+            let error = repo
+                .create_activities(vec![activity.clone()])
+                .await
+                .expect_err("batch create requires an asset");
+            assert!(error.to_string().contains("asset_id or symbol"));
+            let error = repo
+                .create_activity(activity)
+                .await
+                .expect_err("single create requires an asset");
+            assert!(error.to_string().contains("asset_id or symbol"));
+        }
+        use crate::schema::activities::dsl::activities;
+        let count: i64 = activities
+            .count()
+            .get_result(&mut get_connection(&pool).expect("conn"))
+            .expect("count activities");
+        assert_eq!(count, 0);
+    }
+
+    /// The repository floor: a POSTED cash-bearing row with no amount and no
+    /// review flag must be refused at every write door - it would book zero
+    /// cash silently (the CSV-import bypass class, PR #1571).
+    #[tokio::test]
+    async fn create_refuses_posted_cash_row_without_amount_or_flag() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_account(&mut conn, "acc-floor");
+        }
+
+        let bare_trade = qa_floor_new_activity("BUY");
+        let error = repo
+            .create_activities(vec![bare_trade.clone()])
+            .await
+            .expect_err("silent-zero trade must be refused");
+        assert!(error.to_string().contains("flagged for review"));
+
+        let error = repo
+            .create_activity(bare_trade)
+            .await
+            .expect_err("single-create door enforces the same floor");
+        assert!(error.to_string().contains("flagged for review"));
+
+        let error = repo
+            .bulk_mutate_activities(
+                vec![qa_floor_new_activity("DEPOSIT")],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect_err("bulk-mutate create door enforces the same floor");
+        assert!(error.to_string().contains("flagged for review"));
+    }
+
+    #[tokio::test]
+    async fn create_allows_flagged_missing_amount_and_security_transfers() {
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        {
+            let mut conn = get_connection(&pool).expect("conn");
+            insert_account(&mut conn, "acc-floor");
+            diesel::insert_into(assets::table)
+                .values((
+                    assets::id.eq("asset-floor".to_string()),
+                    assets::kind.eq("INVESTMENT".to_string()),
+                    assets::is_active.eq(1),
+                    assets::quote_mode.eq("MANUAL".to_string()),
+                    assets::quote_ccy.eq("USD".to_string()),
+                    assets::created_at.eq("2024-01-15T00:00:00+00:00".to_string()),
+                    assets::updated_at.eq("2024-01-15T00:00:00+00:00".to_string()),
+                ))
+                .execute(&mut conn)
+                .expect("insert asset");
+        }
+
+        // Flagged missing amount: legal (the review queue owns it).
+        let mut flagged = qa_floor_new_activity("SELL");
+        flagged.needs_review = Some(true);
+        assert_eq!(
+            repo.create_activities(vec![flagged])
+                .await
+                .expect("flagged row is legal"),
+            1
+        );
+
+        // Security transfer: lot-only, exempt from the amount requirement.
+        let mut transfer = qa_floor_new_activity("TRANSFER_IN");
+        transfer.asset = Some(wealthfolio_core::activities::AssetResolutionInput {
+            id: Some("asset-floor".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            repo.create_activities(vec![transfer])
+                .await
+                .expect("security transfer with no amount is legal"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_source_group_deletion_preserves_siblings() {
+        for source_system in ["SNAPTRADE", "CSV"] {
+            for bulk in [false, true] {
+                let (pool, writer) = setup_db();
+                let repo = ActivityRepository::new(pool.clone(), writer);
+                {
+                    let mut conn = get_connection(&pool).expect("conn");
+                    insert_broker_account_and_import_run(&mut conn);
+                    for (id, activity_type, amount) in [
+                        ("historical-deposit", "DEPOSIT", "100"),
+                        ("historical-fee", "FEE", "2"),
+                        ("historical-tax", "TAX", "3"),
+                    ] {
+                        insert_broker_activity(
+                            &mut conn,
+                            BrokerActivitySeed {
+                                id,
+                                activity_type,
+                                activity_type_override: None,
+                                source_system,
+                                source_record_id: id,
+                                amount,
+                                notes: "Historical source group",
+                                subtype: None,
+                            },
+                        );
+                    }
+                    diesel::update(activities::table)
+                        .set(activities::source_group_id.eq(Some("historical-source-group")))
+                        .execute(&mut conn)
+                        .expect("attach historical provenance");
+                }
+
+                if bulk {
+                    let outcome = repo
+                        .bulk_mutate_activities(vec![], vec![], vec!["historical-fee".into()])
+                        .await
+                        .expect("bulk delete fee");
+                    assert_eq!(outcome.deleted.len(), 1);
+                    assert_eq!(outcome.deleted[0].id, "historical-fee");
+                } else {
+                    repo.delete_activity("historical-fee".into())
+                        .await
+                        .expect("delete fee");
+                }
+                let remaining = repo
+                    .get_activities_by_source_group_id("historical-source-group")
+                    .expect("read historical rows");
+                for activity in &remaining {
+                    assert_eq!(activity.source_system.as_deref(), Some(source_system));
+                    assert_eq!(
+                        activity.source_record_id.as_deref(),
+                        Some(activity.id.as_str())
+                    );
+                    assert_eq!(activity.import_run_id.as_deref(), Some("local-import-run"));
+                    assert_eq!(
+                        activity.metadata,
+                        Some(serde_json::json!({ "broker": "keep" }))
+                    );
+                }
+                let mut remaining_ids: Vec<_> =
+                    remaining.into_iter().map(|activity| activity.id).collect();
+                remaining_ids.sort();
+                assert_eq!(
+                    remaining_ids,
+                    ["historical-deposit", "historical-tax"],
+                    "bulk={bulk}, source_system={source_system}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_unvalidated_transfer_group_preserves_siblings() {
+        for bulk in [false, true] {
+            for (extra_fee, same_account, metadata) in [
+                (true, false, Some(r#"{"flow":{"is_external":false}}"#)),
+                (false, false, Some(r#"{"flow":{"is_external":true}}"#)),
+                (false, true, Some(r#"{"flow":{"is_external":false}}"#)),
+            ] {
+                let (pool, writer) = setup_db();
+                let repo = ActivityRepository::new(pool.clone(), writer);
+                {
+                    let mut conn = get_connection(&pool).expect("conn");
+                    insert_account(&mut conn, "acc-out");
+                    insert_account(&mut conn, "acc-in");
+                    insert_transfer_activity(
+                        &mut conn,
+                        "transfer-out",
+                        "acc-out",
+                        "TRANSFER_OUT",
+                        Some("historical-transfer-group"),
+                        metadata,
+                    );
+                    insert_transfer_activity(
+                        &mut conn,
+                        "transfer-in",
+                        if same_account { "acc-out" } else { "acc-in" },
+                        "TRANSFER_IN",
+                        Some("historical-transfer-group"),
+                        metadata,
+                    );
+                    if extra_fee {
+                        insert_transfer_activity(
+                            &mut conn,
+                            "historical-fee",
+                            "acc-out",
+                            "FEE",
+                            Some("historical-transfer-group"),
+                            None,
+                        );
+                    }
+                }
+
+                if bulk {
+                    let outcome = repo
+                        .bulk_mutate_activities(vec![], vec![], vec!["transfer-out".into()])
+                        .await
+                        .expect("bulk delete unvalidated transfer");
+                    assert_eq!(outcome.deleted.len(), 1);
+                    assert_eq!(outcome.deleted[0].id, "transfer-out");
+                } else {
+                    repo.delete_activity("transfer-out".into())
+                        .await
+                        .expect("delete unvalidated transfer");
+                }
+
+                let remaining = repo
+                    .get_activities_by_source_group_id("historical-transfer-group")
+                    .expect("read historical transfer group");
+                let remaining_ids: HashSet<_> = remaining
+                    .iter()
+                    .map(|activity| activity.id.as_str())
+                    .collect();
+                let mut expected_ids = HashSet::from(["transfer-in"]);
+                if extra_fee {
+                    expected_ids.insert("historical-fee");
+                }
+                assert_eq!(
+                    remaining_ids, expected_ids,
+                    "bulk={bulk}, extra_fee={extra_fee}, same_account={same_account}"
+                );
+                let transfer_in = remaining
+                    .iter()
+                    .find(|activity| activity.id == "transfer-in")
+                    .expect("surviving transfer");
+                assert_eq!(
+                    transfer_in.metadata,
+                    metadata.map(|value| {
+                        serde_json::from_str::<serde_json::Value>(value).expect("metadata")
+                    })
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_delete_explicit_transfer_pair_is_atomic() {
+        for missing_id in [false, true] {
+            let (pool, writer) = setup_db();
+            let repo = ActivityRepository::new(pool.clone(), writer);
+            {
+                let mut conn = get_connection(&pool).expect("conn");
+                insert_account(&mut conn, "acc-out");
+                insert_account(&mut conn, "acc-in");
+                for (id, account_id, activity_type) in [
+                    ("transfer-out", "acc-out", "TRANSFER_OUT"),
+                    ("transfer-in", "acc-in", "TRANSFER_IN"),
+                ] {
+                    insert_transfer_activity(
+                        &mut conn,
+                        id,
+                        account_id,
+                        activity_type,
+                        Some("internal-transfer-group"),
+                        Some(r#"{"flow":{"is_external":false}}"#),
+                    );
+                }
+            }
+
+            let group = repo
+                .get_activities_by_source_group_id("internal-transfer-group")
+                .expect("read internal transfer pair");
+            let resolution =
+                wealthfolio_core::activities::TransferPairResolution::from_activities(&group);
+            let pair = resolution
+                .pair_for_activity("transfer-out")
+                .expect("valid transfer pair");
+            let mut delete_ids = vec![pair.transfer_out.id.clone(), pair.transfer_in.id.clone()];
+            if missing_id {
+                // A later failure must roll back both already-deleted transfer legs.
+                delete_ids.push("missing-activity".into());
+            } else {
+                delete_ids.push(pair.transfer_out.id.clone());
+            }
+            let outcome = repo
+                .bulk_mutate_activities(vec![], vec![], delete_ids)
+                .await;
+
+            let remaining = repo
+                .get_activities_by_source_group_id("internal-transfer-group")
+                .expect("read remaining transfer pair");
+            if missing_id {
+                assert!(outcome.is_err());
+                assert_eq!(
+                    remaining.len(),
+                    2,
+                    "failed deletion must roll back both legs"
+                );
+            } else {
+                let deleted_ids: Vec<_> = outcome
+                    .expect("delete both validated transfer IDs")
+                    .deleted
+                    .into_iter()
+                    .map(|activity| activity.id)
+                    .collect();
+                assert_eq!(deleted_ids, ["transfer-out", "transfer-in"]);
+                assert!(remaining.is_empty());
+            }
+        }
+    }
+}

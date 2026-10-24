@@ -1,0 +1,1374 @@
+//! Activity domain models.
+
+use crate::activities::activities_constants::{
+    ACTIVITY_SUBTYPE_BONUS, ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND, ACTIVITY_SUBTYPE_DRIP,
+    ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION, ACTIVITY_SUBTYPE_OPTION_EXPIRY,
+    ACTIVITY_SUBTYPE_POSITION_CLOSE, ACTIVITY_SUBTYPE_POSITION_OPEN, ACTIVITY_SUBTYPE_REBATE,
+    ACTIVITY_SUBTYPE_REFUND, ACTIVITY_SUBTYPE_REIMBURSEMENT, ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL,
+    ACTIVITY_SUBTYPE_STAKING_REWARD, ACTIVITY_TYPE_ADJUSTMENT, ACTIVITY_TYPE_BUY,
+    ACTIVITY_TYPE_DIVIDEND, ACTIVITY_TYPE_INTEREST, ACTIVITY_TYPE_SELL,
+};
+use crate::activities::activities_errors::ActivityError;
+use crate::activities::TransferLinkState;
+use crate::Result;
+use chrono::{DateTime, NaiveDate, Utc};
+use chrono_tz::Tz;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::str::FromStr;
+
+pub(crate) fn validate_activity_date(
+    activity_date: &str,
+) -> std::result::Result<NaiveDate, ActivityError> {
+    let date = DateTime::parse_from_rfc3339(activity_date)
+        .map(|date| date.date_naive())
+        .or_else(|_| NaiveDate::parse_from_str(activity_date, "%Y-%m-%d"))
+        .map_err(|_| {
+            ActivityError::InvalidData(
+                "Invalid date format. Expected ISO 8601/RFC3339 or YYYY-MM-DD".to_string(),
+            )
+        })?;
+    let min_date = crate::portfolio::snapshot::min_supported_snapshot_date();
+    if date < min_date {
+        return Err(ActivityError::InvalidData(format!(
+            "Activity date {} isn't supported. Use a date on or after {}.",
+            date, min_date
+        )));
+    }
+    Ok(date)
+}
+
+pub(crate) fn validate_activity_date_in_timezone(
+    activity_date: &str,
+    timezone: Tz,
+) -> std::result::Result<NaiveDate, ActivityError> {
+    let date = DateTime::parse_from_rfc3339(activity_date)
+        .map(|date| date.with_timezone(&timezone).date_naive())
+        .or_else(|_| NaiveDate::parse_from_str(activity_date, "%Y-%m-%d"))
+        .map_err(|_| {
+            ActivityError::InvalidData(
+                "Invalid date format. Expected ISO 8601/RFC3339 or YYYY-MM-DD".to_string(),
+            )
+        })?;
+    let min_date = crate::portfolio::snapshot::min_supported_snapshot_date();
+    if date < min_date {
+        return Err(ActivityError::InvalidData(format!(
+            "Activity date {} isn't supported. Use a date on or after {}.",
+            date, min_date
+        )));
+    }
+    Ok(date)
+}
+
+/// Helper function to parse a string into a Decimal,
+/// with support for scientific notation.
+pub fn parse_decimal_string_tolerant(value_str: &str, field_name: &str) -> Decimal {
+    // Attempt to parse directly as Decimal
+    match Decimal::from_str(value_str) {
+        Ok(d) => d,
+        Err(e_decimal) => {
+            // If direct parsing fails, try scientific notation parsing
+            match Decimal::from_scientific(value_str) {
+                Ok(d) => d,
+                Err(e_scientific) => {
+                    // If both attempts fail, log the original decimal error and the scientific error.
+                    log::error!(
+                        "Failed to parse {} '{}': as Decimal (err: {}), and as scientific (err: {}). Falling back to ZERO.",
+                        field_name, value_str, e_decimal, e_scientific
+                    );
+                    Decimal::ZERO
+                }
+            }
+        }
+    }
+}
+
+/// Activity status for lifecycle management
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ActivityStatus {
+    #[default]
+    Posted, // Live, affects calculations
+    Pending, // Awaiting settlement/confirmation
+    Draft,   // User-created, not yet confirmed
+    Void,    // Cancelled/reversed (soft delete)
+}
+
+/// Domain model representing an activity in the system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activity {
+    // Identity
+    pub id: String,
+    pub account_id: String,
+    pub asset_id: Option<String>, // NOW OPTIONAL - NULL for pure cash movements
+
+    // Classification
+    pub activity_type: String, // Canonical type (closed set of 14)
+    pub activity_type_override: Option<String>, // User override (never touched by sync)
+    pub source_type: Option<String>, // Raw provider label (REI, DIV, etc.)
+    pub subtype: Option<String>, // Semantic variation (DRIP, STAKING_REWARD, etc.)
+    pub status: ActivityStatus,
+
+    // Timing
+    #[serde(with = "timestamp_format")]
+    pub activity_date: DateTime<Utc>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settlement_date: Option<DateTime<Utc>>,
+
+    // Quantities - NOW ALL OPTIONAL
+    #[serde(default)]
+    #[serde(with = "optional_decimal_format")]
+    pub quantity: Option<Decimal>,
+    #[serde(default)]
+    #[serde(with = "optional_decimal_format")]
+    pub unit_price: Option<Decimal>,
+    #[serde(default)]
+    #[serde(with = "optional_decimal_format")]
+    pub amount: Option<Decimal>,
+    #[serde(default)]
+    #[serde(with = "optional_decimal_format")]
+    pub fee: Option<Decimal>,
+    #[serde(default)]
+    #[serde(with = "optional_decimal_format")]
+    pub tax: Option<Decimal>,
+    pub currency: String,
+    #[serde(default)]
+    #[serde(with = "optional_decimal_format")]
+    pub fx_rate: Option<Decimal>,
+
+    // Metadata
+    pub notes: Option<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>, // JSON blob
+
+    // Source identity
+    pub source_system: Option<String>, // SNAPTRADE, PLAID, MANUAL, CSV
+    pub source_record_id: Option<String>, // Provider's record ID
+    pub source_group_id: Option<String>, // Provider grouping key
+    pub idempotency_key: Option<String>, // Stable hash for dedupe
+    pub import_run_id: Option<String>, // Batch/run identifier
+
+    // Sync flags
+    #[serde(default)]
+    pub is_user_modified: bool, // User edited; sync protects economics
+    #[serde(default)]
+    pub needs_review: bool, // Needs user review (low confidence, etc.)
+
+    // Audit
+    #[serde(with = "timestamp_format")]
+    pub created_at: DateTime<Utc>,
+    #[serde(with = "timestamp_format")]
+    pub updated_at: DateTime<Utc>,
+}
+
+/// An activity's type override, when it is not blank: a blank override is
+/// none, wherever the type is read (engine rules §5). SQL reads it through
+/// the storage crate's `effective_type_sql`, the frontend through
+/// `getEffectiveType`.
+pub fn type_override(type_override: Option<&str>) -> Option<&str> {
+    type_override.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// A type override as stored: as `type_override` reads it, trimmed and none
+/// when blank. Every write of `activities.activity_type_override` stores it
+/// through this, so a reader of the stored column that does not trim (the
+/// addon SDK's `getEffectiveType`) reads the type the engine reads in every
+/// row written since; rows stored before keep theirs until edited or edited through the retained activity API.
+pub fn stored_type_override(value: Option<&str>) -> Option<String> {
+    type_override(value).map(str::to_string)
+}
+
+/// The type an activity computes as: its override when not blank, else its
+/// stored type.
+pub fn effective_activity_type<'a>(activity_type: &'a str, override_: Option<&'a str>) -> &'a str {
+    type_override(override_).unwrap_or(activity_type)
+}
+
+impl Activity {
+    /// Returns the effective activity type, respecting user overrides.
+    /// This is what the compiler and calculator should use.
+    pub fn effective_type(&self) -> &str {
+        effective_activity_type(&self.activity_type, self.activity_type_override.as_deref())
+    }
+
+    /// Check if this activity is posted (should affect calculations)
+    pub fn is_posted(&self) -> bool {
+        self.status == ActivityStatus::Posted
+    }
+
+    /// The explicit external-transfer marker (`metadata.flow.is_external`),
+    /// when the row carries one.
+    pub fn explicit_external_transfer(&self) -> Option<bool> {
+        self.metadata
+            .as_ref()
+            .and_then(|m| m.get("flow"))
+            .and_then(|f| f.get("is_external"))
+            .and_then(|v| v.as_bool())
+    }
+
+    /// Whether the row is explicitly marked as an external transfer.
+    pub fn is_external_transfer(&self) -> bool {
+        self.explicit_external_transfer().unwrap_or(false)
+    }
+
+    /// Check if this activity has a user override
+    pub fn has_override(&self) -> bool {
+        type_override(self.activity_type_override.as_deref()).is_some()
+    }
+
+    /// Get quantity, defaulting to zero if not set.
+    /// Always returns absolute value — direction is determined by activity type.
+    pub fn qty(&self) -> Decimal {
+        self.quantity.unwrap_or(Decimal::ZERO).abs()
+    }
+
+    /// Get unit price, defaulting to zero if not set.
+    /// Always returns absolute value.
+    pub fn price(&self) -> Decimal {
+        self.unit_price.unwrap_or(Decimal::ZERO).abs()
+    }
+
+    /// Get amount, defaulting to zero if not set.
+    /// Always returns absolute value — direction is determined by activity type.
+    pub fn amt(&self) -> Decimal {
+        self.amount.unwrap_or(Decimal::ZERO).abs()
+    }
+
+    /// Get fee, defaulting to zero if not set.
+    /// Always returns absolute value.
+    pub fn fee_amt(&self) -> Decimal {
+        self.fee.unwrap_or(Decimal::ZERO).abs()
+    }
+
+    /// Get tax or withholding amount, defaulting to zero if not set.
+    /// Always returns absolute value.
+    pub fn tax_amt(&self) -> Decimal {
+        self.tax.unwrap_or(Decimal::ZERO).abs()
+    }
+
+    /// Get typed metadata value
+    pub fn get_meta<T: serde::de::DeserializeOwned>(&self, key: &str) -> Option<T> {
+        self.metadata
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
+}
+
+/// Input for asset identification when creating/updating activities.
+/// Consolidates all asset-related fields into a single nested object.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetResolutionInput {
+    /// Existing asset ID. When provided without natural identity, it must refer to a persisted asset.
+    pub id: Option<String>,
+    /// Symbol (e.g., "AAPL", "BTC") used to resolve or create an asset.
+    pub symbol: Option<String>,
+    /// Exchange MIC code (e.g., "XNAS", "XTSE") for securities.
+    pub exchange_mic: Option<String>,
+    /// Asset kind hint (e.g., "SECURITY", "CRYPTO") - if not provided, inferred.
+    pub kind: Option<String>,
+    /// Asset name hint for custom/manual assets.
+    pub name: Option<String>,
+    /// Quote mode hint: "MARKET" or "MANUAL".
+    pub quote_mode: Option<String>,
+    /// Optional quote currency from symbol search/provider (e.g., "GBp").
+    pub quote_ccy: Option<String>,
+    /// Optional instrument type from symbol search/provider (e.g., "EQUITY", "CRYPTO").
+    pub instrument_type: Option<String>,
+    /// Market data provider that resolved this symbol, if selected.
+    pub provider_id: Option<String>,
+    /// Provider-native symbol/code selected by search/import.
+    pub provider_symbol: Option<String>,
+}
+
+impl AssetResolutionInput {
+    /// An empty object is the explicit PATCH representation for removing an
+    /// activity's optional asset. Omitting the object preserves the asset.
+    pub fn is_empty(&self) -> bool {
+        self.id.is_none()
+            && self.symbol.is_none()
+            && self.exchange_mic.is_none()
+            && self.kind.is_none()
+            && self.name.is_none()
+            && self.quote_mode.is_none()
+            && self.quote_ccy.is_none()
+            && self.instrument_type.is_none()
+            && self.provider_id.is_none()
+            && self.provider_symbol.is_none()
+    }
+}
+
+/// Input model for creating a new activity
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct NewActivity {
+    pub id: Option<String>,
+    pub account_id: String,
+
+    /// Asset resolution input. Accepts the old `symbol` JSON field during transition.
+    /// Optional for cash activities which don't require an asset.
+    #[serde(alias = "symbol")]
+    pub asset: Option<AssetResolutionInput>,
+
+    pub activity_type: String,
+    pub subtype: Option<String>, // Semantic variation (DRIP, STAKING_REWARD, etc.)
+    pub activity_date: String,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub quantity: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub unit_price: Option<Decimal>,
+    pub currency: String,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub fee: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub tax: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub amount: Option<Decimal>,
+    pub status: Option<ActivityStatus>,
+    #[serde(alias = "comment")]
+    pub notes: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub fx_rate: Option<Decimal>,
+    // Sync-related fields
+    pub metadata: Option<String>,         // JSON blob for sync metadata
+    pub needs_review: Option<bool>,       // Flag for activities needing user review
+    pub source_system: Option<String>,    // SNAPTRADE, PLAID, MANUAL, CSV
+    pub source_record_id: Option<String>, // Provider's record ID
+    pub source_group_id: Option<String>,  // Provider grouping key
+    pub idempotency_key: Option<String>,  // Stable hash for dedupe
+}
+
+impl NewActivity {
+    pub fn canonicalize_subtype(subtype: Option<&str>) -> Option<String> {
+        let subtype = subtype.map(str::trim).filter(|value| !value.is_empty())?;
+
+        let normalized = subtype.replace([' ', '-'], "_");
+        let canonical = if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DRIP) {
+            ACTIVITY_SUBTYPE_DRIP
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND) {
+            ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_STAKING_REWARD) {
+            ACTIVITY_SUBTYPE_STAKING_REWARD
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_BONUS) {
+            ACTIVITY_SUBTYPE_BONUS
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REBATE) {
+            ACTIVITY_SUBTYPE_REBATE
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REFUND) {
+            ACTIVITY_SUBTYPE_REFUND
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REIMBURSEMENT) {
+            ACTIVITY_SUBTYPE_REIMBURSEMENT
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_OPTION_EXPIRY) {
+            ACTIVITY_SUBTYPE_OPTION_EXPIRY
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_POSITION_OPEN) {
+            ACTIVITY_SUBTYPE_POSITION_OPEN
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_POSITION_CLOSE) {
+            ACTIVITY_SUBTYPE_POSITION_CLOSE
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL) {
+            ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION) {
+            ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION
+        } else {
+            subtype
+        };
+
+        Some(canonical.to_string())
+    }
+
+    pub fn canonicalize_subtype_for_activity(
+        activity_type: &str,
+        subtype: Option<&str>,
+    ) -> Option<String> {
+        let subtype = subtype.map(str::trim).filter(|value| !value.is_empty())?;
+        let normalized = subtype
+            .chars()
+            .map(|c| match c {
+                ' ' | '-' => '_',
+                _ => c.to_ascii_uppercase(),
+            })
+            .collect::<String>();
+
+        let canonical = if activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_BUY) {
+            match normalized.as_str() {
+                "BTO" | "BUY_TO_OPEN" | "BUY_OPEN" | "OPEN_BUY" => {
+                    Some(ACTIVITY_SUBTYPE_POSITION_OPEN)
+                }
+                "BTC" | "BUY_TO_CLOSE" | "BUY_CLOSE" | "CLOSE_BUY" | "BUY_TO_COVER"
+                | "BUY_COVER" | "COVER_SHORT" => Some(ACTIVITY_SUBTYPE_POSITION_CLOSE),
+                _ => None,
+            }
+        } else if activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_SELL) {
+            match normalized.as_str() {
+                "STO" | "SELL_TO_OPEN" | "SELL_OPEN" | "OPEN_SELL" | "SELL_SHORT"
+                | "SHORT_SELL" | "SELL_SHORT_TO_OPEN" => Some(ACTIVITY_SUBTYPE_POSITION_OPEN),
+                "STC" | "SELL_TO_CLOSE" | "SELL_CLOSE" | "CLOSE_SELL" => {
+                    Some(ACTIVITY_SUBTYPE_POSITION_CLOSE)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        canonical
+            .map(|value| value.to_string())
+            .or_else(|| Self::canonicalize_subtype(Some(subtype)))
+    }
+
+    pub(crate) fn is_asset_backed_income_subtype(
+        activity_type: &str,
+        subtype: Option<&str>,
+    ) -> bool {
+        let Some(subtype) = subtype.map(str::trim).filter(|value| !value.is_empty()) else {
+            return false;
+        };
+
+        (activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_DIVIDEND)
+            && (subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DRIP)
+                || subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND)))
+            || (activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_INTEREST)
+                && subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_STAKING_REWARD))
+    }
+
+    pub(crate) fn validate_asset_backed_income_values(
+        activity_type: &str,
+        subtype: Option<&str>,
+        quantity: Option<Decimal>,
+        unit_price: Option<Decimal>,
+        amount: Option<Decimal>,
+    ) -> std::result::Result<(), ActivityError> {
+        if !Self::is_asset_backed_income_subtype(activity_type, subtype) {
+            return Ok(());
+        }
+
+        match quantity {
+            Some(quantity) if quantity.is_sign_positive() && !quantity.is_zero() => {}
+            _ => {
+                return Err(ActivityError::InvalidData(
+                    "Asset-backed income activities require a positive quantity".to_string(),
+                ));
+            }
+        }
+
+        let has_positive_unit_price =
+            unit_price.is_some_and(|value| value.is_sign_positive() && !value.is_zero());
+        let has_positive_amount =
+            amount.is_some_and(|value| value.is_sign_positive() && !value.is_zero());
+
+        if !has_positive_unit_price && !has_positive_amount {
+            return Err(ActivityError::InvalidData(
+                "Asset-backed income activities require an amount or FMV per unit".to_string(),
+            ));
+        }
+
+        if unit_price.is_some_and(|value| value.is_sign_negative()) {
+            return Err(ActivityError::InvalidData(
+                "FMV per unit cannot be negative".to_string(),
+            ));
+        }
+
+        if amount.is_some_and(|value| value.is_sign_negative()) {
+            return Err(ActivityError::InvalidData(
+                "Income amount cannot be negative".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validates the new activity data
+    pub fn validate(&self) -> std::result::Result<(), ActivityError> {
+        if self.account_id.trim().is_empty() {
+            return Err(crate::activities::ActivityError::InvalidData(
+                "Account ID cannot be empty".to_string(),
+            ));
+        }
+        if self.activity_type.trim().is_empty() {
+            return Err(crate::activities::ActivityError::InvalidData(
+                "Activity type cannot be empty".to_string(),
+            ));
+        }
+
+        validate_activity_date(&self.activity_date)?;
+
+        let subtype =
+            Self::canonicalize_subtype_for_activity(&self.activity_type, self.subtype.as_deref());
+        if self
+            .activity_type
+            .eq_ignore_ascii_case(ACTIVITY_TYPE_ADJUSTMENT)
+            && matches!(
+                subtype.as_deref(),
+                Some(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL | ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION)
+            )
+            && ![self.get_asset_resolution_id(), self.get_asset_symbol()]
+                .into_iter()
+                .flatten()
+                .any(|value| !value.trim().is_empty())
+        {
+            return Err(ActivityError::InvalidData(
+                "Cost basis adjustments require an asset_id or symbol".to_string(),
+            ));
+        }
+
+        Self::validate_asset_backed_income_values(
+            &self.activity_type,
+            self.subtype.as_deref(),
+            self.quantity,
+            self.unit_price,
+            self.amount,
+        )?;
+
+        Ok(())
+    }
+
+    // Helper methods to extract fields from nested asset resolution input.
+
+    pub fn get_asset_resolution_id(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.id.as_deref())
+    }
+
+    pub fn get_asset_symbol(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.symbol.as_deref())
+    }
+
+    pub fn get_asset_exchange_mic(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.exchange_mic.as_deref())
+    }
+
+    pub fn get_symbol_id(&self) -> Option<&str> {
+        self.get_asset_resolution_id()
+    }
+
+    pub fn get_symbol_code(&self) -> Option<&str> {
+        self.get_asset_symbol()
+    }
+
+    pub fn get_exchange_mic(&self) -> Option<&str> {
+        self.get_asset_exchange_mic()
+    }
+
+    pub fn get_kind(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.kind.as_deref())
+    }
+
+    pub fn get_name(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.name.as_deref())
+    }
+
+    pub fn get_quote_mode(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.quote_mode.as_deref())
+    }
+
+    pub fn get_quote_ccy(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.quote_ccy.as_deref())
+    }
+
+    pub fn get_instrument_type(&self) -> Option<&str> {
+        self.asset
+            .as_ref()
+            .and_then(|a| a.instrument_type.as_deref())
+    }
+}
+
+/// One activity as an update would leave it, computed without writing.
+#[derive(Debug, Clone)]
+pub struct PreviewedActivityUpdate {
+    /// The stored activity.
+    pub existing: Activity,
+    /// The update as it would be written: omitted fields hydrated from
+    /// `existing` (a `None` patch still keeps the stored value), derived
+    /// amount and review flag applied, date and values normalized.
+    pub update: ActivityUpdate,
+    /// The instant `update.activity_date` is stored as.
+    pub activity_date: DateTime<Utc>,
+}
+
+/// What `update_activity` would write for an update, without writing it.
+#[derive(Debug, Clone)]
+pub struct ActivityUpdatePreview {
+    pub activity: PreviewedActivityUpdate,
+    /// The other leg of a linked transfer pair, which the update mirrors onto.
+    pub linked: Option<PreviewedActivityUpdate>,
+}
+
+/// Input model for updating an existing activity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityUpdate {
+    pub id: String,
+    pub account_id: String,
+
+    /// Asset patch. Omit to preserve, provide identity to replace, or provide
+    /// an empty object to explicitly clear an optional asset. Accepts the old
+    /// `symbol` JSON field during transition.
+    #[serde(alias = "symbol")]
+    pub asset: Option<AssetResolutionInput>,
+
+    pub activity_type: String,
+    #[serde(
+        default,
+        deserialize_with = "subtype_patch_format::deserialize_patch_subtype"
+    )]
+    pub subtype: Option<String>, // Semantic variation (DRIP, STAKING_REWARD, etc.)
+    pub activity_date: String,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_patch_decimal"
+    )]
+    pub quantity: Option<Option<Decimal>>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_patch_decimal"
+    )]
+    pub unit_price: Option<Option<Decimal>>,
+    pub currency: String,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_patch_decimal"
+    )]
+    pub fee: Option<Option<Decimal>>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_patch_decimal"
+    )]
+    pub tax: Option<Option<Decimal>>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_patch_decimal"
+    )]
+    pub amount: Option<Option<Decimal>>,
+    pub status: Option<ActivityStatus>,
+    /// Review is independent from lifecycle status. Omitted updates preserve the stored flag.
+    #[serde(default)]
+    pub needs_review: Option<bool>,
+    #[serde(alias = "comment")]
+    pub notes: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_patch_decimal"
+    )]
+    pub fx_rate: Option<Option<Decimal>>,
+    pub metadata: Option<String>, // JSON blob for metadata (e.g., flow.is_external)
+}
+
+impl ActivityUpdate {
+    /// Validates the activity update data
+    pub fn validate(&self) -> Result<()> {
+        if self.id.trim().is_empty() {
+            return Err(crate::activities::ActivityError::InvalidData(
+                "Activity ID is required for updates".to_string(),
+            )
+            .into());
+        }
+        if self.account_id.trim().is_empty() {
+            return Err(crate::activities::ActivityError::InvalidData(
+                "Account ID cannot be empty".to_string(),
+            )
+            .into());
+        }
+        if self.activity_type.trim().is_empty() {
+            return Err(crate::activities::ActivityError::InvalidData(
+                "Activity type cannot be empty".to_string(),
+            )
+            .into());
+        }
+        validate_activity_date(&self.activity_date)?;
+        Ok(())
+    }
+
+    // Helper methods to extract fields from nested asset resolution input.
+
+    pub fn get_asset_resolution_id(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.id.as_deref())
+    }
+
+    pub fn get_asset_symbol(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.symbol.as_deref())
+    }
+
+    pub fn get_asset_exchange_mic(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.exchange_mic.as_deref())
+    }
+
+    pub fn get_symbol_id(&self) -> Option<&str> {
+        self.get_asset_resolution_id()
+    }
+
+    pub fn get_symbol_code(&self) -> Option<&str> {
+        self.get_asset_symbol()
+    }
+
+    pub fn get_exchange_mic(&self) -> Option<&str> {
+        self.get_asset_exchange_mic()
+    }
+
+    pub fn get_kind(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.kind.as_deref())
+    }
+
+    pub fn get_name(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.name.as_deref())
+    }
+
+    pub fn get_quote_mode(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.quote_mode.as_deref())
+    }
+
+    pub fn get_quote_ccy(&self) -> Option<&str> {
+        self.asset.as_ref().and_then(|a| a.quote_ccy.as_deref())
+    }
+
+    pub fn get_instrument_type(&self) -> Option<&str> {
+        self.asset
+            .as_ref()
+            .and_then(|a| a.instrument_type.as_deref())
+    }
+}
+
+/// Request payload grouping multiple activity mutations.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityBulkMutationRequest {
+    #[serde(default)]
+    pub creates: Vec<NewActivity>,
+    #[serde(default)]
+    pub updates: Vec<ActivityUpdate>,
+    #[serde(default)]
+    pub delete_ids: Vec<String>,
+}
+
+/// Summary of the results for a bulk mutation request.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityBulkMutationResult {
+    pub created: Vec<Activity>,
+    pub updated: Vec<Activity>,
+    pub deleted: Vec<Activity>,
+    #[serde(default)]
+    pub created_mappings: Vec<ActivityBulkIdentifierMapping>,
+    #[serde(default)]
+    pub errors: Vec<ActivityBulkMutationError>,
+}
+
+/// Minimal update applied by the removable one-shot final-cash migration.
+#[derive(Debug, Clone)]
+pub struct ActivityFinalCashMigrationUpdate {
+    pub id: String,
+    pub amount: Option<Decimal>,
+    pub needs_review: bool,
+}
+
+/// What storage actually persisted during the final-cash rewrite. Rejected
+/// amount replacements are reported so core can rebuild from the value that
+/// remains authoritative on the row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActivityFinalCashMigrationWriteResult {
+    pub changed: usize,
+    pub unapplied_amount_update_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ActivityFinalCashMigrationResult {
+    pub changed: usize,
+    pub affected_account_ids: Vec<String>,
+}
+
+/// Pair-aware request for creating or updating an internal cash transfer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InternalTransferPairRequest {
+    #[serde(default)]
+    pub transfer_out_id: Option<String>,
+    #[serde(default)]
+    pub transfer_in_id: Option<String>,
+    #[serde(default)]
+    pub source_group_id: Option<String>,
+    pub from_account_id: String,
+    pub to_account_id: String,
+    pub activity_date: String,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub source_amount: Option<Decimal>,
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub destination_amount: Option<Decimal>,
+    pub source_currency: String,
+    pub destination_currency: String,
+    /// Legacy execution-rate hint. Amounts are authoritative; this is never
+    /// persisted as Activity.fx_rate (an activity-to-account valuation override).
+    #[serde(
+        default,
+        deserialize_with = "decimal_input_format::deserialize_option_decimal"
+    )]
+    pub fx_rate: Option<Decimal>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub transfer_mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InternalTransferPairResponse {
+    pub transfer_out: Activity,
+    pub transfer_in: Activity,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferMatchCandidateRequest {
+    pub activity_id: String,
+    #[serde(default)]
+    pub window_days: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferMatchCandidate {
+    pub activity: Activity,
+    pub match_kind: String,
+    pub confidence: String,
+    pub score: i32,
+    pub reasons: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Scope of a scan for posted transfers with no linked other side.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlinkedTransfersRequest {
+    /// Look up this one activity instead of scanning.
+    #[serde(default)]
+    pub activity_id: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// Inclusive UTC calendar dates of the transfer.
+    #[serde(default)]
+    pub start_date: Option<NaiveDate>,
+    #[serde(default)]
+    pub end_date: Option<NaiveDate>,
+    /// Days a candidate may be from the transfer (default 7, at most 90).
+    #[serde(default)]
+    pub window_days: Option<i64>,
+    /// Candidates per transfer (default 3, at most 25).
+    #[serde(default)]
+    pub candidate_limit: Option<usize>,
+    /// Transfers returned (default 25, at most 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Transfers skipped before `limit`, for paging.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Only these unlinked states (default all three).
+    #[serde(default)]
+    pub link_states: Option<Vec<TransferLinkState>>,
+}
+
+/// A posted transfer with no linked other side, its link state, and the
+/// transfers it could pair with, best first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlinkedTransfer {
+    pub activity: Activity,
+    pub link_state: TransferLinkState,
+    pub candidates: Vec<TransferMatchCandidate>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlinkedTransfers {
+    /// Newest first, at most the request's `limit`.
+    pub transfers: Vec<UnlinkedTransfer>,
+    /// Unlinked transfers in scope before the offset and limit.
+    pub total: usize,
+    /// For an `activity_id` lookup of a linked transfer: its other side.
+    pub linked: Option<LinkedTransfer>,
+}
+
+/// The other side of a linked transfer, and the transfer's link state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkedTransfer {
+    pub counterpart_id: String,
+    pub link_state: TransferLinkState,
+}
+
+/// Structured error reported for a single bulk mutation entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityBulkMutationError {
+    pub id: Option<String>,
+    pub action: String,
+    pub message: String,
+}
+
+/// Maps a temporary client identifier to the persisted activity identifier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityBulkIdentifierMapping {
+    pub temp_id: Option<String>,
+    pub activity_id: String,
+}
+
+/// Model for activity details including related data
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityDetails {
+    pub id: String,
+    pub account_id: String,
+    pub asset_id: String,
+    pub activity_type: String,
+    pub subtype: Option<String>,
+    pub status: ActivityStatus,
+    pub date: String,
+    pub quantity: Option<String>,
+    pub unit_price: Option<String>,
+    pub currency: String,
+    pub fee: Option<String>,
+    pub tax: Option<String>,
+    /// Authoritative final cash magnitude stored in `amount`.
+    pub amount: Option<String>,
+    pub needs_review: bool,
+    pub comment: Option<String>,
+    pub fx_rate: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub account_name: String,
+    pub account_currency: String,
+    pub asset_symbol: String,
+    pub asset_name: Option<String>,
+    pub exchange_mic: Option<String>,
+    pub asset_pricing_mode: String, // MARKET, MANUAL, DERIVED, NONE
+    pub instrument_type: Option<String>,
+    /// Effective multiplier resolved from the asset, never from activity metadata.
+    pub asset_contract_multiplier: Option<String>,
+    // Sync/source metadata
+    pub source_system: Option<String>,
+    pub source_record_id: Option<String>,
+    pub source_group_id: Option<String>,
+    pub idempotency_key: Option<String>,
+    pub import_run_id: Option<String>,
+    pub is_user_modified: bool,
+    pub metadata: Option<Value>,
+    /// Business-concurrency version. Updates must send it back as
+    /// `expectedVersion` on the unified business path.
+    pub version: i32,
+    /// Stored raw type override. Non-empty means the original cash edit path
+    /// owns this row; the unified path must not take it.
+    pub activity_type_override: Option<String>,
+}
+
+impl ActivityDetails {
+    pub fn get_quantity(&self) -> Decimal {
+        self.quantity
+            .as_ref()
+            .map(|s| parse_decimal_string_tolerant(s, "quantity"))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn get_unit_price(&self) -> Decimal {
+        self.unit_price
+            .as_ref()
+            .map(|s| parse_decimal_string_tolerant(s, "unit_price"))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn get_fee(&self) -> Decimal {
+        self.fee
+            .as_ref()
+            .map(|s| parse_decimal_string_tolerant(s, "fee"))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn get_tax(&self) -> Decimal {
+        self.tax
+            .as_ref()
+            .map(|s| parse_decimal_string_tolerant(s, "tax"))
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    pub fn get_amount(&self) -> Option<Decimal> {
+        self.amount
+            .as_ref()
+            .map(|s| parse_decimal_string_tolerant(s, "amount"))
+    }
+
+    // Helper to parse the date string
+    pub fn get_date(&self) -> std::result::Result<DateTime<Utc>, chrono::ParseError> {
+        DateTime::parse_from_rfc3339(&self.date).map(|dt| dt.with_timezone(&Utc))
+    }
+
+    // Helper to parse the created_at string
+    pub fn get_created_at(&self) -> std::result::Result<DateTime<Utc>, chrono::ParseError> {
+        DateTime::parse_from_rfc3339(&self.created_at).map(|dt| dt.with_timezone(&Utc))
+    }
+
+    // Helper to parse the updated_at string
+    pub fn get_updated_at(&self) -> std::result::Result<DateTime<Utc>, chrono::ParseError> {
+        DateTime::parse_from_rfc3339(&self.updated_at).map(|dt| dt.with_timezone(&Utc))
+    }
+}
+
+/// Model for activity search response metadata
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySearchResponseMeta {
+    pub total_row_count: i64,
+}
+
+/// Model for activity search response
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySearchResponse {
+    pub data: Vec<ActivityDetails>,
+    pub meta: ActivitySearchResponseMeta,
+}
+
+/// Model for sorting activities
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sort {
+    pub id: String,
+    pub desc: bool,
+}
+
+/// Enum representing different types of activities
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ActivityType {
+    Buy,
+    Sell,
+    Dividend,
+    Interest,
+    Deposit,
+    Withdrawal,
+    TransferIn,
+    TransferOut,
+    Fee,
+    Tax,
+    Split,
+    Credit,     // Cash-only credit: refunds, rebates, bonuses
+    Adjustment, // Non-trade correction / transformation (usually no cash)
+    Unknown,    // Unmapped/unknown activity types
+}
+
+impl ActivityType {
+    pub fn as_str(&self) -> &'static str {
+        use crate::activities::activities_constants::*;
+        match self {
+            ActivityType::Buy => ACTIVITY_TYPE_BUY,
+            ActivityType::Sell => ACTIVITY_TYPE_SELL,
+            ActivityType::Dividend => ACTIVITY_TYPE_DIVIDEND,
+            ActivityType::Interest => ACTIVITY_TYPE_INTEREST,
+            ActivityType::Deposit => ACTIVITY_TYPE_DEPOSIT,
+            ActivityType::Withdrawal => ACTIVITY_TYPE_WITHDRAWAL,
+            ActivityType::TransferIn => ACTIVITY_TYPE_TRANSFER_IN,
+            ActivityType::TransferOut => ACTIVITY_TYPE_TRANSFER_OUT,
+            ActivityType::Fee => ACTIVITY_TYPE_FEE,
+            ActivityType::Tax => ACTIVITY_TYPE_TAX,
+            ActivityType::Split => ACTIVITY_TYPE_SPLIT,
+            ActivityType::Credit => ACTIVITY_TYPE_CREDIT,
+            ActivityType::Adjustment => ACTIVITY_TYPE_ADJUSTMENT,
+            ActivityType::Unknown => ACTIVITY_TYPE_UNKNOWN,
+        }
+    }
+}
+
+impl FromStr for ActivityType {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        use crate::activities::activities_constants::*;
+        match s {
+            s if s == ACTIVITY_TYPE_BUY => Ok(ActivityType::Buy),
+            s if s == ACTIVITY_TYPE_SELL => Ok(ActivityType::Sell),
+            s if s == ACTIVITY_TYPE_DIVIDEND => Ok(ActivityType::Dividend),
+            s if s == ACTIVITY_TYPE_INTEREST => Ok(ActivityType::Interest),
+            s if s == ACTIVITY_TYPE_DEPOSIT => Ok(ActivityType::Deposit),
+            s if s == ACTIVITY_TYPE_WITHDRAWAL => Ok(ActivityType::Withdrawal),
+            s if s == ACTIVITY_TYPE_TRANSFER_IN => Ok(ActivityType::TransferIn),
+            s if s == ACTIVITY_TYPE_TRANSFER_OUT => Ok(ActivityType::TransferOut),
+            s if s == ACTIVITY_TYPE_FEE => Ok(ActivityType::Fee),
+            s if s == ACTIVITY_TYPE_TAX => Ok(ActivityType::Tax),
+            s if s == ACTIVITY_TYPE_SPLIT => Ok(ActivityType::Split),
+            s if s == ACTIVITY_TYPE_CREDIT => Ok(ActivityType::Credit),
+            s if s == ACTIVITY_TYPE_ADJUSTMENT => Ok(ActivityType::Adjustment),
+            s if s == ACTIVITY_TYPE_UNKNOWN => Ok(ActivityType::Unknown),
+            _ => Err(format!("Unknown activity type: {}", s)),
+        }
+    }
+}
+
+// Custom serialization for timestamps to ensure consistent ISO 8601 formatting
+mod timestamp_format {
+    use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(date: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Always serialize in ISO 8601 format with UTC timezone
+        serializer.serialize_str(&date.to_rfc3339())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+
+        // First try parsing as RFC3339/ISO8601
+        if let Ok(dt) = DateTime::parse_from_rfc3339(&s) {
+            return Ok(dt.with_timezone(&Utc));
+        }
+
+        // Then try as date-only format
+        if let Ok(date) = NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
+            // Use midnight UTC for date-only values
+            return Ok(Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap_or_default()));
+        }
+
+        Err(serde::de::Error::custom(format!(
+            "Invalid timestamp format: {}. Expected ISO 8601/RFC3339 or YYYY-MM-DD",
+            s
+        )))
+    }
+}
+
+// Custom deserialization for Decimal inputs to support strings, numbers, nulls, and scientific notation
+mod decimal_input_format {
+    use rust_decimal::Decimal;
+    use serde::{self, Deserialize, Deserializer};
+    use serde_json::Number;
+    use std::str::FromStr;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum DecimalInput {
+        String(String),
+        Number(Number),
+        Null,
+    }
+
+    fn parse_decimal_value(value: &str) -> Result<Decimal, String> {
+        let trimmed = value.trim();
+        Decimal::from_str(trimmed)
+            .or_else(|_| Decimal::from_scientific(trimmed))
+            .map_err(|e| format!("Invalid decimal value '{}': {}", value, e))
+    }
+
+    pub fn deserialize_option_decimal<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = Option::<DecimalInput>::deserialize(deserializer)?;
+        match raw {
+            None | Some(DecimalInput::Null) => Ok(None),
+            Some(DecimalInput::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                parse_decimal_value(trimmed)
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some(DecimalInput::Number(n)) => parse_decimal_value(&n.to_string())
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+
+    pub fn deserialize_patch_decimal<'de, D>(
+        deserializer: D,
+    ) -> Result<Option<Option<Decimal>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        match raw {
+            serde_json::Value::Null => Ok(Some(None)),
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Ok(Some(None));
+                }
+                parse_decimal_value(trimmed)
+                    .map(|value| Some(Some(value)))
+                    .map_err(serde::de::Error::custom)
+            }
+            serde_json::Value::Number(n) => parse_decimal_value(&n.to_string())
+                .map(|value| Some(Some(value)))
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom("Invalid decimal value type")),
+        }
+    }
+}
+
+mod subtype_patch_format {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize_patch_subtype<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Some(
+            Option::<String>::deserialize(deserializer)?.unwrap_or_default(),
+        ))
+    }
+}
+
+// Custom serialization for optional Decimal fields to handle string representation
+mod optional_decimal_format {
+    use rust_decimal::Decimal;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+    use std::str::FromStr;
+
+    pub fn serialize<S>(value: &Option<Decimal>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(d) => serializer.serialize_str(&d.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Decimal>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Use an untagged enum to handle both string and number representations
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum DecimalOrString {
+            Decimal(Decimal),
+            String(String),
+            Null,
+        }
+
+        match Option::<DecimalOrString>::deserialize(deserializer)? {
+            Some(DecimalOrString::Decimal(d)) => Ok(Some(d)),
+            Some(DecimalOrString::String(s)) if s.is_empty() => Ok(None),
+            Some(DecimalOrString::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    return Ok(None);
+                }
+                Decimal::from_str(trimmed)
+                    .or_else(|_| Decimal::from_scientific(trimmed))
+                    .map(Some)
+                    .map_err(serde::de::Error::custom)
+            }
+            Some(DecimalOrString::Null) | None => Ok(None),
+        }
+    }
+}
+
+/// Model for income data from activities
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomeData {
+    pub date: String,
+    pub income_type: String,
+    pub asset_id: String,
+    pub asset_kind: String,
+    pub symbol: String,
+    pub symbol_name: String,
+    pub currency: String,
+    pub amount: Decimal,
+    pub account_id: String,
+    pub account_name: String,
+}
+
+/// Input model for upserting activities (insert or update on conflict).
+/// Used for generated market-data activities with idempotency support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityUpsert {
+    /// Provider activity ID (used as primary key for upsert)
+    pub id: String,
+    pub account_id: String,
+    pub asset_id: Option<String>,
+    pub activity_type: String,
+    pub subtype: Option<String>,
+    pub activity_date: String,
+    pub quantity: Option<Decimal>,
+    pub unit_price: Option<Decimal>,
+    pub currency: String,
+    pub fee: Option<Decimal>,
+    pub tax: Option<Decimal>,
+    pub amount: Option<Decimal>,
+    pub status: Option<ActivityStatus>,
+    pub notes: Option<String>,
+    pub fx_rate: Option<Decimal>,
+    pub metadata: Option<String>,
+    pub needs_review: Option<bool>,
+    pub source_system: Option<String>,
+    pub source_record_id: Option<String>,
+    pub source_group_id: Option<String>,
+    pub idempotency_key: Option<String>,
+}
+
+/// Result of a bulk upsert operation
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkUpsertResult {
+    /// Total number of activities processed
+    pub upserted: usize,
+    /// Number of activities that were newly created
+    pub created: usize,
+    /// Number of activities that were updated
+    pub updated: usize,
+    /// Number of activities skipped (e.g., user-modified)
+    pub skipped: usize,
+    /// Asset ids of pre-existing SPLIT rows that were overwritten, so callers can
+    /// emit asset-level split events even when the incoming row is no longer a SPLIT
+    #[serde(skip)]
+    pub updated_split_asset_ids: Vec<String>,
+}
+
+/// Activity ready for persistence
+#[derive(Debug, Clone)]
+pub struct PreparedActivity {
+    pub activity: NewActivity,
+    pub resolved_asset_id: Option<String>,
+    pub fx_pair: Option<(String, String)>, // (from_currency, to_currency)
+}
+
+/// Result of prepare_activities
+#[derive(Debug, Default)]
+pub struct PrepareActivitiesResult {
+    pub prepared: Vec<PreparedActivity>,
+    pub errors: Vec<(usize, String)>, // (index, error_message)
+    pub assets_created: u32,
+    pub created_asset_ids: Vec<String>,
+}

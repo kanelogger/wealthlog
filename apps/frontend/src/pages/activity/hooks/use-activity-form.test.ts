@@ -1,0 +1,621 @@
+import { ActivityStatus, ActivityType } from "@/lib/constants";
+import { act, renderHook } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { AccountSelectOption } from "../components/forms/fields";
+import type { ActivityFormValues } from "../config/activity-form-config";
+import { useActivityForm } from "./use-activity-form";
+
+const mutationMocks = vi.hoisted(() => ({
+  addMutateAsync: vi.fn(),
+  updateMutateAsync: vi.fn(),
+  saveMutateAsync: vi.fn(),
+  savePairMutateAsync: vi.fn(),
+  unlinkMutateAsync: vi.fn(),
+}));
+
+const adapterMocks = vi.hoisted(() => ({
+  getTransferPairForActivity: vi.fn(),
+  createOrdinaryActivity: vi.fn(),
+  updateOrdinaryActivity: vi.fn(),
+  loggerError: vi.fn(),
+}));
+
+const queryClientMocks = vi.hoisted(() => ({ invalidateQueries: vi.fn() }));
+
+vi.mock("@tanstack/react-query", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@tanstack/react-query")>();
+  return { ...actual, useQueryClient: () => queryClientMocks };
+});
+
+vi.mock("@/adapters", () => ({
+  getTransferPairForActivity: adapterMocks.getTransferPairForActivity,
+  createOrdinaryActivity: adapterMocks.createOrdinaryActivity,
+  updateOrdinaryActivity: adapterMocks.updateOrdinaryActivity,
+  logger: {
+    error: adapterMocks.loggerError,
+  },
+}));
+vi.mock("@/features/spending/adapters/settings", () => ({
+  getSpendingSettings: vi.fn().mockResolvedValue({ enabled: true, accountIds: ["acc-cash"] }),
+}));
+
+vi.mock("./use-activity-mutations", () => ({
+  useActivityMutations: () => ({
+    addActivityMutation: {
+      mutateAsync: mutationMocks.addMutateAsync,
+      isPending: false,
+      error: null,
+      isError: false,
+    },
+    updateActivityMutation: {
+      mutateAsync: mutationMocks.updateMutateAsync,
+      isPending: false,
+      error: null,
+      isError: false,
+    },
+    saveActivitiesMutation: {
+      mutateAsync: mutationMocks.saveMutateAsync,
+      isPending: false,
+      error: null,
+      isError: false,
+    },
+    saveInternalTransferPairMutation: {
+      mutateAsync: mutationMocks.savePairMutateAsync,
+      isPending: false,
+      error: null,
+      isError: false,
+    },
+    unlinkTransferActivitiesMutation: {
+      mutateAsync: mutationMocks.unlinkMutateAsync,
+      isPending: false,
+      error: null,
+      isError: false,
+    },
+  }),
+}));
+
+const accounts: AccountSelectOption[] = [
+  { value: "acc-usd", label: "USD Account", currency: "USD" },
+  { value: "acc-cad", label: "CAD Account", currency: "CAD" },
+  { value: "acc-other", label: "Other Cash", currency: "USD", accountType: "CASH" },
+];
+
+describe("useActivityForm", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mutationMocks.addMutateAsync.mockResolvedValue({});
+    mutationMocks.updateMutateAsync.mockResolvedValue({});
+    mutationMocks.saveMutateAsync.mockResolvedValue({});
+    mutationMocks.savePairMutateAsync.mockResolvedValue({});
+    mutationMocks.unlinkMutateAsync.mockResolvedValue({});
+    adapterMocks.getTransferPairForActivity.mockReset();
+    adapterMocks.loggerError.mockReset();
+    adapterMocks.createOrdinaryActivity.mockReset();
+    adapterMocks.createOrdinaryActivity.mockResolvedValue({
+      activity: {},
+      version: 1,
+      requestId: "req",
+      replayed: false,
+    });
+    adapterMocks.updateOrdinaryActivity.mockReset();
+    queryClientMocks.invalidateQueries.mockReset();
+  });
+
+  it("preserves user-selected currency for DEPOSIT", async () => {
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "DEPOSIT",
+      }),
+    );
+
+    const formData = {
+      accountId: "acc-usd",
+      activityDate: new Date("2026-02-01T10:00:00.000Z"),
+      amount: 1000,
+      comment: "test",
+      currency: "EUR",
+      fxRate: 1.25,
+    } as ActivityFormValues;
+
+    await act(async () => {
+      await result.current.handleSubmit(formData);
+    });
+
+    expect(mutationMocks.addMutateAsync).toHaveBeenCalledTimes(1);
+    expect(mutationMocks.addMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "acc-usd",
+        activityType: ActivityType.DEPOSIT,
+        currency: "EUR",
+      }),
+    );
+  });
+
+  it("falls back to account currency when DEPOSIT currency is empty", async () => {
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "DEPOSIT",
+      }),
+    );
+
+    const formData = {
+      accountId: "acc-usd",
+      activityDate: new Date("2026-02-01T10:00:00.000Z"),
+      amount: 1000,
+      comment: null,
+      currency: "   ",
+    } as ActivityFormValues;
+
+    await act(async () => {
+      await result.current.handleSubmit(formData);
+    });
+
+    expect(mutationMocks.addMutateAsync).toHaveBeenCalledTimes(1);
+    expect(mutationMocks.addMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "acc-usd",
+        activityType: ActivityType.DEPOSIT,
+        currency: "USD",
+      }),
+    );
+  });
+
+  it("preserves Draft review lifecycle when editing without explicit approval", async () => {
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "DEPOSIT",
+        activity: {
+          id: "draft-deposit",
+          accountId: "acc-usd",
+          activityType: ActivityType.DEPOSIT,
+          status: ActivityStatus.DRAFT,
+          needsReview: true,
+        },
+      }),
+    );
+
+    await act(async () => {
+      await result.current.handleSubmit({
+        accountId: "acc-usd",
+        activityDate: new Date("2026-02-01T10:00:00.000Z"),
+        amount: 1000,
+        comment: "corrected details",
+        currency: "USD",
+      } as ActivityFormValues);
+    });
+
+    const payload = mutationMocks.updateMutateAsync.mock.calls[0][0];
+    expect(payload).not.toHaveProperty("status");
+    expect(payload).not.toHaveProperty("needsReview");
+  });
+
+  it("attests every non-Draft form submission as reviewed", async () => {
+    // A form save is a review: the whole form is on screen when the user
+    // submits, so creates and Posted edits carry needsReview: false.
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "DEPOSIT",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.handleSubmit({
+        accountId: "acc-usd",
+        activityDate: new Date("2026-02-01T10:00:00.000Z"),
+        amount: 1000,
+        comment: null,
+        currency: "USD",
+      } as ActivityFormValues);
+    });
+
+    expect(mutationMocks.addMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ needsReview: false }),
+    );
+
+    const { result: editResult } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "DEPOSIT",
+        activity: {
+          id: "posted-deposit",
+          accountId: "acc-usd",
+          activityType: ActivityType.DEPOSIT,
+          status: ActivityStatus.POSTED,
+          needsReview: true,
+        },
+      }),
+    );
+
+    await act(async () => {
+      await editResult.current.handleSubmit({
+        accountId: "acc-usd",
+        activityDate: new Date("2026-02-01T10:00:00.000Z"),
+        amount: 1000,
+        comment: "reviewed in the form",
+        currency: "USD",
+      } as ActivityFormValues);
+    });
+
+    expect(mutationMocks.updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "posted-deposit", needsReview: false }),
+    );
+  });
+
+  it("forwards the custom-total attestation when editing a Posted trade", async () => {
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "BUY",
+        activity: {
+          id: "buy-posted",
+          accountId: "acc-usd",
+          activityType: ActivityType.BUY,
+          status: ActivityStatus.POSTED,
+          needsReview: false,
+        },
+      }),
+    );
+
+    await act(async () => {
+      await result.current.handleSubmit({
+        accountId: "acc-usd",
+        activityDate: new Date("2026-02-01T10:00:00.000Z"),
+        assetId: "AAPL",
+        quantity: 2,
+        unitPrice: 10,
+        fee: 1,
+        amount: 30,
+        needsReview: false,
+        currency: "USD",
+      } as unknown as ActivityFormValues);
+    });
+
+    const payload = mutationMocks.updateMutateAsync.mock.calls[0][0];
+    expect(payload.needsReview).toBe(false);
+    expect(payload.amount).toBe(30);
+  });
+
+  it("strips the custom-total attestation when editing a Draft trade", async () => {
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "BUY",
+        activity: {
+          id: "buy-draft",
+          accountId: "acc-usd",
+          activityType: ActivityType.BUY,
+          status: ActivityStatus.DRAFT,
+          needsReview: true,
+        },
+      }),
+    );
+
+    await act(async () => {
+      await result.current.handleSubmit({
+        accountId: "acc-usd",
+        activityDate: new Date("2026-02-01T10:00:00.000Z"),
+        assetId: "AAPL",
+        quantity: 2,
+        unitPrice: 10,
+        fee: 1,
+        amount: 30,
+        needsReview: false,
+        currency: "USD",
+      } as unknown as ActivityFormValues);
+    });
+
+    const payload = mutationMocks.updateMutateAsync.mock.calls[0][0];
+    expect(payload).not.toHaveProperty("needsReview");
+  });
+
+  it("preserves user-selected currency for external TRANSFER", async () => {
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "TRANSFER",
+      }),
+    );
+
+    const formData = {
+      isExternal: true,
+      direction: "in",
+      accountId: "acc-usd",
+      fromAccountId: "",
+      toAccountId: "",
+      activityDate: new Date("2026-02-01T10:00:00.000Z"),
+      transferMode: "cash",
+      amount: 250,
+      assetId: null,
+      quantity: null,
+      unitPrice: null,
+      comment: "external transfer",
+      currency: "EUR",
+      fxRate: 1.2,
+      subtype: null,
+      quoteMode: "MARKET",
+    } as ActivityFormValues;
+
+    await act(async () => {
+      await result.current.handleSubmit(formData);
+    });
+
+    expect(mutationMocks.addMutateAsync).toHaveBeenCalledTimes(1);
+    expect(mutationMocks.addMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "acc-usd",
+        activityType: ActivityType.TRANSFER_IN,
+        currency: "EUR",
+      }),
+    );
+  });
+
+  it("updates both existing legs when editing an internal securities transfer", async () => {
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "TRANSFER",
+        activity: {
+          id: "transfer-out-id",
+          activityType: ActivityType.TRANSFER_OUT,
+          transferOutId: "transfer-out-id",
+          transferInId: "transfer-in-id",
+        },
+      }),
+    );
+
+    const formData = {
+      isExternal: false,
+      direction: "out",
+      accountId: "",
+      fromAccountId: "acc-usd",
+      toAccountId: "acc-cad",
+      activityDate: new Date("2026-02-01T10:00:00.000Z"),
+      transferMode: "securities",
+      amount: undefined,
+      sourceAmount: undefined,
+      destinationAmount: undefined,
+      sourceCurrency: "USD",
+      destinationCurrency: "CAD",
+      assetId: "AAPL",
+      quantity: 10,
+      unitPrice: 100,
+      comment: "move 股",
+      currency: "USD",
+      fxRate: 1.35,
+      subtype: null,
+      quoteMode: "MARKET",
+    } as ActivityFormValues;
+
+    await act(async () => {
+      await result.current.handleSubmit(formData);
+    });
+
+    expect(mutationMocks.saveMutateAsync).toHaveBeenCalledTimes(1);
+    expect(mutationMocks.saveMutateAsync).toHaveBeenCalledWith({
+      updates: [
+        expect.objectContaining({
+          id: "transfer-out-id",
+          accountId: "acc-usd",
+          activityType: ActivityType.TRANSFER_OUT,
+          currency: "USD",
+        }),
+        expect.objectContaining({
+          id: "transfer-in-id",
+          accountId: "acc-cad",
+          activityType: ActivityType.TRANSFER_IN,
+          currency: "CAD",
+          fxRate: 1.35,
+        }),
+      ],
+    });
+  });
+
+  it("unlinks a valid grouped transfer before saving it as external", async () => {
+    adapterMocks.getTransferPairForActivity.mockResolvedValue({
+      transferOut: { id: "transfer-out-id" },
+      transferIn: { id: "transfer-in-id" },
+    });
+
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "TRANSFER",
+        activity: {
+          id: "transfer-in-id",
+          activityType: ActivityType.TRANSFER_IN,
+          accountId: "acc-cad",
+          sourceGroupId: "group-1",
+        },
+      }),
+    );
+
+    const formData = {
+      isExternal: true,
+      direction: "in",
+      accountId: "acc-cad",
+      fromAccountId: "",
+      toAccountId: "",
+      activityDate: new Date("2026-02-01T10:00:00.000Z"),
+      transferMode: "cash",
+      amount: 250,
+      assetId: null,
+      quantity: null,
+      unitPrice: null,
+      comment: "external transfer",
+      currency: "CAD",
+      fxRate: null,
+      subtype: null,
+      quoteMode: "MARKET",
+    } as ActivityFormValues;
+
+    await act(async () => {
+      await result.current.handleSubmit(formData);
+    });
+
+    expect(adapterMocks.getTransferPairForActivity).toHaveBeenCalledWith("transfer-in-id");
+    expect(mutationMocks.unlinkMutateAsync).toHaveBeenCalledWith({
+      activityAId: "transfer-out-id",
+      activityBId: "transfer-in-id",
+    });
+    expect(mutationMocks.updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "transfer-in-id",
+        accountId: "acc-cad",
+        activityType: ActivityType.TRANSFER_IN,
+        metadata: { flow: { is_external: true } },
+      }),
+    );
+    expect(mutationMocks.unlinkMutateAsync.mock.invocationCallOrder[0]).toBeLessThan(
+      mutationMocks.updateMutateAsync.mock.invocationCallOrder[0],
+    );
+  });
+
+  it("skips the unlink when the grouped transfer has no resolvable pair", async () => {
+    adapterMocks.getTransferPairForActivity.mockResolvedValue(null);
+
+    const { result } = renderHook(() =>
+      useActivityForm({
+        accounts,
+        selectedType: "TRANSFER",
+        activity: {
+          id: "transfer-in-id",
+          activityType: ActivityType.TRANSFER_IN,
+          accountId: "acc-cad",
+          sourceGroupId: "orphan-group",
+        },
+      }),
+    );
+
+    const formData = {
+      isExternal: true,
+      direction: "in",
+      accountId: "acc-cad",
+      fromAccountId: "",
+      toAccountId: "",
+      activityDate: new Date("2026-02-01T10:00:00.000Z"),
+      transferMode: "cash",
+      amount: 250,
+      assetId: null,
+      quantity: null,
+      unitPrice: null,
+      comment: "external transfer",
+      currency: "CAD",
+      fxRate: null,
+      subtype: null,
+      quoteMode: "MARKET",
+    } as ActivityFormValues;
+
+    await act(async () => {
+      await result.current.handleSubmit(formData);
+    });
+
+    expect(adapterMocks.getTransferPairForActivity).toHaveBeenCalledWith("transfer-in-id");
+    expect(mutationMocks.unlinkMutateAsync).not.toHaveBeenCalled();
+    expect(mutationMocks.updateMutateAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "transfer-in-id",
+        metadata: { flow: { is_external: true } },
+      }),
+    );
+  });
+});
+
+describe("useActivityForm ordinary branch", () => {
+  const cashAccounts: AccountSelectOption[] = [
+    { value: "acc-cash", label: "Cash", currency: "USD", accountType: "CASH" },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    adapterMocks.createOrdinaryActivity.mockResolvedValue({
+      activity: {},
+      version: 1,
+      requestId: "req",
+      replayed: false,
+    });
+  });
+
+  it("routes an in-scope DEPOSIT through the unified create with FX and notes", async () => {
+    const { result } = renderHook(() =>
+      useActivityForm({ accounts: cashAccounts, selectedType: "DEPOSIT" }),
+    );
+    await act(async () => {
+      await result.current.handleSubmit({
+        accountId: "acc-cash",
+        activityDate: new Date("2026-02-01T10:00:00.000Z"),
+        amount: 100,
+        currency: "USD",
+        fxRate: 1.5,
+        comment: "cash gift",
+      } as ActivityFormValues);
+    });
+    expect(adapterMocks.createOrdinaryActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: "acc-cash",
+        activityType: "DEPOSIT",
+        amount: "100",
+        fxRate: "1.5",
+        notes: "cash gift",
+        requestKey: expect.any(String),
+      }),
+    );
+    expect(mutationMocks.addMutateAsync).not.toHaveBeenCalled();
+    expect(queryClientMocks.invalidateQueries).toHaveBeenCalled();
+  });
+
+  it("starts a new key after the form reopens", async () => {
+    const { result, rerender } = renderHook(
+      ({ open }) => useActivityForm({ accounts: cashAccounts, selectedType: "DEPOSIT", open }),
+      { initialProps: { open: true } },
+    );
+    const submit = async () =>
+      act(async () => {
+        await result.current.handleSubmit({
+          accountId: "acc-cash",
+          activityDate: new Date("2026-02-01T10:00:00.000Z"),
+          amount: 100,
+          currency: "USD",
+        } as ActivityFormValues);
+      });
+    await submit();
+    const firstKey = adapterMocks.createOrdinaryActivity.mock.calls[0][0].requestKey;
+    rerender({ open: false });
+    rerender({ open: true });
+    await submit();
+    const secondKey = adapterMocks.createOrdinaryActivity.mock.calls[1][0].requestKey;
+    expect(secondKey).not.toBe(firstKey);
+  });
+
+  it("retries the frozen payload even after the account routes elsewhere", async () => {
+    adapterMocks.createOrdinaryActivity.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    const { result } = renderHook(() =>
+      useActivityForm({ accounts: cashAccounts, selectedType: "DEPOSIT" }),
+    );
+    await act(async () => {
+      await result.current.handleSubmit({
+        accountId: "acc-cash",
+        activityDate: new Date("2026-02-01T10:00:00.000Z"),
+        amount: 100,
+        currency: "USD",
+      } as ActivityFormValues);
+    });
+    // The user switches to an account outside spending and edits the amount.
+    await act(async () => {
+      await result.current.handleSubmit({
+        accountId: "acc-other",
+        activityDate: new Date("2026-02-01T10:00:00.000Z"),
+        amount: 250,
+        currency: "USD",
+      } as ActivityFormValues);
+    });
+    const first = adapterMocks.createOrdinaryActivity.mock.calls[0][0];
+    const second = adapterMocks.createOrdinaryActivity.mock.calls[1][0];
+    expect(second).toEqual(first);
+    // Never falls through to the legacy create endpoint.
+    expect(mutationMocks.addMutateAsync).not.toHaveBeenCalled();
+  });
+});

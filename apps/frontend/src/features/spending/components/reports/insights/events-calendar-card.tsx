@@ -1,0 +1,242 @@
+import { useMemo, useState, type FC } from "react";
+import { useTranslation } from "react-i18next";
+
+import { useBalancePrivacy } from "@/hooks/use-balance-privacy";
+import { cn, parseLocalDate } from "@/lib/utils";
+import {
+  Button,
+  Icons,
+  calendarDateFromLocalDate,
+  useAmountFormatting,
+  useDateFormatting,
+  useNumberFormatting,
+} from "@wealthfolio/ui";
+
+import { useMonthCalendar } from "../../../hooks/use-month-calendar";
+import { getZonedDateParts } from "../../../lib/timezone";
+import type { EventSpendingSummary } from "../../../types/event";
+import { useEventDialog } from "../../event-dialog-provider";
+import { getEventColors } from "./event-colors";
+
+const CARD_CLASS = "border-border/60 bg-card/40 rounded-2xl border p-4 backdrop-blur-xl";
+const LABEL_CLASS = "text-muted-foreground/70 text-[10px] font-normal uppercase tracking-[0.12em]";
+
+interface Props {
+  events: EventSpendingSummary[];
+  currency: string;
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+  rangeStart?: Date;
+  rangeEnd?: Date;
+  timezone?: string | null;
+}
+
+export const EventsCalendarCard: FC<Props> = ({
+  events,
+  currency,
+  selectedId,
+  onSelect,
+  rangeStart,
+  rangeEnd,
+  timezone,
+}) => {
+  const formatting = useAmountFormatting();
+  const dateFormatting = useDateFormatting();
+  const numberFormatting = useNumberFormatting();
+  const { t } = useTranslation();
+  const { isBalanceHidden } = useBalancePrivacy();
+  const { openEventDialog } = useEventDialog();
+  const today = useMemo(() => stripTime(new Date()), []);
+  const firstMonth = rangeStart ? monthInTimezone(rangeStart, timezone) : null;
+  const lastMonth = rangeEnd ? monthInTimezone(rangeEnd, timezone) : null;
+  const selectedStart = firstMonth
+    ? events.find((event) => event.eventId === selectedId)?.startDate
+    : undefined;
+  const eventMonth = selectedStart ? startOfMonth(parseLocalDate(selectedStart)) : null;
+  const initialMonth =
+    eventMonth && firstMonth
+      ? new Date(
+          Math.max(
+            firstMonth.getTime(),
+            Math.min(eventMonth.getTime(), lastMonth?.getTime() ?? Infinity),
+          ),
+        )
+      : (firstMonth ?? startOfMonth(today));
+  const rangeKey = `${rangeStart?.getTime() ?? ""}:${rangeEnd?.getTime() ?? ""}:${timezone ?? ""}:${selectedStart ?? ""}`;
+  const [cursorBinding, setCursorBinding] = useState(() => ({
+    rangeKey,
+    month: initialMonth,
+  }));
+  const cursor = cursorBinding.rangeKey === rangeKey ? cursorBinding.month : initialMonth;
+  const setCursor = (month: Date) => setCursorBinding({ rangeKey, month });
+
+  const { monthLabel, weekStartsOn, monthStart, monthEnd, weeks, monthEvents } = useMonthCalendar(
+    events,
+    cursor,
+  );
+  const dayNames = Array.from({ length: 7 }, (_, index) =>
+    dateFormatting.formatCalendarDate(calendarDateFromLocalDate(new Date(2026, 7, 2 + index)), {
+      weekday: "short",
+    }),
+  );
+  const orderedDayNames = [...dayNames.slice(weekStartsOn), ...dayNames.slice(0, weekStartsOn)];
+
+  return (
+    <div className={CARD_CLASS}>
+      {/* Header */}
+      <div className="mb-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-foreground text-base font-semibold tracking-tight">
+            {t("spending:eventsCard.title")}
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button
+              variant="outline"
+              size="icon"
+              aria-label={t("spending:calendar.previousMonth")}
+              disabled={!!firstMonth && cursor <= firstMonth}
+              className="h-7 w-7"
+              onClick={() => setCursor(addMonths(cursor, -1))}
+            >
+              <Icons.ChevronLeft className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              aria-label={t("spending:calendar.nextMonth")}
+              disabled={!!lastMonth && cursor >= lastMonth}
+              className="h-7 w-7"
+              onClick={() => setCursor(addMonths(cursor, 1))}
+            >
+              <Icons.ChevronRight className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
+              aria-label={t("spending:events.createEvent")}
+              className="ml-1 h-7 w-7 rounded-full"
+              onClick={() =>
+                openEventDialog({
+                  prefill: { startDate: monthStart, endDate: monthEnd },
+                  onCreated: (ev) => onSelect(ev.id),
+                })
+              }
+            >
+              <Icons.Plus className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        </div>
+        <div className="text-muted-foreground/80 mt-1 text-[11px]">
+          {t("spending:calendar.monthSummary", {
+            count: monthEvents.length,
+            month: monthLabel,
+          })}
+        </div>
+      </div>
+
+      {/* Day-of-week header */}
+      <div className={cn("grid grid-cols-7 text-center", LABEL_CLASS)}>
+        {orderedDayNames.map((name, index) => (
+          <div key={index} className="pb-1">
+            {name}
+          </div>
+        ))}
+      </div>
+
+      {/* Weeks */}
+      <div className="space-y-1">
+        {weeks.map((week, wi) => (
+          <div
+            key={wi}
+            className="grid auto-rows-min grid-cols-7 gap-y-0.5"
+            style={{ gridAutoRows: "min-content" }}
+          >
+            {/* Day numbers in row 1 */}
+            {week.days.map((day, di) => {
+              const isToday = sameDay(day, today);
+              const inMonth = day.getMonth() === cursor.getMonth();
+              return (
+                <div
+                  key={`d-${di}`}
+                  className={cn(
+                    "flex h-7 items-center justify-center text-[11px] tabular-nums",
+                    !inMonth && "text-muted-foreground/40",
+                    inMonth && "text-foreground/80",
+                    isToday && "font-semibold",
+                  )}
+                  style={{ gridColumn: di + 1, gridRow: 1 }}
+                >
+                  <span
+                    className={cn(
+                      isToday &&
+                        "ring-foreground/70 inline-flex h-5 w-5 items-center justify-center rounded-full ring-1",
+                    )}
+                  >
+                    {numberFormatting.formatDecimal(day.getDate(), { useGrouping: false })}
+                  </span>
+                </div>
+              );
+            })}
+            {/* Event bars on rows 2+ */}
+            {week.bars.map((bar) => {
+              const c = getEventColors(bar.event);
+              const isSel = selectedId === bar.event.eventId;
+              return (
+                <button
+                  type="button"
+                  key={`bar-${bar.event.eventId}`}
+                  onClick={() => onSelect(bar.event.eventId)}
+                  title={`${bar.event.eventName} · ${
+                    isBalanceHidden
+                      ? "••••"
+                      : formatting.formatAmount(bar.event.totalSpending, currency)
+                  }`}
+                  className={cn(
+                    "min-h-[16px] truncate rounded-sm px-1 text-left text-[10px] leading-[16px]",
+                    isSel ? "font-semibold" : "hover:brightness-95",
+                  )}
+                  style={{
+                    gridColumn: `${bar.startCol + 1} / ${bar.endCol + 2}`,
+                    gridRow: bar.lane + 2,
+                    background: c.fill,
+                    border: isSel ? `2px solid var(--foreground)` : `1px solid ${c.stroke}`,
+                    color: c.stroke,
+                  }}
+                >
+                  {bar.showName ? bar.event.eventName : " "}
+                </button>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// ─── Component-local date helpers (today highlight + month nav) ─────────
+
+function stripTime(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function startOfMonth(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), 1);
+}
+
+function monthInTimezone(date: Date, timezone?: string | null): Date {
+  const parts = getZonedDateParts(date, timezone);
+  return new Date(parts.year, parts.month - 1, 1);
+}
+
+function addMonths(d: Date, n: number): Date {
+  return new Date(d.getFullYear(), d.getMonth() + n, 1);
+}
+
+function sameDay(a: Date, b: Date): boolean {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}

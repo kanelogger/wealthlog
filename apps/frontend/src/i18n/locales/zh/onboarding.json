@@ -1,0 +1,80 @@
+{
+  "buttons": {
+    "continue": "继续",
+    "getStarted": "开始使用"
+  },
+  "steps": {
+    "chooseMode": {
+      "subtitle": "两种方式跟踪您的投资组合。",
+      "holdings": {
+        "title": "持仓",
+        "subtitle": "价值跟踪",
+        "badge": "最适合低维护的跟踪。",
+        "features": {
+          "netWorth": "净资产与配置",
+          "unrealizedPnl": "价值与未实现盈亏",
+          "priceBased": "基于价格的业绩",
+          "fastSetup": "快速轻量的设置"
+        },
+        "limit": "限制：不支持基于交易的 TWR/IRR。",
+        "note": "注意：需要维护持仓/仓位。"
+      },
+      "transactions": {
+        "title": "交易",
+        "subtitle": "业绩跟踪",
+        "badge": "最适合完整的业绩分析。",
+        "features": {
+          "totalReturn": "长期总回报",
+          "attribution": "收益与现金流归因",
+          "completeView": "最完整的业绩视图",
+          "brokerSync": "最适合搭配券商同步或 CSV 导入"
+        },
+        "limit": "限制：需要跟踪所有交易。",
+        "note": "注意：与券商同步后可自动完成。"
+      },
+      "footnote": "您可以为不同账户使用不同的模式。",
+      "learnMore": "了解更多"
+    },
+    "preferences": {
+      "subtitle": "只需几项偏好设置即可开始",
+      "currencyLabel": "货币",
+      "timezoneLabel": "时区",
+      "other": "其他",
+      "selectCurrency": "选择货币",
+      "selectTimezone": "选择时区",
+      "searchCurrenciesPlaceholder": "搜索货币……",
+      "searchTimezonesPlaceholder": "搜索时区……",
+      "noCurrenciesFound": "未找到货币",
+      "noTimezonesFound": "未找到时区",
+      "currencyRequired": "请选择一种基准货币。",
+      "timezoneRequired": "请选择一个时区。",
+      "languageLabel": "语言",
+      "formattingRegionLabel": "地区与格式",
+      "searchRegionsPlaceholder": "搜索地区……",
+      "noRegionsFound": "未找到地区",
+      "searchLanguagesPlaceholder": "搜索语言……",
+      "noLanguagesFound": "未找到语言"
+    }
+  },
+  "appearance": {
+    "subtitle": "自定义您的体验",
+    "themeLabel": "主题",
+    "fontLabel": "字体",
+    "themeLight": "浅色",
+    "themeDark": "深色",
+    "themeSystem": "跟随系统",
+    "themeLightPreviewAlt": "浅色主题预览",
+    "themeDarkPreviewAlt": "深色主题预览",
+    "themeSystemPreviewAlt": "系统主题预览",
+    "fontSample": "清晰地投资。",
+    "fonts": {
+      "monoLabel": "等宽",
+      "monoDescription": "技术感与精确",
+      "sansLabel": "无衬线",
+      "sansDescription": "简洁而现代",
+      "serifLabel": "衬线",
+      "serifDescription": "经典而优雅"
+    },
+    "navigationLabel": "导航"
+  }
+}

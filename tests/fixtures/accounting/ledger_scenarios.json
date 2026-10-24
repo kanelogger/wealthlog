@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "name": "cash purchase fully refunded",
+      "accountType": "CASH",
+      "activities": [
+        { "day": 1, "activityType": "DEPOSIT", "amount": "100.00" },
+        { "day": 2, "activityType": "WITHDRAWAL", "amount": "100.00" },
+        {
+          "day": 3,
+          "activityType": "CREDIT",
+          "subtype": "REFUND",
+          "isExternal": true,
+          "amount": "100.00"
+        }
+      ],
+      "expected": {
+        "endingCash": "100.00",
+        "netContribution": "100.00",
+        "gain": "0.00",
+        "netSpending": "0.00",
+        "income": "100.00"
+      }
+    },
+    {
+      "name": "cash purchase partially refunded",
+      "accountType": "CASH",
+      "activities": [
+        { "day": 1, "activityType": "DEPOSIT", "amount": "100.00" },
+        { "day": 2, "activityType": "WITHDRAWAL", "amount": "100.00" },
+        {
+          "day": 3,
+          "activityType": "CREDIT",
+          "subtype": "REFUND",
+          "isExternal": true,
+          "amount": "40.00"
+        }
+      ],
+      "expected": {
+        "endingCash": "40.00",
+        "netContribution": "40.00",
+        "gain": "0.00",
+        "netSpending": "60.00",
+        "income": "100.00"
+      }
+    },
+    {
+      "name": "cash purchase reimbursed",
+      "accountType": "CASH",
+      "activities": [
+        { "day": 1, "activityType": "DEPOSIT", "amount": "100.00" },
+        { "day": 2, "activityType": "WITHDRAWAL", "amount": "100.00" },
+        {
+          "day": 3,
+          "activityType": "CREDIT",
+          "subtype": "REIMBURSEMENT",
+          "isExternal": true,
+          "amount": "100.00"
+        }
+      ],
+      "expected": {
+        "endingCash": "100.00",
+        "netContribution": "100.00",
+        "gain": "0.00",
+        "netSpending": "0.00",
+        "income": "100.00"
+      }
+    },
+    {
+      "name": "cash fee correction is internal",
+      "accountType": "CASH",
+      "activities": [
+        { "day": 1, "activityType": "DEPOSIT", "amount": "100.00" },
+        { "day": 2, "activityType": "FEE", "amount": "20.00" },
+        {
+          "day": 3,
+          "activityType": "CREDIT",
+          "subtype": "REFUND",
+          "amount": "20.00"
+        }
+      ],
+      "expected": {
+        "endingCash": "100.00",
+        "netContribution": "100.00",
+        "gain": "0.00",
+        "netSpending": "0.00",
+        "income": "100.00"
+      }
+    },
+    {
+      "name": "cash interest is performance income",
+      "accountType": "CASH",
+      "activities": [
+        { "day": 1, "activityType": "DEPOSIT", "amount": "100.00" },
+        { "day": 2, "activityType": "INTEREST", "amount": "10.00" }
+      ],
+      "expected": {
+        "endingCash": "110.00",
+        "netContribution": "100.00",
+        "gain": "10.00",
+        "netSpending": "0.00",
+        "income": "110.00"
+      }
+    },
+    {
+      "name": "cash fee is a performance cost",
+      "accountType": "CASH",
+      "activities": [
+        { "day": 1, "activityType": "DEPOSIT", "amount": "100.00" },
+        { "day": 2, "activityType": "FEE", "amount": "10.00" }
+      ],
+      "expected": {
+        "endingCash": "90.00",
+        "netContribution": "100.00",
+        "gain": "-10.00",
+        "netSpending": "10.00",
+        "income": "100.00"
+      }
+    }
+  ]
+}

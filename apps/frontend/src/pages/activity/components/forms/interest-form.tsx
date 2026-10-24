@@ -1,0 +1,423 @@
+import { useSettings } from "@/hooks/use-settings";
+import { ACTIVITY_SUBTYPES, ActivityType } from "@/lib/constants";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { Button } from "@wealthfolio/ui/components/ui/button";
+import { Icons } from "@wealthfolio/ui/components/ui/icons";
+import { Label } from "@wealthfolio/ui/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@wealthfolio/ui/components/ui/radio-group";
+import { useEffect, useMemo, useRef } from "react";
+import { useTranslation } from "react-i18next";
+import { FormProvider, useForm, type Resolver } from "react-hook-form";
+import { z } from "zod";
+import type { TFunction } from "i18next";
+import { useActivityCurrency } from "../../hooks/use-activity-currency";
+import {
+  AccountSelect,
+  AdvancedOptionsSection,
+  AmountInput,
+  createValidatedSubmit,
+  DatePicker,
+  FormSection,
+  NotesInput,
+  QuantityInput,
+  SymbolSearch,
+  type AccountSelectOption,
+} from "./fields";
+import { calculateIncomeFinalAmount } from "@/lib/activity-final-amount";
+import { assetMetadataSchema } from "./schemas";
+
+// Non-UI sentinel for the "cash" income mode (not a DB value; internal only).
+const INCOME_MODE_CASH = "CASH";
+
+// Translated message helper (see buy-form for rationale).
+type MsgFn = TFunction | undefined;
+const msg = (t: MsgFn, key: string, en: string) => (t ? t(key) : en);
+
+// Zod schema factory for InterestForm validation. `t` optional so the exported
+// static schema keeps English messages (used by tests and type inference).
+export const createInterestFormSchema = (t?: TFunction) =>
+  z
+    .object({
+      accountId: z.string().min(1, {
+        message: msg(t, "activity:form.err_select_account", "Please select an account."),
+      }),
+      activityDate: z.date({
+        required_error: msg(t, "activity:form.err_select_date", "Please select a date."),
+      }),
+      symbol: z.string().optional().nullable(),
+      existingAssetId: z.string().nullable().optional(),
+      exchangeMic: z.string().nullable().optional(),
+      amount: z.coerce
+        .number({
+          required_error: msg(t, "activity:form.err_enter_amount", "Please enter an amount."),
+          invalid_type_error: msg(t, "activity:form.err_amount_number", "Amount must be a number."),
+        })
+        .min(0, {
+          message: msg(t, "activity:form.err_amount_non_negative", "Amount must be non-negative."),
+        }),
+      tax: z.coerce
+        .number({
+          invalid_type_error: msg(
+            t,
+            "activity:form.err_withholding_tax_number",
+            "Withholding tax must be a number.",
+          ),
+        })
+        .min(0, {
+          message: msg(
+            t,
+            "activity:form.err_withholding_tax_non_negative",
+            "Withholding tax must be non-negative.",
+          ),
+        })
+        .default(0),
+      // Positivity for unitPrice/quantity is enforced in superRefine, only for
+      // the staking-reward subtype: cash records persist 0 for these hidden
+      // fields, and a top-level .positive() would reject editing them.
+      unitPrice: z.coerce
+        .number({
+          invalid_type_error: msg(
+            t,
+            "activity:form.err_fmv_number",
+            "FMV per unit must be a number.",
+          ),
+        })
+        .optional(),
+      quantity: z.coerce
+        .number({
+          invalid_type_error: msg(
+            t,
+            "activity:form.err_received_quantity_number",
+            "Received quantity must be a number.",
+          ),
+        })
+        .optional(),
+      comment: z.string().optional().nullable(),
+      // Advanced options
+      currency: z.string().min(1, {
+        message: msg(t, "activity:form.err_currency_required", "Currency is required."),
+      }),
+      fxRate: z.coerce
+        .number({
+          invalid_type_error: msg(
+            t,
+            "activity:form.err_fxrate_number",
+            "FX Rate must be a number.",
+          ),
+        })
+        .positive({
+          message: msg(t, "activity:form.err_fxrate_positive", "FX Rate must be positive."),
+        })
+        .optional()
+        .nullable(),
+      subtype: z.string().optional().nullable(),
+      symbolQuoteCcy: z.string().nullable().optional(),
+      symbolInstrumentType: z.string().nullable().optional(),
+      assetMetadata: assetMetadataSchema,
+    })
+    .superRefine((data, ctx) => {
+      const isStakingReward = data.subtype === ACTIVITY_SUBTYPES.STAKING_REWARD;
+      if (!isStakingReward) return;
+
+      if (!data.symbol?.trim()) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["symbol"],
+          message: msg(t, "activity:form.err_reward_asset_required", "Reward asset is required."),
+        });
+      }
+      if (!data.quantity) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["quantity"],
+          message: msg(
+            t,
+            "activity:form.err_received_quantity_required",
+            "Received quantity is required.",
+          ),
+        });
+      } else if (data.quantity < 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["quantity"],
+          message: msg(
+            t,
+            "activity:form.err_received_quantity_gt_zero",
+            "Received quantity must be greater than 0.",
+          ),
+        });
+      }
+      if (!data.unitPrice) {
+        if (data.amount) return;
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["unitPrice"],
+          message: msg(
+            t,
+            "activity:form.err_enter_interest_or_fmv",
+            "Enter either interest amount or FMV per unit.",
+          ),
+        });
+      } else if (data.unitPrice < 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["unitPrice"],
+          message: msg(t, "activity:form.err_fmv_gt_zero", "FMV per unit must be greater than 0."),
+        });
+      }
+    });
+
+// Zod schema for InterestForm validation (English messages; used by tests).
+export const interestFormSchema = createInterestFormSchema();
+
+export type InterestFormValues = z.infer<typeof interestFormSchema>;
+
+interface InterestFormProps {
+  accounts: AccountSelectOption[];
+  defaultValues?: Partial<InterestFormValues>;
+  onSubmit: (data: InterestFormValues) => void | Promise<void>;
+  onCancel?: () => void;
+  isLoading?: boolean;
+  isEditing?: boolean;
+}
+
+export function InterestForm({
+  accounts,
+  defaultValues,
+  onSubmit,
+  onCancel,
+  isLoading = false,
+  isEditing = false,
+}: InterestFormProps) {
+  const { t } = useTranslation(["activity"]);
+  const { data: settings } = useSettings();
+  const baseCurrency = settings?.baseCurrency;
+
+  const schema = useMemo(() => createInterestFormSchema(t), [t]);
+  const fmvHelpText = t("activity:form.help_fmv_per_unit");
+
+  // Compute initial account and currency for defaultValues
+  const initialAccountId =
+    defaultValues?.accountId ?? (accounts.length === 1 ? accounts[0].value : "");
+  const initialAccount = accounts.find((a) => a.value === initialAccountId);
+  const initialCurrency = defaultValues?.currency?.trim() || initialAccount?.currency;
+
+  const form = useForm<InterestFormValues>({
+    resolver: zodResolver(schema) as Resolver<InterestFormValues>,
+    mode: "onSubmit", // Validate only on submit - works correctly with default values
+    defaultValues: {
+      accountId: initialAccountId,
+      activityDate: new Date(),
+      symbol: null,
+      amount: undefined,
+      tax: 0,
+      quantity: undefined,
+      unitPrice: undefined,
+      comment: null,
+      fxRate: undefined,
+      subtype: null,
+      ...defaultValues,
+      currency: defaultValues?.currency?.trim() || initialCurrency,
+    },
+  });
+
+  useActivityCurrency(form, accounts, { isEditing });
+
+  const { watch } = form;
+  const { getFieldState, getValues, setValue } = form;
+  const accountId = watch("accountId");
+  const currency = watch("currency");
+  const subtype = watch("subtype");
+  const quantity = watch("quantity");
+  const unitPrice = watch("unitPrice");
+  const amountWasEdited = useRef(false);
+  const isStakingReward = subtype === ACTIVITY_SUBTYPES.STAKING_REWARD;
+  const interestMode = subtype ?? INCOME_MODE_CASH;
+
+  useEffect(() => {
+    if (!isStakingReward) return;
+    const q = Number(quantity);
+    const p = Number(unitPrice);
+    if (amountWasEdited.current) return;
+    const computedAmount = calculateIncomeFinalAmount(
+      quantity,
+      unitPrice,
+      getValues("symbolInstrumentType"),
+    );
+    if (computedAmount === undefined) return;
+    const currentAmount = Number(getValues("amount"));
+    const quantityIsDirty = getFieldState("quantity").isDirty;
+    const unitPriceIsDirty = getFieldState("unitPrice").isDirty;
+    const shouldAutoSetAmount =
+      quantityIsDirty ||
+      unitPriceIsDirty ||
+      !(Number.isFinite(currentAmount) && currentAmount >= 0);
+    if (q > 0 && p > 0 && shouldAutoSetAmount) {
+      if (currentAmount !== computedAmount) {
+        setValue("amount", computedAmount, {
+          shouldDirty: quantityIsDirty || unitPriceIsDirty,
+          shouldValidate: false,
+        });
+      }
+    }
+  }, [getFieldState, getValues, isStakingReward, quantity, setValue, unitPrice]);
+
+  const handleInterestModeChange = (value: string) => {
+    setValue("subtype", value === INCOME_MODE_CASH ? null : value, {
+      shouldDirty: true,
+      shouldValidate: true,
+    });
+    if (value === INCOME_MODE_CASH) {
+      setValue("quantity", undefined, { shouldDirty: true, shouldValidate: false });
+      setValue("unitPrice", undefined, { shouldDirty: true, shouldValidate: false });
+    }
+  };
+
+  // Get account currency from selected account
+  const selectedAccount = useMemo(
+    () => accounts.find((a) => a.value === accountId),
+    [accounts, accountId],
+  );
+  const accountCurrency = selectedAccount?.currency;
+
+  const handleSubmit = createValidatedSubmit(form, async (data) => {
+    await onSubmit(data);
+  });
+
+  return (
+    <FormProvider {...form}>
+      <form onSubmit={handleSubmit} className="space-y-4">
+        <FormSection title={t("activity:form.section_asset_account")}>
+          {/* Optional Symbol (e.g., for bond interest) */}
+          <SymbolSearch
+            name="symbol"
+            label={
+              isStakingReward
+                ? t("activity:form.label_reward_asset")
+                : t("activity:form.label_symbol_optional")
+            }
+            exchangeMicName="exchangeMic"
+            currencyName="currency"
+            quoteCcyName="symbolQuoteCcy"
+            instrumentTypeName="symbolInstrumentType"
+            existingAssetIdName="existingAssetId"
+            assetMetadataName="assetMetadata"
+          />
+          <input type="hidden" {...form.register("assetMetadata.providerId")} />
+          <input type="hidden" {...form.register("assetMetadata.providerSymbol")} />
+          <input type="hidden" {...form.register("symbolQuoteCcy")} />
+          <input type="hidden" {...form.register("symbolInstrumentType")} />
+          <input type="hidden" {...form.register("existingAssetId")} />
+
+          <AccountSelect name="accountId" accounts={accounts} />
+          <DatePicker name="activityDate" label={t("activity:field_date")} />
+        </FormSection>
+
+        <FormSection title={t("activity:form.section_interest")}>
+          <div className="space-y-2">
+            <div className="text-sm font-medium">{t("activity:form.interest_type")}</div>
+            <RadioGroup
+              value={interestMode}
+              onValueChange={handleInterestModeChange}
+              className="flex flex-wrap gap-4"
+            >
+              <div className="flex items-center space-x-2">
+                <RadioGroupItem value={INCOME_MODE_CASH} id="interest-type-cash" />
+                <Label htmlFor="interest-type-cash" className="cursor-pointer text-sm font-normal">
+                  {t("activity:form.type_cash")}
+                </Label>
+              </div>
+              <div className="flex items-center space-x-2">
+                <RadioGroupItem
+                  value={ACTIVITY_SUBTYPES.STAKING_REWARD}
+                  id="interest-type-staking-reward"
+                />
+                <Label
+                  htmlFor="interest-type-staking-reward"
+                  className="cursor-pointer text-sm font-normal"
+                >
+                  {t("activity:form.type_staking_reward")}
+                </Label>
+              </div>
+            </RadioGroup>
+          </div>
+
+          {isStakingReward && (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <QuantityInput
+                name="quantity"
+                data-testid="received-quantity-input"
+                label={t("activity:form.label_received_quantity")}
+              />
+              <AmountInput
+                name="unitPrice"
+                data-testid="fmv-per-unit-input"
+                label={t("activity:form.label_fmv_per_unit")}
+                labelHelpText={fmvHelpText}
+                maxDecimalPlaces={4}
+                currency={currency}
+              />
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <AmountInput
+              name="amount"
+              data-testid={isStakingReward ? "interest-amount-input" : undefined}
+              label={
+                isStakingReward
+                  ? t("activity:form.label_interest_amount")
+                  : t("activity:form.label_amount")
+              }
+              currency={currency}
+              onValueChange={() => {
+                amountWasEdited.current = true;
+              }}
+            />
+            <AmountInput
+              name="tax"
+              label={t("activity:form.label_withholding_tax")}
+              currency={currency}
+            />
+          </div>
+        </FormSection>
+
+        {/* Advanced options (currency, FX rate) and notes, collapsed by default */}
+        <AdvancedOptionsSection
+          title={t("activity:form.section_advanced_notes")}
+          dashed
+          currencyName="currency"
+          fxRateName="fxRate"
+          activityType={ActivityType.INTEREST}
+          accountCurrency={accountCurrency}
+          baseCurrency={baseCurrency}
+          showSubtype={false}
+        >
+          <NotesInput
+            name="comment"
+            label={t("activity:form.label_notes")}
+            placeholder={t("activity:form.placeholder_note")}
+          />
+        </AdvancedOptionsSection>
+
+        {/* Action Buttons */}
+        <div className="flex justify-end gap-2">
+          {onCancel && (
+            <Button type="button" variant="outline" onClick={onCancel} disabled={isLoading}>
+              {t("activity:cancel")}
+            </Button>
+          )}
+          <Button type="submit" disabled={isLoading}>
+            {isLoading && <Icons.Spinner className="mr-2 h-4 w-4 animate-spin" />}
+            {isEditing ? (
+              <Icons.Check className="mr-2 h-4 w-4" />
+            ) : (
+              <Icons.Plus className="mr-2 h-4 w-4" />
+            )}
+            {isEditing ? t("activity:form.button_update") : t("activity:form.button_add_interest")}
+          </Button>
+        </div>
+      </form>
+    </FormProvider>
+  );
+}

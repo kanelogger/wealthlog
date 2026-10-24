@@ -1,0 +1,1135 @@
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
+
+use crate::{
+    agent_environment::ServerAgentEnvironment, auth::AuthManager, config::Config,
+    domain_events::WebDomainEventSink, events::EventBus, oidc::OidcManager,
+    secrets::build_secret_store,
+};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{fmt, EnvFilter};
+
+use wealthfolio_core::portfolio::coordinator::{
+    CoordinatorDeps, FactSources, PortfolioCoordinator, WindowCadence,
+};
+use wealthfolio_core::portfolio::projection::ProjectionStoreTrait;
+use wealthfolio_core::{
+    accounts::AccountService,
+    activities::{
+        rebuild_pending_final_cash_accounts, run_final_cash_migration,
+        ActivityService as CoreActivityService, ActivityServiceTrait,
+    },
+    assets::{
+        AlternativeAssetRepositoryTrait, AlternativeAssetService, AlternativeAssetServiceTrait,
+        AssetClassificationService, AssetLogoService, AssetLogoServiceTrait, AssetService,
+        AssetServiceTrait,
+    },
+    events::DomainEventSink,
+    fx::{FxService, FxServiceTrait},
+    health::{HealthService, HealthServiceTrait},
+    portfolio::allocation::{AllocationService, AllocationServiceTrait},
+    portfolio::income::{IncomeService, IncomeServiceTrait},
+    portfolio::{
+        holdings::{
+            holdings_valuation_service::HoldingsValuationService, HoldingsService,
+            HoldingsServiceTrait,
+        },
+        net_worth::{NetWorthService, NetWorthServiceTrait},
+        snapshot::{SnapshotService, SnapshotServiceTrait},
+        valuation::{ValuationService, ValuationServiceTrait},
+    },
+    portfolios::{PortfolioService, PortfolioServiceTrait},
+    quotes::{QuoteService, QuoteServiceTrait},
+    secrets::SecretStore,
+    settings::{SettingsService, SettingsServiceTrait},
+    taxonomies::{TaxonomyService, TaxonomyServiceTrait},
+};
+
+use wealthfolio_storage_sqlite::{
+    accounts::AccountRepository,
+    activities::ActivityRepository,
+    agent::{McpAuditRepository, PatRepository},
+    assets::{AlternativeAssetRepository, AssetLogoRepository, AssetRepository},
+    db::{self, write_actor},
+    fx::FxRepository,
+    health::HealthDismissalRepository,
+    market_data::{MarketDataRepository, QuoteSyncStateRepository},
+    portfolio::{snapshot::SnapshotRepository, valuation::ValuationRepository},
+    portfolios::PortfolioRepository,
+    settings::SettingsRepository,
+    taxonomies::TaxonomyRepository,
+};
+
+pub struct AppState {
+    pub(crate) mcp_sessions:
+        Arc<rmcp::transport::streamable_http_server::session::local::LocalSessionManager>,
+    pub(crate) profile_lifecycle: tokio::sync::Mutex<()>,
+    pub(crate) workers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pub(crate) writer: write_actor::WriteHandle,
+    pub(crate) writer_task: tokio::sync::Mutex<Option<write_actor::WriterTask>>,
+
+    pub backup_exports: crate::api::portable_backups::BackupExports,
+
+    /// Domain event sink for emitting events after mutations.
+    /// Note: The sink is used by services injected at construction time; this field
+    /// is kept for documentation and possible future access patterns.
+    #[allow(dead_code)]
+    pub domain_event_sink: Arc<dyn DomainEventSink>,
+    pub account_service: Arc<AccountService>,
+    pub settings_service: Arc<SettingsService>,
+    pub holdings_service: Arc<dyn HoldingsServiceTrait + Send + Sync>,
+    pub valuation_service: Arc<dyn ValuationServiceTrait + Send + Sync>,
+    pub portfolio_coordinator: Arc<PortfolioCoordinator>,
+    pub allocation_service: Arc<dyn AllocationServiceTrait + Send + Sync>,
+    pub quote_service: Arc<dyn QuoteServiceTrait + Send + Sync>,
+    pub base_currency: Arc<RwLock<String>>,
+    pub timezone: Arc<RwLock<String>>,
+    pub snapshot_service: Arc<dyn SnapshotServiceTrait + Send + Sync>,
+    /// Direct repository handle. No handler reads it currently — snapshot
+    /// access goes through `snapshot_service`. Retained for tests and any
+    /// future maintenance path that needs raw repository access.
+    #[allow(dead_code)]
+    pub snapshot_repository: Arc<SnapshotRepository>,
+    pub lots_repository: Arc<dyn wealthfolio_core::lots::LotRepositoryTrait + Send + Sync>,
+    pub performance_service:
+        Arc<dyn wealthfolio_core::portfolio::performance::PerformanceServiceTrait + Send + Sync>,
+    pub income_service: Arc<dyn IncomeServiceTrait + Send + Sync>,
+
+    pub fx_service: Arc<dyn FxServiceTrait + Send + Sync>,
+    pub activity_service: Arc<dyn ActivityServiceTrait + Send + Sync>,
+    pub asset_service: Arc<dyn AssetServiceTrait + Send + Sync>,
+    pub taxonomy_service: Arc<dyn TaxonomyServiceTrait + Send + Sync>,
+    pub net_worth_service: Arc<dyn NetWorthServiceTrait + Send + Sync>,
+    pub alternative_asset_service: Arc<dyn AlternativeAssetServiceTrait + Send + Sync>,
+    pub asset_logo_service: Arc<dyn AssetLogoServiceTrait + Send + Sync>,
+
+    pub data_root: String,
+    pub db_path: String,
+    /// Path plus key for the live database, so backups apply `PRAGMA key`.
+    pub db_access: db::DbAccess,
+    pub database_key: Arc<db::DbEncryptionKey>,
+    pub secret_store: Arc<dyn SecretStore>,
+    pub event_bus: EventBus,
+    pub auth: Option<Arc<AuthManager>>,
+    pub oidc: Option<Arc<OidcManager>>,
+
+    pub health_service: Arc<dyn HealthServiceTrait + Send + Sync>,
+
+    pub custom_provider_service: Arc<wealthfolio_core::custom_provider::CustomProviderService>,
+    pub portfolio_service: Arc<dyn PortfolioServiceTrait + Send + Sync>,
+    pub spending_settings_service: Arc<wealthfolio_spending::settings::SpendingSettingsService>,
+    pub cash_activity_service: Arc<wealthfolio_spending::cash_activities::CashActivityService>,
+    pub categorization_rules_service:
+        Arc<wealthfolio_spending::categorization_rules::CategorizationRulesService>,
+    pub events_service: Arc<wealthfolio_spending::events::EventsService>,
+    pub budget_service: Arc<wealthfolio_spending::budget::BudgetService>,
+    pub spending_analytics_service: Arc<wealthfolio_spending::analytics::AnalyticsService>,
+    pub spending_insight_service: Arc<wealthfolio_spending::insight::InsightService>,
+    pub allocation_target_service: Arc<
+        dyn wealthfolio_core::portfolio::allocation_targets::AllocationTargetServiceTrait
+            + Send
+            + Sync,
+    >,
+    pub drift_service:
+        Arc<dyn wealthfolio_core::portfolio::allocation_targets::DriftServiceTrait + Send + Sync>,
+    pub rebalance_service: Arc<
+        dyn wealthfolio_core::portfolio::allocation_targets::RebalanceServiceTrait + Send + Sync,
+    >,
+    pub pat_repository: Arc<PatRepository>,
+    pub mcp_audit_repository: Arc<McpAuditRepository>,
+    pub agent_environment: Arc<dyn wealthfolio_agent_tools::AgentEnvironment>,
+    /// Unified business use cases (activity writes, request replay, audit).
+    pub business_service: Arc<wealthfolio_business::BusinessService>,
+    /// Pending entries (待确认收支).
+    pub pending_service: Arc<wealthfolio_business::PendingService>,
+    /// Whether the `/mcp` endpoint is mounted (from `Config::mcp_enabled`).
+    pub mcp_enabled: bool,
+    /// Whether agent tool calls are audited (from `Config::mcp_audit_enabled`).
+    pub mcp_audit_enabled: bool,
+    /// Coarse listen classification for the public status endpoints. Never
+    /// carries the address, port or proxy details.
+    pub listen_scope: &'static str,
+    // Drop after the services; retained even when all SQLite connections are idle.
+    pub(crate) _database_owner: Arc<db::DatabaseOwner>,
+}
+
+pub(crate) fn read_runtime_setting(
+    lock: &RwLock<String>,
+    name: &'static str,
+) -> crate::error::ApiResult<String> {
+    lock.read().map(|value| value.clone()).map_err(|_| {
+        crate::error::ApiError::Internal(format!(
+            "{name} state is unavailable. Restart the server before continuing."
+        ))
+    })
+}
+
+impl AppState {
+    pub(crate) fn base_currency(&self) -> crate::error::ApiResult<String> {
+        read_runtime_setting(&self.base_currency, "Base currency")
+    }
+
+    pub(crate) fn timezone(&self) -> crate::error::ApiResult<String> {
+        read_runtime_setting(&self.timezone, "Timezone")
+    }
+}
+
+pub fn init_tracing() {
+    let log_format = std::env::var("WF_LOG_FORMAT").unwrap_or_else(|_| "text".to_string());
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let registry = tracing_subscriber::registry().with(filter);
+
+    if log_format.eq_ignore_ascii_case("json") {
+        registry
+            .with(fmt::layer().json().with_current_span(false))
+            .init();
+    } else {
+        registry
+            .with(fmt::layer().with_target(true).with_line_number(true))
+            .init();
+    }
+}
+
+/// Supplies the database key derived from `WF_SECRET_KEY`.
+///
+/// Nothing is stored: the key exists whenever the master secret does, which is
+/// what makes a server database portable across any instance sharing it.
+struct DerivedKeyProvider {
+    key: [u8; 32],
+}
+
+impl wealthfolio_storage_sqlite::db::KeyProvider for DerivedKeyProvider {
+    fn existing(&self) -> wealthfolio_core::errors::Result<Option<db::DbEncryptionKey>> {
+        Ok(Some(db::DbEncryptionKey::from_bytes(&self.key)))
+    }
+
+    fn create(&self) -> wealthfolio_core::errors::Result<db::DbEncryptionKey> {
+        Ok(db::DbEncryptionKey::from_bytes(&self.key))
+    }
+}
+
+/// Opens the database and refuses to start when its state disagrees with
+/// `WF_DB_REQUIRE_ENCRYPTION`.
+///
+/// Fail closed in both directions. Booting an encrypted database with the flag
+/// unset would run a configuration the operator did not ask for; booting a
+/// plaintext database with the flag set would claim encryption the file does not
+/// have. Neither should be papered over.
+fn open_database(config: &Config, db_path: &str) -> anyhow::Result<db::DbAccess> {
+    let provider = DerivedKeyProvider {
+        key: config.database_key,
+    };
+    let policy = if config.db_encryption_required {
+        db::EncryptionPolicy::Encrypted
+    } else {
+        db::EncryptionPolicy::Plaintext
+    };
+
+    // build_state holds DatabaseOwner before reaching here, excluding other
+    // Wealthfolio instances using this database. Clear abandoned snapshot
+    // staging before this process starts operations that could create live files.
+    db::purge_scratch_dir(std::path::Path::new(db_path), database_root(db_path));
+
+    let access = db::bootstrap(db_path, &provider, policy)?;
+
+    match (access.is_encrypted(), config.db_encryption_required) {
+        (true, false) => anyhow::bail!(
+"Refusing to start: the database at {} is encrypted but WF_DB_REQUIRE_ENCRYPTION is not \
+ enabled.\n\n\
+ Set WF_DB_REQUIRE_ENCRYPTION=1 to start, or decrypt the database with:\n  \
+ wealthfolio-server db decrypt",
+access.path()
+),
+        (false, true) => anyhow::bail!(
+            "Refusing to start: WF_DB_REQUIRE_ENCRYPTION is enabled but the database at {} is not \
+ encrypted.\n\n\
+ Encrypt it with:\n  wealthfolio-server db encrypt\n\n\
+ Or unset WF_DB_REQUIRE_ENCRYPTION to keep running unencrypted.",
+            access.path()
+        ),
+        _ => Ok(access),
+    }
+}
+
+/// Converts the database between plaintext and encrypted, offline.
+///
+/// Deliberately not an API call: replacing the database file requires that
+/// nothing is connected to it, which on the server means the process is not
+/// serving. Run it with the server stopped.
+pub fn run_database_maintenance(encrypt: bool) -> anyhow::Result<()> {
+    run_profile_database_maintenance(encrypt, None)
+}
+pub fn run_profile_database_maintenance(
+    encrypt: bool,
+    profile: Option<uuid::Uuid>,
+) -> anyhow::Result<()> {
+    // Deliberately not `Config::from_env()`: that enforces the *listening*
+    // server's policy (auth required off loopback, CORS, MCP) and panics when it
+    // is unmet. Converting the database opens no socket, so it must not be
+    // gated by any of it — it needs the master secret and the path, nothing more.
+    dotenvy::dotenv().ok();
+
+    let raw_secret_key = crate::config::load_secret_key(
+        std::env::var_os("WF_SECRET_KEY"),
+        std::env::var_os("WF_SECRET_KEY_FILE"),
+    )?;
+    let db_path = crate::config::database_path_from_env()?;
+
+    let (db_path, database_key, _registry) =
+        crate::profiles::offline_database(db_path, &raw_secret_key, profile)?;
+    let provider = DerivedKeyProvider { key: database_key };
+
+    // Converting a database that is not there is never what the operator meant.
+    // Without this check `bootstrap` would happily *create* one — encrypted,
+    // under the encrypt policy — and the run would report "already encrypted;
+    // nothing to do", leaving an empty database at a mistyped WF_DB_PATH or on
+    // an unmounted volume while the real data sits untouched elsewhere.
+    let resolved_path = db_path;
+    if !std::path::Path::new(&resolved_path).exists() {
+        anyhow::bail!(
+            "No database found at {resolved_path}.\n\n\
+ Check WF_DB_PATH and that the data volume is mounted. Nothing was created."
+        );
+    }
+
+    // The policy only decides how a database that does not exist yet is created,
+    // so take it from the operation being asked for; an existing file is always
+    // resolved by probing.
+    let policy = if encrypt {
+        db::EncryptionPolicy::Encrypted
+    } else {
+        db::EncryptionPolicy::Plaintext
+    };
+    let database_owner = db::DatabaseOwner::acquire(&resolved_path)?;
+    let current = db::bootstrap(&resolved_path, &provider, policy)?;
+
+    if current.is_encrypted() == encrypt {
+        tracing::info!(
+            "Database at {} is already {}; nothing to do",
+            current.path(),
+            if encrypt { "encrypted" } else { "plaintext" }
+        );
+        return Ok(());
+    }
+
+    let data_root = database_root(current.path()).to_string_lossy().into_owned();
+    // DatabaseOwner prevents this offline command from running alongside a
+    // serving instance for the same database. Clean abandoned staging before
+    // starting our own backup and conversion, whose files must remain intact.
+    db::purge_scratch_dir(
+        std::path::Path::new(current.path()),
+        std::path::Path::new(&data_root),
+    );
+    // Migrations must be current before the file is copied: the candidate is a
+    // logical copy of whatever schema the source has.
+    // Pre-migration backups retain source protection, including plaintext before encryption.
+    current.run_migrations_with_backup(&data_root, &database_owner)?;
+
+    let request = if encrypt {
+        db::maintenance::MaintenanceRequest::Enable {
+            key: Arc::new(db::DbEncryptionKey::from_bytes(&database_key)),
+        }
+    } else {
+        db::maintenance::MaintenanceRequest::Disable
+    };
+
+    let outcome = db::maintenance::run(&data_root, &current, request, &database_owner)?;
+    tracing::info!(
+        "Database at {} is now {}",
+        outcome.access.path(),
+        if outcome.access.is_encrypted() {
+            "encrypted"
+        } else {
+            "plaintext"
+        }
+    );
+    if let Some(backup) = outcome.pre_operation_backup {
+        tracing::info!("Pre-operation backup retained at {}", backup);
+    }
+    Ok(())
+}
+
+/// Default location of the database when `WF_DB_PATH` is unset.
+pub const DEFAULT_DB_PATH: &str = "./db/app.db";
+
+fn database_root(db_path: &str) -> &std::path::Path {
+    std::path::Path::new(db_path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+}
+
+pub async fn build_state(config: &Config) -> anyhow::Result<Arc<AppState>> {
+    let root = database_root(&config.db_path);
+    let file_store = build_secret_store(
+        std::env::var("WF_SECRET_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| root.join("secrets.json")),
+        Some(config.secrets_encryption_key),
+        Some(&config.raw_secret_key),
+    )
+    .map_err(anyhow::Error::new)?;
+    if !std::path::Path::new(&config.db_path).exists() {
+        let existing_data = root.join("profiles.json").exists()
+            || root.join("profiles.json.bak").exists()
+            || std::path::PathBuf::from(format!("{}.encrypted", config.db_path)).exists()
+            || root
+                .join("backups")
+                .read_dir()
+                .is_ok_and(|mut entries| entries.next().is_some());
+        let credentials = [
+            wealthfolio_core::secrets::CLOUD_REFRESH_TOKEN_KEY,
+            wealthfolio_core::secrets::SYNC_IDENTITY_KEY,
+        ]
+        .iter()
+        .any(|key| file_store.get_secret(key).ok().flatten().is_some());
+        anyhow::ensure!(!existing_data && !credentials,"The default database is missing. Restore its file before starting; existing profiles, credentials and backups were preserved.");
+    }
+    build_profile_state(config, Arc::new(file_store)).await
+}
+
+pub(crate) async fn build_profile_state(
+    config: &Config,
+    secret_store: Arc<dyn SecretStore>,
+) -> anyhow::Result<Arc<AppState>> {
+    std::fs::create_dir_all(database_root(&config.db_path))?;
+    let database_owner = Arc::new(db::DatabaseOwner::acquire(&config.db_path)?);
+    match initialize_profile_state(config, secret_store, &database_owner).await {
+        Ok(state) => Ok(state),
+        Err(error) => match wait_for_startup_cleanup(&database_owner).await {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(error.context(cleanup_error)),
+        },
+    }
+}
+
+async fn wait_for_startup_cleanup(owner: &Arc<db::DatabaseOwner>) -> anyhow::Result<()> {
+    // Dropping an r2d2 pool does not join its in-flight connection threads.
+    // Keep ownership until those threads finish, so the next startup can retry.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while Arc::strong_count(owner) > 1 {
+        anyhow::ensure!(
+tokio::time::Instant::now() < deadline,
+"Profile startup cleanup is pending; background database connections are still finishing"
+);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+async fn initialize_profile_state(
+    config: &Config,
+    secret_store: Arc<dyn SecretStore>,
+    database_owner: &Arc<db::DatabaseOwner>,
+) -> anyhow::Result<Arc<AppState>> {
+    let db_access = open_database(config, &config.db_path)?;
+    let db_path = db_access.path().to_string();
+    let data_root_path = database_root(&db_path).to_path_buf();
+
+    let migration_access = db_access.clone();
+    let migration_owner = database_owner.clone();
+    let backup_root = data_root_path.to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || {
+        migration_access.run_migrations_with_backup(&backup_root, &migration_owner)
+    })
+    .await??;
+
+    let pool = db_access.create_pool_with_owner(database_owner.clone())?;
+    let (writer, writer_task) = write_actor::spawn_writer_with_task((*pool).clone())?;
+
+    let mut writer_task = Some(writer_task);
+    let mut workers = Vec::new();
+    // Drop partially constructed services before draining the writer on failure.
+    // Retain the owner outside this future until cleanup has finished.
+    let result: anyhow::Result<Arc<AppState>> = async {
+// Domain event sink - two-phase initialization to handle circular dependencies
+// Phase 1: Create the sink (can receive events immediately, buffers until worker starts)
+let domain_event_sink = Arc::new(WebDomainEventSink::new());
+
+let fx_repo = Arc::new(FxRepository::new(pool.clone(), writer.clone()));
+let fx_service =
+Arc::new(FxService::new(fx_repo.clone()).with_event_sink(domain_event_sink.clone()));
+fx_service.initialize()?;
+
+let settings_repo = Arc::new(SettingsRepository::new(pool.clone(), writer.clone()));
+let settings_service = Arc::new(SettingsService::new(
+settings_repo.clone(),
+fx_service.clone(),
+));
+let settings = settings_service.get_settings()?;
+let base_currency = Arc::new(RwLock::new(settings.base_currency));
+let timezone = Arc::new(RwLock::new(settings.timezone.clone()));
+
+let spending_settings_repo: Arc<
+dyn wealthfolio_spending::settings::SpendingSettingsRepositoryTrait,
+> = Arc::new(
+wealthfolio_storage_sqlite::spending::settings::SpendingSettingsRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let spending_settings_service = Arc::new(
+wealthfolio_spending::settings::SpendingSettingsService::new(spending_settings_repo),
+);
+
+let activity_assignments_repo: Arc<
+dyn wealthfolio_spending::activity_assignments::ActivityTaxonomyAssignmentRepositoryTrait,
+> = Arc::new(
+wealthfolio_storage_sqlite::spending::activity_assignments::ActivityTaxonomyAssignmentRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+// Activity ↔ event tag join table (see spending/activity_events).
+let activity_events_repo: Arc<
+dyn wealthfolio_spending::activity_events::ActivityEventsRepositoryTrait,
+> = Arc::new(
+wealthfolio_storage_sqlite::spending::activity_events::ActivityEventsRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let activity_splits_repo: Arc<
+dyn wealthfolio_spending::activity_splits::ActivitySplitRepositoryTrait,
+> = Arc::new(
+wealthfolio_storage_sqlite::spending::activity_splits::ActivitySplitRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let activity_taxonomy_assignment_service = Arc::new(
+wealthfolio_spending::activity_assignments::ActivityTaxonomyAssignmentService::new(
+activity_assignments_repo.clone(),
+),
+);
+
+let account_repo = Arc::new(AccountRepository::new(pool.clone(), writer.clone()));
+
+// Additional repositories/services for web API
+let asset_repository = Arc::new(AssetRepository::new(pool.clone(), writer.clone()));
+let market_data_repository = Arc::new(MarketDataRepository::new(pool.clone(), writer.clone()));
+let activity_repository = Arc::new(ActivityRepository::new(pool.clone(), writer.clone()));
+let business_store = Arc::new(wealthfolio_business::BusinessStore::new(
+    pool.clone(),
+    writer.clone(),
+));
+let snapshot_repository = Arc::new(SnapshotRepository::new(pool.clone(), writer.clone()));
+let lots_repository = Arc::new(wealthfolio_storage_sqlite::lots::LotsRepository::new(
+pool.clone(),
+writer.clone(),
+));
+let quote_sync_state_repository =
+Arc::new(QuoteSyncStateRepository::new(pool.clone(), writer.clone()));
+
+let account_service = Arc::new(AccountService::new(
+account_repo.clone(),
+fx_service.clone(),
+base_currency.clone(),
+domain_event_sink.clone(),
+asset_repository.clone(),
+quote_sync_state_repository.clone(),
+));
+let custom_provider_repository = Arc::new(
+wealthfolio_storage_sqlite::custom_provider::CustomProviderSqliteRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let quote_service: Arc<dyn QuoteServiceTrait + Send + Sync> = Arc::new(
+QuoteService::new_with_custom_provider(
+market_data_repository.clone(),  // QuoteStore
+quote_sync_state_repository.clone(), // SyncStateStore
+market_data_repository.clone(),  // ProviderSettingsStore
+asset_repository.clone(),// AssetRepositoryTrait
+activity_repository.clone(), // ActivityRepositoryTrait
+secret_store.clone(),
+Some(custom_provider_repository.clone()),
+)
+.await?
+.with_event_sink(domain_event_sink.clone()),
+);
+let custom_provider_service = Arc::new(
+wealthfolio_core::custom_provider::CustomProviderService::new(
+custom_provider_repository.clone(),
+secret_store.clone(),
+),
+);
+
+let portfolio_repository = Arc::new(PortfolioRepository::new(pool.clone(), writer.clone()));
+let portfolio_service: Arc<dyn PortfolioServiceTrait + Send + Sync> = Arc::new(
+PortfolioService::new(portfolio_repository, account_repo.clone()),
+);
+
+// Create taxonomy service for auto-classification
+let taxonomy_repository = Arc::new(TaxonomyRepository::new(pool.clone(), writer.clone()));
+let taxonomy_service = Arc::new(
+TaxonomyService::new(taxonomy_repository).with_event_sink(domain_event_sink.clone()),
+);
+
+let asset_service = Arc::new(
+AssetService::with_taxonomy_service(
+asset_repository.clone(),
+quote_service.clone(),
+taxonomy_service.clone(),
+)?
+.with_event_sink(domain_event_sink.clone()),
+);
+let snapshot_service = Arc::new(
+SnapshotService::new(
+timezone.clone(),
+account_repo.clone(),
+snapshot_repository.clone(),
+activity_repository.clone(),
+)
+.with_event_sink(domain_event_sink.clone()),
+);
+
+let valuation_repository = Arc::new(ValuationRepository::new(pool.clone(), writer.clone()));
+let projection_store: Arc<dyn ProjectionStoreTrait> = Arc::new(
+wealthfolio_storage_sqlite::portfolio::projection::ProjectionStore::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let fact_sources = FactSources {
+accounts: account_repo.clone(),
+activities: activity_repository.clone(),
+assets: asset_repository.clone(),
+quotes: quote_service.clone(),
+fx_rates: fx_repo.clone(),
+snapshots: snapshot_repository.clone(),
+projections: projection_store.clone(),
+};
+let valuation_service = Arc::new(ValuationService::new(
+valuation_repository.clone(),
+fact_sources.clone(),
+lots_repository.clone(),
+timezone.clone(),
+));
+
+// Alternative asset repository for alternative assets operations
+let alternative_asset_repository: Arc<dyn AlternativeAssetRepositoryTrait + Send + Sync> =
+Arc::new(AlternativeAssetRepository::new(
+pool.clone(),
+writer.clone(),
+));
+
+let net_worth_service: Arc<dyn NetWorthServiceTrait + Send + Sync> = Arc::new(
+NetWorthService::new(
+base_currency.clone(),
+account_repo.clone(),
+asset_repository.clone(),
+snapshot_service.clone(),
+quote_service.clone(),
+valuation_repository.clone(),
+fx_service.clone(),
+)
+.with_loan_payments(alternative_asset_repository.clone(), timezone.clone()),
+);
+
+let holdings_valuation_service = Arc::new(HoldingsValuationService::new_with_timezone(
+fx_service.clone(),
+quote_service.clone(),
+timezone.clone(),
+));
+let classification_service =
+Arc::new(AssetClassificationService::new(taxonomy_service.clone()));
+let holdings_service = Arc::new(
+HoldingsService::new_with_timezone(
+asset_service.clone(),
+snapshot_service.clone(),
+holdings_valuation_service.clone(),
+classification_service.clone(),
+timezone.clone(),
+)
+.with_income_dependencies(
+activity_repository.clone(),
+fx_service.clone(),
+projection_store.clone(),
+)
+.with_lot_repository(lots_repository.clone()),
+);
+
+let allocation_service: Arc<dyn AllocationServiceTrait + Send + Sync> = Arc::new(
+AllocationService::new(holdings_service.clone(), taxonomy_service.clone())
+.with_account_service(account_service.clone()),
+);
+
+let allocation_target_repository = Arc::new(
+wealthfolio_storage_sqlite::portfolio::allocation_targets::AllocationTargetRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let allocation_target_service: Arc<
+dyn wealthfolio_core::portfolio::allocation_targets::AllocationTargetServiceTrait
++ Send
++ Sync,
+> = Arc::new(
+wealthfolio_core::portfolio::allocation_targets::AllocationTargetService::new(
+allocation_target_repository,
+taxonomy_service.clone(),
+),
+);
+let drift_service: Arc<
+dyn wealthfolio_core::portfolio::allocation_targets::DriftServiceTrait + Send + Sync,
+> = Arc::new(
+wealthfolio_core::portfolio::allocation_targets::DriftService::new(
+allocation_target_service.clone(),
+allocation_service.clone(),
+)
+.with_holdings_service(holdings_service.clone())
+.with_taxonomy_service(taxonomy_service.clone()),
+);
+let rebalance_service: Arc<
+dyn wealthfolio_core::portfolio::allocation_targets::RebalanceServiceTrait + Send + Sync,
+> = Arc::new(
+wealthfolio_core::portfolio::allocation_targets::RebalanceService::new(
+allocation_target_service.clone(),
+drift_service.clone(),
+allocation_service.clone(),
+holdings_service.clone(),
+),
+);
+
+let performance_service = Arc::new(
+wealthfolio_core::portfolio::performance::PerformanceService::new(
+base_currency.clone(),
+timezone.clone(),
+fact_sources.clone(),
+valuation_repository.clone(),
+lots_repository.clone(),
+),
+);
+
+let income_service = Arc::new(IncomeService::new_with_timezone(
+fx_service.clone(),
+activity_repository.clone(),
+base_currency.clone(),
+timezone.clone(),
+));
+
+let activity_service: Arc<dyn ActivityServiceTrait + Send + Sync> = Arc::new(
+CoreActivityService::new(
+activity_repository.clone(),
+account_service.clone(),
+asset_service.clone(),
+fx_service.clone(),
+quote_service.clone(),
+)
+.with_timezone(timezone.clone())
+.with_event_sink(domain_event_sink.clone()),
+);
+let final_cash_migration = run_final_cash_migration(
+settings_service.as_ref(),
+activity_repository.as_ref(),
+account_service.as_ref(),
+asset_service.as_ref(),
+)
+.await?;
+let portfolio_coordinator = Arc::new(PortfolioCoordinator::new(CoordinatorDeps {
+base_currency: base_currency.clone(),
+timezone: timezone.clone(),
+sources: fact_sources.clone(),
+fx_service: fx_service.clone(),
+snapshot_service: snapshot_service.clone(),
+projections: projection_store,
+lots: lots_repository.clone(),
+window_cadence: WindowCadence::Year,
+}));
+
+// Spending: events + event_types
+let event_types_repo: Arc<dyn wealthfolio_spending::events::EventTypesRepositoryTrait> =
+Arc::new(
+wealthfolio_storage_sqlite::spending::events::EventTypesRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let events_repo: Arc<dyn wealthfolio_spending::events::EventsRepositoryTrait> = Arc::new(
+wealthfolio_storage_sqlite::spending::events::EventsRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let events_service = Arc::new(wealthfolio_spending::events::EventsService::new(
+event_types_repo,
+events_repo,
+activity_repository.clone(),
+activity_events_repo.clone(),
+));
+
+// Spending: cash_activity_service depends on activity_repository + spending settings
+//  + the assignments service (so search() can batch-fetch assignments and apply
+//  status/category filters server-side).
+let cash_activity_service = Arc::new(
+wealthfolio_spending::cash_activities::CashActivityService::new(
+activity_repository.clone(),
+account_repo.clone(),
+spending_settings_service.clone(),
+activity_taxonomy_assignment_service.clone(),
+activity_splits_repo.clone(),
+activity_events_repo.clone(),
+events_service.clone(),
+fx_service.clone(),
+taxonomy_service.clone(),
+),
+);
+
+// Spending: categorization_rules
+let categorization_rules_repo: Arc<
+dyn wealthfolio_spending::categorization_rules::CategorizationRulesRepositoryTrait,
+> = Arc::new(
+wealthfolio_storage_sqlite::spending::categorization_rules::CategorizationRulesRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let categorization_rules_service = Arc::new(
+wealthfolio_spending::categorization_rules::CategorizationRulesService::new(
+categorization_rules_repo,
+activity_repository.clone(),
+activity_taxonomy_assignment_service.clone(),
+),
+);
+
+// Spending: budget
+let budget_repo: Arc<dyn wealthfolio_spending::budget::BudgetRepositoryTrait> = Arc::new(
+wealthfolio_storage_sqlite::spending::budget::BudgetRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let budget_service = Arc::new(wealthfolio_spending::budget::BudgetService::new(
+budget_repo,
+activity_repository.clone(),
+account_repo.clone(),
+activity_assignments_repo.clone(),
+activity_splits_repo.clone(),
+spending_settings_service.clone(),
+taxonomy_service.clone(),
+fx_service.clone(),
+));
+
+// Spending: analytics
+let analytics_assignment_repo: Arc<
+dyn wealthfolio_spending::activity_assignments::ActivityTaxonomyAssignmentRepositoryTrait,
+> = Arc::new(
+wealthfolio_storage_sqlite::spending::activity_assignments::ActivityTaxonomyAssignmentRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let spending_analytics_service =
+Arc::new(wealthfolio_spending::analytics::AnalyticsService::new(
+activity_repository.clone(),
+account_repo.clone(),
+analytics_assignment_repo.clone(),
+activity_splits_repo.clone(),
+spending_settings_service.clone(),
+taxonomy_service.clone(),
+events_service.clone(),
+fx_service.clone(),
+activity_events_repo.clone(),
+));
+
+// Spending: reconciled period insight (powers the Spending Insight dashboard).
+let spending_insight_repo: Arc<dyn wealthfolio_spending::budget::BudgetRepositoryTrait> =
+Arc::new(
+wealthfolio_storage_sqlite::spending::budget::BudgetRepository::new(
+pool.clone(),
+writer.clone(),
+),
+);
+let spending_insight_service = Arc::new(wealthfolio_spending::insight::InsightService::new(
+spending_insight_repo,
+activity_repository.clone(),
+account_repo.clone(),
+analytics_assignment_repo,
+activity_splits_repo,
+spending_settings_service.clone(),
+taxonomy_service.clone(),
+fx_service.clone(),
+));
+
+
+// Alternative asset service (delegates to core service)
+let alternative_asset_service: Arc<dyn AlternativeAssetServiceTrait + Send + Sync> = Arc::new(
+AlternativeAssetService::new(
+alternative_asset_repository.clone(),
+asset_repository.clone(),
+quote_service.clone(),
+)
+.with_timezone(timezone.clone())
+.with_event_sink(domain_event_sink.clone()),
+);
+
+// Custom asset logo overrides
+let asset_logo_service: Arc<dyn AssetLogoServiceTrait + Send + Sync> =
+Arc::new(AssetLogoService::new(
+Arc::new(AssetLogoRepository::new(pool.clone(), writer.clone())),
+asset_repository.clone(),
+));
+
+
+
+// Determine data root directory (parent of DB path)
+let data_root = data_root_path.to_string_lossy().to_string();
+
+
+
+
+// Health service for portfolio health diagnostics
+let health_dismissal_repository =
+Arc::new(HealthDismissalRepository::new(pool.clone(), writer.clone()));
+let health_service: Arc<dyn HealthServiceTrait + Send + Sync> = Arc::new(
+HealthService::new(health_dismissal_repository)
+.with_projection_freshness(portfolio_coordinator.clone()),
+);
+
+
+
+// Expose local business services to external Agent tools.
+let business_service = Arc::new(wealthfolio_business::BusinessService::new(
+    activity_service.clone(),
+    account_service.clone(),
+    spending_settings_service.clone(),
+    (*business_store).clone(),
+    "default",
+));
+let pending_service = Arc::new(wealthfolio_business::PendingService::new(
+    activity_service.clone(),
+    account_service.clone(),
+    (*business_store).clone(),
+    "default",
+    spending_settings_service.clone(),
+));
+let agent_environment = Arc::new(ServerAgentEnvironment::new(
+base_currency.clone(),
+account_service.clone(),
+activity_service.clone(),
+holdings_service.clone(),
+valuation_service.clone(),
+
+settings_service.clone(),
+
+
+quote_service.clone(),
+asset_service.clone(),
+allocation_service.clone(),
+performance_service.clone(),
+income_service.clone(),
+health_service.clone(),
+taxonomy_service.clone(),
+portfolio_service.clone(),
+net_worth_service.clone(),
+
+cash_activity_service.clone(),
+
+categorization_rules_service.clone(),
+
+business_service.clone(),
+pending_service.clone(),
+));
+let agent_environment: Arc<dyn wealthfolio_agent_tools::AgentEnvironment> =
+agent_environment.clone();
+
+
+// Agent access: PAT auth + MCP audit trail (server-mode MCP)
+let pat_repository = Arc::new(PatRepository::new(pool.clone(), writer.clone()));
+let mcp_audit_repository = Arc::new(McpAuditRepository::new(pool.clone(), writer.clone()));
+
+
+
+
+
+
+let event_bus = EventBus::new(256);
+
+
+
+
+
+
+
+
+let auth = crate::auth::AuthState::from_config(config).await?;
+let auth_manager = auth.auth;
+let oidc_manager = auth.oidc;
+
+if !final_cash_migration.pending_account_ids.is_empty() {
+// The coordinator serializes and forces a full rebuild per pending
+// account, so the rebuild can run in the background instead of
+// blocking (or failing) startup.
+tracing::info!(
+"Rebuilding {} account(s) after final-cash migration in the background",
+final_cash_migration.pending_account_ids.len()
+);
+let settings_service = settings_service.clone();
+let coordinator = portfolio_coordinator.clone();
+workers.push(tokio::spawn(async move {
+if let Err(error) =
+rebuild_pending_final_cash_accounts(settings_service.as_ref(), coordinator.as_ref())
+.await
+{
+tracing::warn!("Background final-cash rebuild failed: {}", error);
+}
+}));
+}
+
+// Domain event sink - Phase 2: Start the worker now that all services are ready
+workers.push(domain_event_sink.start_worker(
+asset_service.clone(),
+
+event_bus.clone(),
+
+health_service.clone(),
+portfolio_coordinator.clone(),
+fx_service.clone(),
+
+spending_settings_service.clone(),
+categorization_rules_service.clone(),
+)?);
+
+let state = Arc::new(AppState {
+mcp_sessions: Arc::new(Default::default()),
+profile_lifecycle: tokio::sync::Mutex::new(()),
+workers: std::sync::Mutex::new(workers),
+writer: writer.clone(),
+writer_task: tokio::sync::Mutex::new(writer_task.take()),
+
+backup_exports: crate::api::portable_backups::BackupExports::default(),
+
+domain_event_sink,
+account_service,
+settings_service,
+holdings_service,
+valuation_service,
+portfolio_coordinator,
+allocation_service,
+quote_service,
+base_currency,
+timezone,
+snapshot_service,
+snapshot_repository,
+lots_repository,
+performance_service,
+income_service,
+
+
+fx_service: fx_service.clone(),
+activity_service,
+asset_service,
+taxonomy_service,
+net_worth_service,
+alternative_asset_service,
+asset_logo_service,
+
+
+
+
+data_root,
+db_path,
+db_access,
+database_key: Arc::new(db::DbEncryptionKey::from_bytes(&config.database_key)),
+_database_owner: Arc::clone(database_owner),
+secret_store,
+event_bus,
+auth: auth_manager,
+oidc: oidc_manager,
+
+
+
+health_service,
+
+custom_provider_service,
+portfolio_service,
+spending_settings_service,
+cash_activity_service,
+categorization_rules_service,
+events_service,
+budget_service,
+spending_analytics_service,
+spending_insight_service,
+allocation_target_service,
+drift_service,
+rebalance_service,
+pat_repository,
+mcp_audit_repository,
+agent_environment,
+business_service,
+pending_service,
+mcp_enabled: config.mcp_enabled,
+mcp_audit_enabled: config.mcp_audit_enabled,
+listen_scope: crate::auth::listen_scope(config.listen_addr),
+});
+
+
+
+crate::api::shared::spawn_portfolio_update(Arc::clone(&state));
+
+Ok(state)
+}.await;
+    if result.is_err() {
+        writer.shutdown().await;
+        if let Some(task) = writer_task.take() {
+            task.join().await;
+        }
+        drop(pool);
+    }
+    result
+}
+
+#[cfg(test)]
+mod runtime_setting_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    #[tokio::test]
+    async fn failed_startup_cleanup_waits_for_remaining_pool_connections_before_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("app.db");
+        let path = path.to_str().unwrap();
+        let owner = Arc::new(db::DatabaseOwner::acquire(path).unwrap());
+        let pool = db::DbAccess::plaintext(path)
+            .create_pool_with_owner(owner.clone())
+            .unwrap();
+        let connection = pool.get().unwrap();
+        drop(pool);
+
+        {
+            let cleanup = wait_for_startup_cleanup(&owner);
+            tokio::pin!(cleanup);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), &mut cleanup)
+                    .await
+                    .is_err()
+            );
+            assert!(db::DatabaseOwner::acquire(path).is_err());
+
+            drop(connection);
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut cleanup)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        drop(owner);
+        db::DatabaseOwner::acquire(path).unwrap();
+    }
+
+    #[test]
+    fn poisoned_settings_return_internal_errors_instead_of_default_values() {
+        let setting = RwLock::new("USD".to_string());
+        let _ = std::panic::catch_unwind(|| {
+            let mut value = setting.write().unwrap();
+            value.clear();
+            panic!("interrupted settings update");
+        });
+        let error = read_runtime_setting(&setting, "Base currency").unwrap_err();
+        assert_eq!(
+            error.into_response().status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(setting.is_poisoned());
+    }
+}

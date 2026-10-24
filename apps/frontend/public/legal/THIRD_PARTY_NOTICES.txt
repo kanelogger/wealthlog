@@ -1,0 +1,16 @@
+THIRD-PARTY NOTICES — Wealthlog 0.0.3
+
+Wealthlog includes code from Wealthfolio, based on commit
+bfcd6d6202ceb4922d0be85aa5666d1802eda456. Wealthfolio is a trademark
+of Teymz Inc. The applicable AGPL-3.0 license is distributed as LICENSE.txt.
+
+The bundled fonts are redistributed under the SIL Open Font License 1.1:
+- Inter: Inter-OFL-1.1.txt
+- IBM Plex Mono: IBM-Plex-Mono-OFL-1.1.txt
+- JetBrains Mono: JetBrains-Mono-OFL-1.1.txt
+- Merriweather: Merriweather-OFL-1.1.txt
+
+Other JavaScript and Rust dependency versions are pinned in pnpm-lock.yaml
+and Cargo.lock. Their package licenses and notices require a complete
+release audit before a public binary is distributed. This file does not
+claim to be a complete inventory of bundled dependencies.

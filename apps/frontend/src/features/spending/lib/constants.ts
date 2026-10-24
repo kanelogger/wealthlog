@@ -1,0 +1,188 @@
+import type { TFunction } from "i18next";
+
+import { localizeActivityTypeName } from "@/lib/activity-utils";
+import { getEffectiveType } from "@/lib/types";
+import { AccountPurpose, accountSupportsPurpose, isLiabilityAccountType } from "@/lib/constants";
+
+/** Cash/card activity types tracked by the spending module. */
+export const CASH_ACTIVITY_TYPES = [
+  "DEPOSIT",
+  "WITHDRAWAL",
+  "TRANSFER_IN",
+  "TRANSFER_OUT",
+  "FEE",
+  "TAX",
+  "INTEREST",
+  "CREDIT",
+] as const;
+
+export type CashActivityType = (typeof CASH_ACTIVITY_TYPES)[number];
+
+export const CREDIT_CARD_ACTIVITY_TYPES: CashActivityType[] = [
+  "WITHDRAWAL",
+  "FEE",
+  "INTEREST",
+  "TRANSFER_IN",
+  "TRANSFER_OUT",
+  "CREDIT",
+];
+
+/** Card wording for the types that read differently on a credit card. */
+const CREDIT_CARD_ACTIVITY_TYPE_LABEL_KEYS: Partial<Record<CashActivityType, string>> = {
+  WITHDRAWAL: "spending:activityTypes.charge",
+  INTEREST: "spending:activityTypes.interestCharge",
+  TRANSFER_IN: "spending:cashForm.payment",
+  TRANSFER_OUT: "spending:activityTypes.balanceTransferCashAdvance",
+  CREDIT: "spending:activityTypes.refundCredit",
+};
+
+/** Activity types that count as outflow (red, negative direction). */
+export const OUTFLOW_TYPES: CashActivityType[] = ["WITHDRAWAL", "TRANSFER_OUT", "FEE", "TAX"];
+
+/** Activity types that count as income (green, positive direction). */
+export const INCOME_TYPES: CashActivityType[] = ["DEPOSIT", "TRANSFER_IN", "INTEREST"];
+
+export function isSpendingAccountType(accountType: string | undefined): boolean {
+  return accountSupportsPurpose(accountType, AccountPurpose.SPENDING);
+}
+
+export function isCreditCardAccountType(accountType: string | undefined): boolean {
+  return isLiabilityAccountType(accountType);
+}
+
+export function getActivityTypesForAccount(accountType: string | undefined): CashActivityType[] {
+  return isCreditCardAccountType(accountType)
+    ? CREDIT_CARD_ACTIVITY_TYPES
+    : [...CASH_ACTIVITY_TYPES];
+}
+
+export function getCashActivityLabel(
+  t: TFunction,
+  activityType: string,
+  accountType?: string,
+  subtype?: string | null,
+): string {
+  if (isCreditCardAccountType(accountType)) {
+    const cardKey = CREDIT_CARD_ACTIVITY_TYPE_LABEL_KEYS[activityType as CashActivityType];
+    if (cardKey) return t(cardKey);
+  } else if (activityType === "CREDIT" && subtype === "REIMBURSEMENT") {
+    return t("spending:activityTypes.reimbursementRefund");
+  }
+
+  return localizeActivityTypeName(t, activityType);
+}
+
+export function getEffectiveCashActivityType(activity: {
+  activityType: string;
+  activityTypeOverride?: string | null;
+}): string {
+  return getEffectiveType(activity);
+}
+
+export function isCashActivityIncome(
+  activityType: string,
+  accountType?: string,
+  subtype?: string | null,
+): boolean {
+  if (isCreditCardAccountType(accountType)) {
+    return false;
+  }
+  if (activityType === "CREDIT") {
+    return subtype === "BONUS";
+  }
+  return INCOME_TYPES.includes(activityType as CashActivityType);
+}
+
+export function isCashActivityOutflow(activityType: string, accountType?: string): boolean {
+  if (isCreditCardAccountType(accountType)) {
+    // A card TRANSFER_OUT raises what is owed, like a charge, but is not
+    // spending (see getActivitySpendingAmount).
+    return (
+      activityType === "WITHDRAWAL" ||
+      activityType === "FEE" ||
+      activityType === "INTEREST" ||
+      activityType === "TRANSFER_OUT"
+    );
+  }
+  return OUTFLOW_TYPES.includes(activityType as CashActivityType);
+}
+
+export function getActivitySpendingAmount(
+  activity: {
+    activityType: string;
+    activityTypeOverride?: string | null;
+    amount?: string | number | null;
+    subtype?: string | null;
+    sourceGroupId?: string | null;
+  },
+  accountType?: string,
+): number {
+  const activityType = getEffectiveCashActivityType(activity);
+  const amount =
+    typeof activity.amount === "number" ? activity.amount : parseFloat(activity.amount ?? "0") || 0;
+  const absAmount = Math.abs(amount);
+
+  if (
+    activity.sourceGroupId &&
+    (activityType === "TRANSFER_IN" || activityType === "TRANSFER_OUT")
+  ) {
+    return 0;
+  }
+
+  if (isCreditCardAccountType(accountType)) {
+    if (activityType === "CREDIT") {
+      return -absAmount;
+    }
+    return activityType === "WITHDRAWAL" || activityType === "FEE" || activityType === "INTEREST"
+      ? absAmount
+      : 0;
+  }
+
+  if (activityType === "CREDIT") {
+    if (
+      activity.subtype === "REFUND" ||
+      activity.subtype === "REBATE" ||
+      activity.subtype === "REIMBURSEMENT"
+    ) {
+      return -absAmount;
+    }
+    return 0;
+  }
+
+  if (accountType && !isSpendingAccountType(accountType)) {
+    return 0;
+  }
+
+  return OUTFLOW_TYPES.includes(activityType as CashActivityType) ? absAmount : 0;
+}
+
+/**
+ * Spending amount with excluded-category portions removed. Rows from the
+ * cash-activity `list()`/`search()` carry `visibleSpendingAmount`, computed
+ * server-side with the same allocator and exclusion index as the report
+ * aggregates; a row without it (older backend) falls back to the unfiltered
+ * spending amount.
+ */
+export function getVisibleSpendingAmount(
+  activity: Parameters<typeof getActivitySpendingAmount>[0] & {
+    visibleSpendingAmount?: number;
+  },
+  accountType?: string,
+): number {
+  return activity.visibleSpendingAmount ?? getActivitySpendingAmount(activity, accountType);
+}
+
+export function getPositiveActivitySpendingAmount(
+  activity: Parameters<typeof getActivitySpendingAmount>[0],
+  accountType?: string,
+): number {
+  return Math.max(0, getActivitySpendingAmount(activity, accountType));
+}
+
+export function getActivityRefundAmount(
+  activity: Parameters<typeof getActivitySpendingAmount>[0],
+  accountType?: string,
+): number {
+  const amount = getActivitySpendingAmount(activity, accountType);
+  return amount < 0 ? -amount : 0;
+}

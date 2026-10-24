@@ -1,0 +1,114 @@
+[package]
+name = "wealthfolio-app"
+version.workspace = true
+edition.workspace = true
+description = "Portfolio tracker"
+authors = ["Aziz Fadil"]
+license = "AGPL-3.0"
+repository = "https://github.com/wealthfolio/wealthfolio"
+
+[build-dependencies]
+tauri-build = { version = "2.5", features = [] }
+
+[dependencies]
+zeroize = { workspace = true }
+# Internal crates
+wealthfolio-market-data = { workspace = true }
+wealthfolio-core = { workspace = true }
+wealthfolio-storage-sqlite = { workspace = true }
+wealthfolio-spending = { workspace = true }
+wealthfolio-agent-tools = { workspace = true }
+wealthfolio-business = { workspace = true }
+
+# Tauri
+tauri = { version = "2.12.0", features = [] }
+tauri-plugin-fs = "2.5"
+tauri-plugin-dialog = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-log = "2"
+
+# Workspace dependencies
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+log = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["time", "net"] }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+diesel = { workspace = true }
+rust_decimal = { workspace = true }
+async-trait = { workspace = true }
+
+# Additional dependencies
+keyring-core = "1.0.0"
+dotenvy = "0.15.7"
+base64 = "0.22"
+
+# Embedded MCP server
+subtle = "2"
+tokio-util = "0.7"
+
+
+[dev-dependencies]
+tempfile = "3"
+tauri = { version = "2.12.0", features = ["test"] }
+
+[features]
+default = []
+# this feature is used for production builds or when `devPath` points to the filesystem
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+appstore = [] # Feature flag for App Store builds
+
+[lib]
+name = "wealthfolio_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+tauri-plugin-window-state = "2"
+tauri-plugin-single-instance = "2"
+
+# Embedded MCP server for the supported desktop platforms.
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+rmcp = { workspace = true }
+wealthfolio-mcp = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wealthlog-agent-install = { path = "../../crates/agent-install" }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSObject", "NSNotification", "NSDistributedNotificationCenter", "NSOperation", "NSString", "block2"] }
+block2 = "0.6"
+
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.1.0", default-features = false, features = ["search"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dev-dependencies]
+# Compatibility fixture only: verify credentials written by our previous backend.
+legacy-keyring = { package = "keyring", version = "=2.3.3" }
+
+
+[target.'cfg(target_os = "macos")'.dependencies.objc2-app-kit]
+version = "0.3"
+default-features = false
+features = ["std", "NSWorkspace"]
+
+[target.'cfg(target_os = "windows")'.dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_System_RemoteDesktop", "Win32_System_Power", "Win32_UI_WindowsAndMessaging"]
+
+[target.'cfg(target_os = "linux")'.dependencies.zbus]
+version = "5"
+default-features = false
+# Shared with the synchronous Secret Service store. Enabling `tokio` makes its
+# blocking calls nest Tokio runtimes and panic during async desktop startup.
+# The async logind API also works with this runtime-independent backend.
+features = ["async-io"]
+
+[lints]
+workspace = true

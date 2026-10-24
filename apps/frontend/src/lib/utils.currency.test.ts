@@ -1,0 +1,33 @@
+import { describe, expect, it } from "vitest";
+import { createFormatter } from "@wealthfolio/ui";
+import { normalizeCurrency } from "./utils";
+
+const formatting = createFormatter("zh-CN");
+
+describe("currency utilities", () => {
+  it("does not treat GBP as the GBp quote unit", () => {
+    expect(normalizeCurrency("GBP")).toBe("GBP");
+    expect(normalizeCurrency("gbp")).toBe("GBP");
+    expect(formatting.formatAmount(12.34, "GBP")).toBe("£12.34");
+  });
+
+  it("normalizes and formats quote units", () => {
+    expect(normalizeCurrency("GBp")).toBe("GBP");
+    expect(normalizeCurrency("gbx")).toBe("GBP");
+    expect(normalizeCurrency("ILA")).toBe("ILS");
+    expect(normalizeCurrency("USX")).toBe("USD");
+    expect(normalizeCurrency("ZAC")).toBe("ZAR");
+
+    expect(formatting.formatAmount(12.34, "GBp")).toBe("12.34p");
+    expect(formatting.formatAmount(12.34, "ILA")).toBe("12.34ag");
+  });
+
+  it("preserves meaningful precision for per-unit prices", () => {
+    expect(formatting.formatPrice(1.4018, "CNY")).toBe("¥1.4018");
+    expect(formatting.formatPrice(12, "USD")).toBe("US$12.00");
+    expect(formatting.formatPrice(268.3999939, "USD")).toBe("US$268.40");
+    expect(formatting.formatPrice(0.00012345, "USD", false)).toBe("0.00012345");
+    expect(formatting.formatPrice(-0.000000001, "USD", false)).toBe("0.00");
+    expect(formatting.formatPrice(1.4018, "GBp")).toBe("1.4018p");
+  });
+});

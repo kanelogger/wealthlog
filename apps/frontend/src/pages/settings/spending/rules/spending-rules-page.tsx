@@ -1,0 +1,401 @@
+import { useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Navigate } from "react-router-dom";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+  EmptyPlaceholder,
+  Icons,
+  Input,
+  Skeleton,
+} from "@wealthfolio/ui";
+import { useAccounts } from "@/hooks/use-accounts";
+import { useNameComparator } from "@/hooks/use-name-comparator";
+import { useTaxonomy } from "@/hooks/use-taxonomies";
+import type { TaxonomyCategory } from "@/lib/types";
+
+import { RuleEditModal } from "@/features/spending/components/rule-edit-modal";
+import { RuleItem, type RuleCategoryMeta } from "@/features/spending/components/rule-item";
+import {
+  ruleAmountPayload,
+  type RuleFormAccountOption,
+  type RuleFormCategoryOption,
+  type RuleFormValues,
+} from "@/features/spending/components/rule-form";
+import { isSpendingAccountType } from "@/features/spending/lib/constants";
+import {
+  useCategorizationRuleMutations,
+  useCategorizationRules,
+} from "@/features/spending/hooks/use-categorization-rules";
+import { useSpendingSettings } from "@/features/spending/hooks/use-spending-settings";
+import type { CategorizationRule } from "@/features/spending/types/rule";
+
+import { SettingsHeader } from "../../settings-header";
+import { SpendingBackLink } from "../components/spending-back-link";
+
+const SPENDING_TAXONOMY = "spending_categories";
+const INCOME_TAXONOMY = "income_sources";
+const SAVINGS_TAXONOMY = "savings_categories";
+
+export default function SpendingRulesPage() {
+  const { t } = useTranslation();
+  const compareNames = useNameComparator();
+  const { isEnabled, isLoading: settingsLoading, accountIds } = useSpendingSettings();
+  const { accounts } = useAccounts({ filterActive: false });
+  const {
+    data: rules = [],
+    isLoading: rulesLoading,
+    isError: rulesErrored,
+    error: rulesError,
+  } = useCategorizationRules();
+  const spending = useTaxonomy(SPENDING_TAXONOMY);
+  const income = useTaxonomy(INCOME_TAXONOMY);
+  const savings = useTaxonomy(SAVINGS_TAXONOMY);
+  const { create, update, remove, rerun } = useCategorizationRuleMutations();
+
+  const [visibleModal, setVisibleModal] = useState(false);
+  const [selectedRule, setSelectedRule] = useState<CategorizationRule | undefined>();
+  const [searchQuery, setSearchQuery] = useState("");
+  const [confirmRerunAllOpen, setConfirmRerunAllOpen] = useState(false);
+
+  const isLoading = rulesLoading || spending.isLoading || income.isLoading || savings.isLoading;
+  const hasLoadError = rulesErrored || spending.isError || income.isError || savings.isError;
+  const loadError =
+    rulesError?.message ??
+    spending.error?.message ??
+    income.error?.message ??
+    savings.error?.message ??
+    t("settings:spending.rules.load_error");
+
+  const { categoryOptions, categoryMeta } = useMemo(() => {
+    const buildOptions = (taxonomyId: string, cats: TaxonomyCategory[]) => {
+      const byId = new Map(cats.map((c) => [c.id, c]));
+      return cats
+        .slice()
+        .sort((a, b) => a.sortOrder - b.sortOrder)
+        .map((c) => {
+          const parent = c.parentId ? byId.get(c.parentId) : null;
+          return {
+            value: `${taxonomyId}:${c.id}`,
+            label: c.name,
+            taxonomyId,
+            categoryId: c.id,
+            color: c.color,
+            parentName: parent?.name ?? null,
+          } satisfies RuleFormCategoryOption;
+        });
+    };
+    const opts: RuleFormCategoryOption[] = [
+      ...buildOptions(SPENDING_TAXONOMY, spending.data?.categories ?? []),
+      ...buildOptions(INCOME_TAXONOMY, income.data?.categories ?? []),
+      ...buildOptions(SAVINGS_TAXONOMY, savings.data?.categories ?? []),
+    ];
+    const meta: Record<string, RuleCategoryMeta> = {};
+    opts.forEach((o) => {
+      const entry = {
+        name: o.label,
+        color: o.color ?? null,
+        parentName: o.parentName ?? null,
+      };
+      meta[o.value] = entry;
+      meta[o.categoryId] ??= entry;
+    });
+    return { categoryOptions: opts, categoryMeta: meta };
+  }, [spending.data?.categories, income.data?.categories, savings.data?.categories]);
+
+  const { accountOptions, accountMeta } = useMemo(() => {
+    // Only tracked spending accounts are offered: a rerun walks just those
+    // accounts, so a rule scoped anywhere else could never fire.
+    const tracked = new Set(accountIds);
+    const opts: RuleFormAccountOption[] = accounts
+      .filter((a) => isSpendingAccountType(a.accountType) && tracked.has(a.id))
+      .map((a) => ({ id: a.id, name: a.name }))
+      .sort((a, b) => compareNames(a.name, b.name));
+    // Names cover every account, not just the pickable ones, so a rule scoped to
+    // an account the user has since untracked still renders a real name.
+    const meta: Record<string, string> = {};
+    accounts.forEach((a) => {
+      meta[a.id] = a.name;
+    });
+    return { accountOptions: opts, accountMeta: meta };
+  }, [accounts, accountIds, compareNames]);
+
+  if (!settingsLoading && !isEnabled) {
+    return <Navigate to="/settings/spending" replace />;
+  }
+
+  const handleAddRule = () => {
+    setSelectedRule(undefined);
+    setVisibleModal(true);
+  };
+
+  const handleEditRule = (rule: CategorizationRule) => {
+    setSelectedRule(rule);
+    setVisibleModal(true);
+  };
+
+  const handleDeleteRule = (rule: CategorizationRule) => {
+    remove.mutate(rule.id);
+  };
+
+  const handleSave = (values: RuleFormValues) => {
+    const { amountOp, amountValue, amountValue2 } = ruleAmountPayload(values);
+    if (selectedRule) {
+      update.mutate(
+        {
+          id: selectedRule.id,
+          patch: {
+            name: values.name,
+            pattern: values.pattern,
+            matchType: values.matchType,
+            taxonomyId: values.taxonomyId || null,
+            categoryId: values.categoryId || null,
+            activityType: values.activityType || null,
+            amountOp,
+            amountValue,
+            amountValue2,
+            priority: values.priority,
+            // Always sent explicitly: null clears the column, an id sets it, and
+            // the backend rejects an isGlobal/accountId pair that disagrees.
+            isGlobal: values.accountId === null,
+            accountId: values.accountId,
+          },
+        },
+        {
+          onSuccess: () => setVisibleModal(false),
+        },
+      );
+    } else {
+      create.mutate(
+        {
+          name: values.name,
+          pattern: values.pattern,
+          matchType: values.matchType,
+          taxonomyId: values.taxonomyId || null,
+          categoryId: values.categoryId || null,
+          activityType: values.activityType || null,
+          amountOp,
+          amountValue,
+          amountValue2,
+          priority: values.priority,
+          isGlobal: values.accountId === null,
+          accountId: values.accountId,
+        },
+        {
+          onSuccess: () => setVisibleModal(false),
+        },
+      );
+    }
+  };
+
+  const filteredRules = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    return [...rules]
+      .sort((a, b) => b.priority - a.priority)
+      .filter((rule) => {
+        if (!query) return true;
+        const name = rule.name?.toLowerCase() ?? "";
+        const pattern = rule.pattern?.toLowerCase() ?? "";
+        return name.includes(query) || pattern.includes(query);
+      });
+  }, [rules, searchQuery]);
+
+  const totalRulesCount = rules.length;
+
+  return (
+    <>
+      <div className="space-y-6">
+        <SpendingBackLink />
+        <SettingsHeader
+          heading={t("settings:spending.rules.heading")}
+          text={t("settings:spending.rules.text")}
+          backTo="/settings/spending"
+        >
+          <div className="flex items-center gap-2">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={rerun.isPending || rules.length === 0}
+                >
+                  {rerun.isPending ? (
+                    <Icons.Spinner className="mr-2 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Icons.Refresh className="mr-2 h-3.5 w-3.5" />
+                  )}
+                  {t("settings:spending.rules.rerun")}
+                  <Icons.ChevronDown className="ml-2 h-3.5 w-3.5 opacity-60" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-72">
+                <DropdownMenuItem
+                  onClick={() => rerun.mutate(true)}
+                  className="flex-col items-start gap-0.5"
+                >
+                  <span className="text-sm font-medium">
+                    {t("settings:spending.rules.rerun_uncategorized")}
+                  </span>
+                  <span className="text-muted-foreground text-xs">
+                    {t("settings:spending.rules.rerun_uncategorized_desc")}
+                  </span>
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem
+                  onSelect={(e) => {
+                    e.preventDefault();
+                    setConfirmRerunAllOpen(true);
+                  }}
+                  className="flex-col items-start gap-0.5"
+                >
+                  <span className="text-sm font-medium">
+                    {t("settings:spending.rules.recategorize_all")}
+                  </span>
+                  <span className="text-muted-foreground text-xs">
+                    {t("settings:spending.rules.recategorize_all_desc")}
+                  </span>
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+            <Button
+              size="sm"
+              className="sm:hidden"
+              onClick={handleAddRule}
+              aria-label={t("settings:spending.rules.add")}
+            >
+              <Icons.Plus className="h-3.5 w-3.5" />
+            </Button>
+            <Button size="sm" className="hidden sm:inline-flex" onClick={handleAddRule}>
+              <Icons.Plus className="mr-2 h-3.5 w-3.5" />
+              {t("settings:spending.rules.add")}
+            </Button>
+          </div>
+        </SettingsHeader>
+
+        {isLoading ? (
+          <div className="space-y-4">
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+          </div>
+        ) : hasLoadError ? (
+          <EmptyPlaceholder>
+            <EmptyPlaceholder.Icon name="AlertTriangle" />
+            <EmptyPlaceholder.Title>
+              {t("settings:spending.rules.error_title")}
+            </EmptyPlaceholder.Title>
+            <EmptyPlaceholder.Description>{loadError}</EmptyPlaceholder.Description>
+          </EmptyPlaceholder>
+        ) : totalRulesCount === 0 ? (
+          <div className="space-y-6">
+            <EmptyPlaceholder>
+              <EmptyPlaceholder.Icon name="ListFilter" />
+              <EmptyPlaceholder.Title>
+                {t("settings:spending.rules.empty_title")}
+              </EmptyPlaceholder.Title>
+              <EmptyPlaceholder.Description>
+                {t("settings:spending.rules.empty_description")}
+              </EmptyPlaceholder.Description>
+              <Button variant="outline" onClick={handleAddRule}>
+                <Icons.Plus className="mr-2 h-4 w-4" />
+                {t("settings:spending.rules.add_manually")}
+              </Button>
+            </EmptyPlaceholder>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <div className="relative">
+                <Icons.Search className="text-muted-foreground/60 absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2" />
+                <Input
+                  type="search"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder={t("settings:spending.rules.search_placeholder")}
+                  className="bg-muted/40 border-border/60 placeholder:text-muted-foreground/60 h-7 pl-8 text-xs"
+                  aria-label={t("settings:spending.rules.search_aria")}
+                />
+              </div>
+            </div>
+
+            {filteredRules.length === 0 ? (
+              <div className="text-muted-foreground rounded-md border border-dashed py-8 text-center text-sm">
+                {searchQuery
+                  ? t("settings:spending.rules.no_match_query", { query: searchQuery })
+                  : t("settings:spending.rules.no_match_filter")}{" "}
+                <button
+                  type="button"
+                  className="text-foreground underline-offset-2 hover:underline"
+                  onClick={() => {
+                    setSearchQuery("");
+                  }}
+                >
+                  {t("settings:spending.rules.clear_filters")}
+                </button>
+                .
+              </div>
+            ) : (
+              <div className="divide-border divide-y rounded-md border">
+                {filteredRules.map((rule) => (
+                  <RuleItem
+                    key={rule.id}
+                    rule={rule}
+                    categoryMeta={categoryMeta}
+                    accountMeta={accountMeta}
+                    onEdit={handleEditRule}
+                    onDelete={handleDeleteRule}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <RuleEditModal
+        open={visibleModal}
+        onClose={() => setVisibleModal(false)}
+        rule={selectedRule}
+        categoryOptions={categoryOptions}
+        accountOptions={accountOptions}
+        onSave={handleSave}
+        isLoading={create.isPending || update.isPending}
+      />
+
+      <AlertDialog open={confirmRerunAllOpen} onOpenChange={setConfirmRerunAllOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {t("settings:spending.rules.recategorize_confirm_title")}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {t("settings:spending.rules.recategorize_confirm_desc")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t("common:cancel")}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => rerun.mutate(false)}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {t("settings:spending.rules.recategorize_all")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}

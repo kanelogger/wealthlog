@@ -1,0 +1,352 @@
+use std::sync::Arc;
+use wealthfolio_core::events::DomainEvent;
+
+use crate::{
+    api::shared::{enqueue_portfolio_job, PortfolioJobConfig},
+    error::ApiResult,
+    main_lib::AppState,
+};
+use axum::{
+    extract::{Path, Query},
+    http::StatusCode,
+    routing::{delete, get, post, put},
+    Json, Router,
+};
+use wealthfolio_core::assets::InstrumentType;
+use wealthfolio_core::quotes::{
+    FetchDividendsParams, LatestQuoteSnapshot, MarketSyncMode, ProviderInfo, Quote,
+    SymbolSearchResult,
+};
+use wealthfolio_market_data::{DividendEvent, ExchangeInfo};
+
+async fn reset_provider_history(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Path(asset_id): Path<String>,
+) -> ApiResult<Json<wealthfolio_core::quotes::ResetProviderHistoryResult>> {
+    // Dropping the HTTP future must not drop committed work's recalculation event.
+    let result = tokio::spawn(async move {
+        let result = state.quote_service.reset_provider_history(&asset_id).await;
+        if result.is_ok() {
+            state
+                .domain_event_sink
+                .emit(DomainEvent::PriceHistoryChanged);
+        }
+        result
+    })
+    .await
+    .map_err(|_| {
+        crate::error::ApiError::Internal(
+            "Reset completion could not be confirmed. Reload quotes before retrying.".into(),
+        )
+    })??;
+    Ok(Json(result))
+}
+
+async fn reset_all_provider_history(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+) -> ApiResult<Json<wealthfolio_core::quotes::ResetAllProviderHistoryResult>> {
+    let result = tokio::spawn(async move {
+        let result = state.quote_service.reset_all_provider_history().await;
+        if result
+            .as_ref()
+            .is_ok_and(|result| !result.results.is_empty())
+        {
+            state
+                .domain_event_sink
+                .emit(DomainEvent::PriceHistoryChanged);
+        }
+        result
+    })
+    .await
+    .map_err(|_| {
+        crate::error::ApiError::Internal(
+            "Reset completion could not be confirmed. Reload quotes before retrying.".into(),
+        )
+    })??;
+    Ok(Json(result))
+}
+
+async fn get_market_data_providers(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+) -> ApiResult<Json<Vec<ProviderInfo>>> {
+    let infos = state.quote_service.get_providers_info().await?;
+    Ok(Json(infos))
+}
+
+async fn get_market_data_provider_settings(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+) -> ApiResult<Json<Vec<ProviderInfo>>> {
+    let infos = state.quote_service.get_providers_info().await?;
+    Ok(Json(infos))
+}
+
+#[derive(serde::Deserialize)]
+struct ProviderUpdateBody {
+    #[serde(rename = "providerId")]
+    provider_id: String,
+    priority: i32,
+    enabled: bool,
+}
+
+async fn update_market_data_provider_settings(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Json(body): Json<ProviderUpdateBody>,
+) -> ApiResult<StatusCode> {
+    state
+        .quote_service
+        .update_provider_settings(&body.provider_id, body.priority, body.enabled)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct SearchQuery {
+    query: String,
+}
+
+async fn search_symbol(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Query(q): Query<SearchQuery>,
+) -> ApiResult<Json<Vec<SymbolSearchResult>>> {
+    let res = state.quote_service.search_symbol(&q.query).await?;
+    Ok(Json(res))
+}
+
+#[derive(serde::Deserialize)]
+struct QuoteHistoryQuery {
+    symbol: String,
+}
+
+async fn get_quote_history(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Query(q): Query<QuoteHistoryQuery>,
+) -> ApiResult<Json<Vec<Quote>>> {
+    let res = state.quote_service.get_historical_quotes(&q.symbol)?;
+    Ok(Json(res))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DividendsQuery {
+    symbol: String,
+    exchange_mic: Option<String>,
+    instrument_type: Option<String>,
+    quote_ccy: Option<String>,
+    provider_id: Option<String>,
+    start_date: Option<chrono::NaiveDate>,
+    end_date: Option<chrono::NaiveDate>,
+}
+
+async fn fetch_dividends(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Query(q): Query<DividendsQuery>,
+) -> ApiResult<Json<Vec<DividendEvent>>> {
+    let inst_type = q
+        .instrument_type
+        .as_deref()
+        .and_then(InstrumentType::from_external_str);
+    let dividends = state
+        .quote_service
+        .fetch_dividends(FetchDividendsParams {
+            symbol: q.symbol,
+            exchange_mic: q.exchange_mic,
+            instrument_type: inst_type,
+            quote_ccy: q.quote_ccy,
+            preferred_provider: q.provider_id,
+            start: q.start_date,
+            end: q.end_date,
+        })
+        .await?;
+    Ok(Json(dividends))
+}
+
+async fn update_quote(
+    Path(symbol): Path<String>,
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Json(mut quote): Json<Quote>,
+) -> ApiResult<StatusCode> {
+    // Ensure asset_id matches path parameter
+    quote.asset_id = symbol;
+    state.quote_service.update_quote(quote).await?;
+    // Manual quote update - no market sync needed, but force full recalculation
+    // so historical valuations are recomputed with the updated quotes
+    enqueue_portfolio_job(
+        state.clone(),
+        PortfolioJobConfig {
+            account_ids: None,
+            market_sync_mode: MarketSyncMode::None,
+            force_full: false,
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_quote(
+    Path(id): Path<String>,
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+) -> ApiResult<StatusCode> {
+    state.quote_service.delete_quote(&id).await?;
+    // Manual quote deletion - no market sync needed, but force full recalculation
+    // so historical valuations are recomputed without the deleted quotes
+    enqueue_portfolio_job(
+        state,
+        PortfolioJobConfig {
+            account_ids: None,
+            market_sync_mode: MarketSyncMode::None,
+            force_full: false,
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn sync_history_quotes(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+) -> ApiResult<StatusCode> {
+    let result = tokio::spawn(async move {
+        let result = state.quote_service.resync(None).await;
+        if result.as_ref().is_ok_and(|result| result.synced > 0) {
+            state
+                .domain_event_sink
+                .emit(DomainEvent::PriceHistoryChanged);
+        }
+        result
+    })
+    .await
+    .map_err(|_| {
+        crate::error::ApiError::Internal("Refresh completion could not be confirmed.".into())
+    })??;
+    if result.failed > 0 {
+        tracing::warn!("resync reported {} failures", result.failed);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct SyncBody {
+    #[serde(rename = "assetIds")]
+    asset_ids: Option<Vec<String>>,
+    #[serde(rename = "refetchAll")]
+    refetch_all: bool,
+    #[serde(rename = "refetchRecentDays")]
+    refetch_recent_days: Option<i64>,
+}
+
+async fn sync_market_data(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Json(body): Json<SyncBody>,
+) -> ApiResult<StatusCode> {
+    // Determine the appropriate market sync mode based on refetch flags
+    let market_sync_mode = if let Some(days) = body.refetch_recent_days {
+        MarketSyncMode::RefetchRecent {
+            asset_ids: body.asset_ids,
+            days,
+        }
+    } else if body.refetch_all {
+        MarketSyncMode::BackfillHistory {
+            asset_ids: body.asset_ids,
+            days: 365 * 5, // 5 years of history as fallback
+        }
+    } else {
+        MarketSyncMode::Incremental {
+            asset_ids: body.asset_ids,
+        }
+    };
+
+    enqueue_portfolio_job(
+        state,
+        PortfolioJobConfig {
+            account_ids: None,
+            market_sync_mode,
+            ..PortfolioJobConfig::default()
+        },
+    );
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LatestQuotesBody {
+    asset_ids: Vec<String>,
+}
+
+async fn get_latest_quotes(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Json(body): Json<LatestQuotesBody>,
+) -> ApiResult<Json<std::collections::HashMap<String, LatestQuoteSnapshot>>> {
+    let quotes = state
+        .quote_service
+        .get_latest_quotes_snapshot(&body.asset_ids)?;
+    Ok(Json(quotes))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveSymbolQuoteQuery {
+    symbol: String,
+    exchange_mic: Option<String>,
+    instrument_type: Option<String>,
+    quote_ccy: Option<String>,
+    provider_id: Option<String>,
+    provider_symbol: Option<String>,
+}
+
+async fn resolve_symbol_quote(
+    axum::Extension(state): axum::Extension<Arc<AppState>>,
+    Query(q): Query<ResolveSymbolQuoteQuery>,
+) -> ApiResult<Json<wealthfolio_core::quotes::ResolvedQuote>> {
+    let inst_type = q
+        .instrument_type
+        .as_deref()
+        .and_then(wealthfolio_core::assets::InstrumentType::from_external_str);
+    let res = state
+        .quote_service
+        .resolve_symbol_quote(
+            &q.symbol,
+            q.exchange_mic.as_deref(),
+            inst_type.as_ref(),
+            q.quote_ccy.as_deref(),
+            q.provider_id.as_deref(),
+            q.provider_symbol.as_deref(),
+        )
+        .await?;
+    Ok(Json(res))
+}
+
+async fn get_exchanges() -> Json<Vec<ExchangeInfo>> {
+    Json(wealthfolio_market_data::get_exchange_list())
+}
+
+pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
+    Router::new()
+        .route("/exchanges", get(get_exchanges))
+        .route("/providers", get(get_market_data_providers))
+        .route(
+            "/providers/settings",
+            get(get_market_data_provider_settings).put(update_market_data_provider_settings),
+        )
+        .route("/market-data/search", get(search_symbol))
+        .route("/market-data/resolve-currency", get(resolve_symbol_quote))
+        .route("/market-data/quotes/history", get(get_quote_history))
+        .route(
+            "/market-data/quotes/{asset_id}/reset",
+            post(reset_provider_history),
+        )
+        .route("/market-data/dividends", get(fetch_dividends))
+        .route("/market-data/quotes/latest", post(get_latest_quotes))
+        .route(
+            "/market-data/quotes/reset",
+            post(reset_all_provider_history),
+        )
+        .route("/market-data/quotes/{symbol}", put(update_quote))
+        .route("/market-data/quotes/id/{id}", delete(delete_quote))
+        .route("/market-data/sync/history", post(sync_history_quotes))
+        .route("/market-data/sync", post(sync_market_data))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn reset_routes_register_alongside_existing_quote_routes() {
+        let _ = super::router::<()>();
+    }
+}

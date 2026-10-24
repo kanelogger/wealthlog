@@ -1,0 +1,556 @@
+//! Event planning functions for translating domain events into actions.
+//!
+//! These functions analyze batches of domain events and determine what
+//! platform-specific actions need to be triggered.
+
+use std::collections::HashSet;
+
+use wealthfolio_core::accounts::TrackingMode;
+use wealthfolio_core::events::DomainEvent;
+
+use crate::events::PortfolioRequestPayload;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetClassificationChangePlan {
+    pub asset_ids: Vec<String>,
+    pub taxonomy_ids: Vec<String>,
+}
+
+/// Plans a UI cache refresh for asset classification changes.
+pub fn plan_asset_classification_change(
+    events: &[DomainEvent],
+) -> Option<AssetClassificationChangePlan> {
+    let mut asset_ids: HashSet<String> = HashSet::new();
+    let mut taxonomy_ids: HashSet<String> = HashSet::new();
+    let mut has_event = false;
+
+    for event in events {
+        if let DomainEvent::AssetClassificationsChanged {
+            asset_ids: changed_asset_ids,
+            taxonomy_ids: changed_taxonomy_ids,
+        } = event
+        {
+            has_event = true;
+            asset_ids.extend(
+                changed_asset_ids
+                    .iter()
+                    .filter(|id| !id.is_empty())
+                    .cloned(),
+            );
+            taxonomy_ids.extend(
+                changed_taxonomy_ids
+                    .iter()
+                    .filter(|id| !id.is_empty())
+                    .cloned(),
+            );
+        }
+    }
+
+    if !has_event {
+        return None;
+    }
+
+    let mut asset_ids = asset_ids.into_iter().collect::<Vec<_>>();
+    asset_ids.sort();
+    let mut taxonomy_ids = taxonomy_ids.into_iter().collect::<Vec<_>>();
+    taxonomy_ids.sort();
+
+    Some(AssetClassificationChangePlan {
+        asset_ids,
+        taxonomy_ids,
+    })
+}
+
+/// Plans a portfolio recalculation job from a batch of domain events.
+///
+/// Merges account_ids and asset_ids from:
+/// - ActivitiesChanged
+/// - HoldingsChanged
+/// - AccountsChanged
+/// - AssetsUpdated
+///
+/// Also carries through asset IDs from AssetsCreated when a recalc-triggering
+/// event exists in the same batch.
+///
+/// Returns `None` if no events require portfolio recalculation.
+pub fn plan_portfolio_job(events: &[DomainEvent]) -> Option<PortfolioRequestPayload> {
+    let mut account_ids: HashSet<String> = HashSet::new();
+    let mut asset_ids: HashSet<String> = HashSet::new();
+    let mut has_recalc_events = false;
+    let mut recalculate_all_accounts = false;
+    // Price-only batches use saved quotes. Other events retain their normal sync.
+    let needs_market_sync = events.iter().any(|event| {
+        !matches!(
+            event,
+            DomainEvent::PriceHistoryChanged
+                | DomainEvent::AssetClassificationsChanged { .. }
+                | DomainEvent::AssetsMerged { .. }
+        )
+    });
+
+    for event in events {
+        match event {
+            DomainEvent::ActivitiesChanged {
+                account_ids: acc_ids,
+                asset_ids: a_ids,
+                ..
+            } => {
+                has_recalc_events = true;
+                account_ids.extend(acc_ids.iter().cloned());
+                asset_ids.extend(a_ids.iter().cloned());
+            }
+            DomainEvent::AssetSplitActivitiesChanged { asset_ids: ids, .. } => {
+                has_recalc_events = true;
+                recalculate_all_accounts = true;
+                asset_ids.extend(ids.iter().filter(|id| !id.is_empty()).cloned());
+            }
+            DomainEvent::HoldingsChanged {
+                account_ids: acc_ids,
+                asset_ids: a_ids,
+            } => {
+                has_recalc_events = true;
+                account_ids.extend(acc_ids.iter().cloned());
+                asset_ids.extend(a_ids.iter().cloned());
+            }
+            DomainEvent::AccountsChanged {
+                account_ids: acc_ids,
+                ..
+            } => {
+                has_recalc_events = true;
+                account_ids.extend(acc_ids.iter().cloned());
+            }
+            DomainEvent::AssetsUpdated { asset_ids: ids } => {
+                has_recalc_events = true;
+                recalculate_all_accounts = true;
+                asset_ids.extend(ids.iter().filter(|id| !id.is_empty()).cloned());
+            }
+            // AssetsCreated: include IDs for sync (e.g., FX assets), but don't trigger recalc alone
+            DomainEvent::AssetsCreated { asset_ids: ids } => {
+                asset_ids.extend(ids.iter().filter(|id| !id.is_empty()).cloned());
+            }
+            // Saved prices changed: the quote triggers marked their holders
+            // for a revalue; the job only has to run.
+            DomainEvent::PriceHistoryChanged => {
+                has_recalc_events = true;
+                recalculate_all_accounts = true;
+            }
+            DomainEvent::AssetClassificationsChanged { .. } => {}
+            DomainEvent::AssetsMerged { .. } => {}
+            DomainEvent::TrackingModeChanged {
+                account_id,
+                old_mode,
+                new_mode,
+                ..
+            } => {
+                if *old_mode == TrackingMode::Holdings && *new_mode == TrackingMode::Transactions {
+                    account_ids.insert(account_id.clone());
+                    has_recalc_events = true;
+                }
+            }
+        }
+    }
+
+    if !has_recalc_events {
+        return None;
+    }
+
+    let mut builder = PortfolioRequestPayload::builder();
+    if !recalculate_all_accounts && !account_ids.is_empty() {
+        builder = builder.account_ids(Some(account_ids.into_iter().collect()));
+    }
+    let sync_mode = if !needs_market_sync {
+        wealthfolio_core::quotes::MarketSyncMode::None
+    } else if asset_ids.is_empty() {
+        wealthfolio_core::quotes::MarketSyncMode::Incremental { asset_ids: None }
+    } else {
+        wealthfolio_core::quotes::MarketSyncMode::Incremental {
+            asset_ids: Some(asset_ids.into_iter().collect()),
+        }
+    };
+    Some(builder.market_sync_mode(sync_mode).build())
+}
+
+/// Plans asset enrichment for newly created assets.
+///
+/// Returns asset IDs from AssetsCreated events.
+pub fn plan_asset_enrichment(events: &[DomainEvent]) -> Vec<String> {
+    let mut asset_ids: HashSet<String> = HashSet::new();
+
+    for event in events {
+        if let DomainEvent::AssetsCreated {
+            asset_ids: a_ids, ..
+        } = event
+        {
+            asset_ids.extend(a_ids.iter().cloned());
+        }
+    }
+
+    asset_ids.into_iter().collect()
+}
+
+/// Plans an auto-categorization pass over spending accounts touched by this batch.
+///
+/// Returns the unique set of opted-in spending account IDs that appeared in any
+/// `ActivitiesChanged` event. Empty result means no work to do.
+///
+/// Asset, holdings, account and tracking-mode events do not change spending
+/// activities, so only activity mutations trigger categorization.
+pub fn plan_categorization_job(
+    events: &[DomainEvent],
+    opted_in_accounts: &HashSet<String>,
+) -> Vec<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for event in events {
+        if let DomainEvent::ActivitiesChanged { account_ids, .. } = event {
+            for id in account_ids {
+                if opted_in_accounts.contains(id) {
+                    out.insert(id.clone());
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wealthfolio_core::events::CurrencyChange;
+
+    #[test]
+    fn test_plan_portfolio_job_empty_events() {
+        let events: Vec<DomainEvent> = vec![];
+        let result = plan_portfolio_job(&events);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_activities_changed() {
+        let events = vec![DomainEvent::ActivitiesChanged {
+            account_ids: vec!["acc1".to_string()],
+            asset_ids: vec!["AAPL".to_string()],
+            currencies: vec!["USD".to_string()],
+            earliest_activity_at_utc: None,
+        }];
+
+        let result = plan_portfolio_job(&events);
+        assert!(result.is_some());
+
+        let payload = result.unwrap();
+        assert!(payload.account_ids.is_some());
+        let account_ids = payload.account_ids.unwrap();
+        assert!(account_ids.contains(&"acc1".to_string()));
+    }
+
+    #[test]
+    fn test_split_activity_change_recalculates_all_accounts() {
+        let events = vec![
+            DomainEvent::ActivitiesChanged {
+                account_ids: vec!["edited-account".to_string()],
+                asset_ids: vec!["VGT".to_string()],
+                currencies: vec!["USD".to_string()],
+                earliest_activity_at_utc: None,
+            },
+            DomainEvent::asset_split_activities_changed(vec!["VGT".to_string()], None),
+        ];
+
+        let payload = plan_portfolio_job(&events).unwrap();
+
+        assert!(payload.account_ids.is_none());
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_accounts_changed_no_fake_fx_ids() {
+        let events = vec![DomainEvent::AccountsChanged {
+            account_ids: vec!["acc1".to_string()],
+            currency_changes: vec![CurrencyChange {
+                account_id: "acc1".to_string(),
+                old_currency: Some("EUR".to_string()),
+                new_currency: "GBP".to_string(),
+            }],
+        }];
+
+        let result = plan_portfolio_job(&events);
+        assert!(result.is_some());
+
+        let payload = result.unwrap();
+        // FX assets are synced via AssetsCreated events, not constructed from currencies
+        if let wealthfolio_core::quotes::MarketSyncMode::Incremental { asset_ids } =
+            payload.market_sync_mode
+        {
+            assert!(asset_ids.is_none());
+        } else {
+            panic!("Expected Incremental sync mode");
+        }
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_holdings_to_transactions_triggers_recalc() {
+        let events = vec![DomainEvent::TrackingModeChanged {
+            account_id: "acc1".to_string(),
+            old_mode: TrackingMode::Holdings,
+            new_mode: TrackingMode::Transactions,
+            is_connected: true,
+        }];
+
+        let result = plan_portfolio_job(&events).unwrap();
+        assert_eq!(result.account_ids, Some(vec!["acc1".to_string()]));
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_transactions_to_holdings_does_not_trigger_recalc() {
+        let events = vec![DomainEvent::TrackingModeChanged {
+            account_id: "acc1".to_string(),
+            old_mode: TrackingMode::Transactions,
+            new_mode: TrackingMode::Holdings,
+            is_connected: true,
+        }];
+
+        let result = plan_portfolio_job(&events);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_assets_created_contributes_ids() {
+        let events = vec![
+            DomainEvent::ActivitiesChanged {
+                account_ids: vec!["acc1".to_string()],
+                asset_ids: vec!["equity-uuid".to_string()],
+                currencies: vec!["USD".to_string()],
+                earliest_activity_at_utc: None,
+            },
+            DomainEvent::AssetsCreated {
+                asset_ids: vec!["fx-uuid".to_string()],
+            },
+        ];
+
+        let result = plan_portfolio_job(&events).unwrap();
+        if let wealthfolio_core::quotes::MarketSyncMode::Incremental { asset_ids } =
+            result.market_sync_mode
+        {
+            let ids = asset_ids.unwrap();
+            assert!(ids.contains(&"equity-uuid".to_string()));
+            assert!(ids.contains(&"fx-uuid".to_string()));
+        } else {
+            panic!("Expected Incremental sync mode");
+        }
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_assets_created_no_recalc() {
+        let events = vec![DomainEvent::AssetsCreated {
+            asset_ids: vec!["AAPL".to_string()],
+        }];
+
+        let result = plan_portfolio_job(&events);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_assets_updated_triggers_recalc() {
+        let events = vec![DomainEvent::AssetsUpdated {
+            asset_ids: vec!["asset-1".to_string()],
+        }];
+
+        let result = plan_portfolio_job(&events).unwrap();
+        assert!(result.account_ids.is_none());
+
+        if let wealthfolio_core::quotes::MarketSyncMode::Incremental { asset_ids } =
+            result.market_sync_mode
+        {
+            assert_eq!(asset_ids, Some(vec!["asset-1".to_string()]));
+        } else {
+            panic!("Expected Incremental sync mode");
+        }
+    }
+
+    #[test]
+    fn test_plan_portfolio_job_asset_classifications_changed_does_not_trigger_recalc() {
+        let events = vec![DomainEvent::asset_classifications_changed(
+            vec!["asset-1".to_string()],
+            vec!["asset_classes".to_string()],
+        )];
+
+        assert!(plan_portfolio_job(&events).is_none());
+    }
+
+    #[test]
+    fn test_plan_asset_classification_change_deduplicates_ids() {
+        let events = vec![
+            DomainEvent::asset_classifications_changed(
+                vec!["asset-2".to_string(), "asset-1".to_string()],
+                vec!["regions".to_string()],
+            ),
+            DomainEvent::asset_classifications_changed(
+                vec!["asset-1".to_string(), "".to_string()],
+                vec!["regions".to_string(), "asset_classes".to_string()],
+            ),
+        ];
+
+        let plan = plan_asset_classification_change(&events).unwrap();
+        assert_eq!(
+            plan.asset_ids,
+            vec!["asset-1".to_string(), "asset-2".to_string()]
+        );
+        assert_eq!(
+            plan.taxonomy_ids,
+            vec!["asset_classes".to_string(), "regions".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_plan_asset_enrichment() {
+        let events = vec![
+            DomainEvent::AssetsCreated {
+                asset_ids: vec!["AAPL".to_string(), "MSFT".to_string()],
+            },
+            DomainEvent::AssetsCreated {
+                asset_ids: vec!["GOOG".to_string()],
+            },
+        ];
+
+        let result = plan_asset_enrichment(&events);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(&"AAPL".to_string()));
+        assert!(result.contains(&"MSFT".to_string()));
+        assert!(result.contains(&"GOOG".to_string()));
+    }
+
+    #[test]
+    fn test_plan_asset_enrichment_deduplicates() {
+        let events = vec![
+            DomainEvent::AssetsCreated {
+                asset_ids: vec!["AAPL".to_string()],
+            },
+            DomainEvent::AssetsCreated {
+                asset_ids: vec!["AAPL".to_string()], // Duplicate
+            },
+        ];
+
+        let result = plan_asset_enrichment(&events);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_assets_updated_keeps_all_account_scope_when_batched_with_holdings() {
+        let events = vec![
+            DomainEvent::holdings_changed(
+                vec!["holdings-account".to_string()],
+                vec!["AAPL".to_string()],
+            ),
+            DomainEvent::AssetsUpdated {
+                asset_ids: vec!["AAPL".to_string()],
+            },
+        ];
+
+        let payload = plan_portfolio_job(&events).unwrap();
+        assert!(payload.account_ids.is_none());
+    }
+
+    // ── plan_categorization_job ──────────────────────────────────────────────
+
+    fn opted_in(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_plan_categorization_job_filters_to_opted_in_accounts() {
+        let events = vec![DomainEvent::ActivitiesChanged {
+            account_ids: vec!["acc1".to_string(), "acc2".to_string(), "acc3".to_string()],
+            asset_ids: vec![],
+            currencies: vec![],
+            earliest_activity_at_utc: None,
+        }];
+        // Only acc1 and acc3 are opted into spending.
+        let result = plan_categorization_job(&events, &opted_in(&["acc1", "acc3"]));
+        let mut sorted = result.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["acc1".to_string(), "acc3".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_categorization_job_empty_when_no_overlap() {
+        let events = vec![DomainEvent::ActivitiesChanged {
+            account_ids: vec!["acc-non-spending".to_string()],
+            asset_ids: vec![],
+            currencies: vec![],
+            earliest_activity_at_utc: None,
+        }];
+        let result = plan_categorization_job(&events, &opted_in(&["acc-spending"]));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_plan_categorization_job_empty_when_no_activity_events() {
+        let events = vec![
+            DomainEvent::AssetsCreated {
+                asset_ids: vec!["AAPL".to_string()],
+            },
+            DomainEvent::holdings_changed(vec!["acc1".to_string()], vec![]),
+        ];
+        // Asset events and holdings changes must not trigger categorization.
+        let result = plan_categorization_job(&events, &opted_in(&["acc1"]));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_plan_categorization_job_coalesces_multiple_events() {
+        let events = vec![
+            DomainEvent::ActivitiesChanged {
+                account_ids: vec!["acc1".to_string()],
+                asset_ids: vec![],
+                currencies: vec![],
+                earliest_activity_at_utc: None,
+            },
+            DomainEvent::ActivitiesChanged {
+                account_ids: vec!["acc1".to_string(), "acc2".to_string()],
+                asset_ids: vec![],
+                currencies: vec![],
+                earliest_activity_at_utc: None,
+            },
+        ];
+        let result = plan_categorization_job(&events, &opted_in(&["acc1", "acc2"]));
+        let mut sorted = result.clone();
+        sorted.sort();
+        assert_eq!(sorted, vec!["acc1".to_string(), "acc2".to_string()]);
+    }
+
+    #[test]
+    fn test_plan_categorization_job_empty_opted_in_yields_no_work() {
+        let events = vec![DomainEvent::ActivitiesChanged {
+            account_ids: vec!["acc1".to_string()],
+            asset_ids: vec![],
+            currencies: vec![],
+            earliest_activity_at_utc: None,
+        }];
+        let result = plan_categorization_job(&events, &HashSet::new());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn price_history_notifications_do_not_schedule_market_fetches() {
+        let events = vec![
+            DomainEvent::PriceHistoryChanged,
+            DomainEvent::PriceHistoryChanged,
+        ];
+        let job = plan_portfolio_job(&events).unwrap();
+        assert!(!job.market_sync_mode.requires_sync());
+        assert!(job.account_ids.is_none());
+    }
+
+    #[test]
+    fn price_history_notifications_preserve_other_portfolio_work() {
+        let events = vec![
+            DomainEvent::PriceHistoryChanged,
+            DomainEvent::ActivitiesChanged {
+                account_ids: vec!["acc1".to_string()],
+                asset_ids: vec![],
+                currencies: vec![],
+                earliest_activity_at_utc: None,
+            },
+        ];
+        let job = plan_portfolio_job(&events).unwrap();
+        assert!(job.account_ids.is_none());
+        assert!(job.market_sync_mode.requires_sync());
+    }
+}

@@ -1,0 +1,1324 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::sync::Mutex;
+use wealthfolio_core::activities::ActivityRepositoryTrait;
+
+use rust_decimal::Decimal;
+
+use super::matcher::{compile_regex_pattern, compile_rules, match_compiled, MAX_REGEX_PATTERN_LEN};
+use super::model::{
+    CategorizationRule, NewCategorizationRule, RuleAmountOp, RuleMatchType,
+    UpdateCategorizationRule,
+};
+use super::traits::CategorizationRulesRepositoryTrait;
+use crate::activity_assignments::{
+    ActivityTaxonomyAssignmentService, NewActivityTaxonomyAssignment,
+};
+use crate::error::SpendingError;
+
+pub struct CategorizationRulesService {
+    repo: Arc<dyn CategorizationRulesRepositoryTrait>,
+    activity_repo: Arc<dyn ActivityRepositoryTrait>,
+    assignment_service: Arc<ActivityTaxonomyAssignmentService>,
+    /// Serializes `rerun_all` against itself and against in-progress user
+    /// assignments. Without this, a background rerun's pre-built skip-set
+    /// can become stale relative to a concurrent manual assign, causing the
+    /// rerun's bulk_apply to clobber the manual write (race tracked in #28).
+    /// User-initiated `assign_*` calls are atomic at the DB layer for a
+    /// single (activity, taxonomy) pair and do NOT take this lock — the lock
+    /// only forces reruns to complete-or-wait, so a manual write that lands
+    /// during a rerun is sequenced after the rerun's transaction.
+    rerun_lock: Arc<Mutex<()>>,
+}
+
+impl CategorizationRulesService {
+    pub fn new(
+        repo: Arc<dyn CategorizationRulesRepositoryTrait>,
+        activity_repo: Arc<dyn ActivityRepositoryTrait>,
+        assignment_service: Arc<ActivityTaxonomyAssignmentService>,
+    ) -> Self {
+        Self {
+            repo,
+            activity_repo,
+            assignment_service,
+            rerun_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    pub async fn list(&self) -> Result<Vec<CategorizationRule>> {
+        self.repo.list().await
+    }
+    pub async fn get(&self, id: &str) -> Result<Option<CategorizationRule>> {
+        self.repo.get(id).await
+    }
+    pub async fn create(&self, mut new_rule: NewCategorizationRule) -> Result<CategorizationRule> {
+        validate_rule_scope(new_rule.is_global, new_rule.account_id.as_deref())?;
+        validate_rule_pattern(&new_rule.match_type, &new_rule.pattern)?;
+        // Normalize before validating: values without an operator are dropped,
+        // and only `between` keeps an upper value.
+        if new_rule.amount_op.is_none() {
+            new_rule.amount_value = None;
+            new_rule.amount_value2 = None;
+        } else if new_rule.amount_op != Some(RuleAmountOp::Between) {
+            new_rule.amount_value2 = None;
+        }
+        validate_rule_amount(
+            new_rule.amount_op,
+            new_rule.amount_value,
+            new_rule.amount_value2,
+        )?;
+        self.repo.create(new_rule).await
+    }
+    pub async fn update(
+        &self,
+        id: &str,
+        mut patch: UpdateCategorizationRule,
+    ) -> Result<CategorizationRule> {
+        // Resolve the post-patch (is_global, account_id) and reject contradictions.
+        let existing = self
+            .repo
+            .get(id)
+            .await?
+            .ok_or_else(|| SpendingError::NotFound {
+                entity: "Rule",
+                id: id.to_string(),
+            })?;
+        let new_global = patch.is_global.unwrap_or(existing.is_global);
+        let new_account = match &patch.account_id {
+            Some(opt) => opt.clone(),
+            None => existing.account_id.clone(),
+        };
+        validate_rule_scope(new_global, new_account.as_deref())?;
+        let new_match_type = patch.match_type.unwrap_or(existing.match_type);
+        let new_pattern = patch
+            .pattern
+            .as_deref()
+            .unwrap_or(existing.pattern.as_str());
+        validate_rule_pattern(&new_match_type, new_pattern)?;
+
+        // Resolve the post-patch amount condition, normalize it (clearing the
+        // operator clears both values; only `between` keeps an upper value),
+        // then validate the result.
+        let eff_op = patch.amount_op.unwrap_or(existing.amount_op);
+        let mut eff_value = patch.amount_value.unwrap_or(existing.amount_value);
+        let mut eff_value2 = patch.amount_value2.unwrap_or(existing.amount_value2);
+        if eff_op.is_none() {
+            if eff_value.is_some() {
+                patch.amount_value = Some(None);
+                eff_value = None;
+            }
+            if eff_value2.is_some() {
+                patch.amount_value2 = Some(None);
+                eff_value2 = None;
+            }
+        } else if eff_op != Some(RuleAmountOp::Between) && eff_value2.is_some() {
+            patch.amount_value2 = Some(None);
+            eff_value2 = None;
+        }
+        validate_rule_amount(eff_op, eff_value, eff_value2)?;
+        self.repo.update(id, patch).await
+    }
+    pub async fn delete(&self, id: &str) -> Result<()> {
+        self.repo.delete(id).await
+    }
+
+    /// Atomically create-or-update the rule identified by `new_rule.id`.
+    /// Unlike `create`/`update`, callers must supply an explicit id — this is
+    /// meant for callers (e.g. the addon bridge) that derive a stable id up
+    /// front and need create-or-update to be race-free against itself,
+    /// including when the same id is submitted twice in quick succession.
+    pub async fn upsert(&self, mut new_rule: NewCategorizationRule) -> Result<CategorizationRule> {
+        validate_rule_scope(new_rule.is_global, new_rule.account_id.as_deref())?;
+        validate_rule_pattern(&new_rule.match_type, &new_rule.pattern)?;
+        if new_rule.amount_op.is_none() {
+            new_rule.amount_value = None;
+            new_rule.amount_value2 = None;
+        } else if new_rule.amount_op != Some(RuleAmountOp::Between) {
+            new_rule.amount_value2 = None;
+        }
+        validate_rule_amount(
+            new_rule.amount_op,
+            new_rule.amount_value,
+            new_rule.amount_value2,
+        )?;
+        self.repo.upsert(new_rule).await
+    }
+
+    /// Re-run all rules against existing activities. Returns count of activities
+    /// matched by a rule (a rule that fires counts toward the total even when it
+    /// has no category target to write — matches the prior count semantics).
+    /// Filters to the provided account ids when non-empty (typically the spending accounts).
+    ///
+    /// `only_uncategorized=true` skips activities that already have any activity-scope
+    /// assignment (spending_categories or income_sources). Default safe behavior.
+    /// `only_uncategorized=false` overwrites existing rule/ai/history/import-sourced
+    /// assignments with the new rule target.
+    ///
+    /// **Manual categorizations (`source = "manual"`) are always preserved**, in
+    /// both modes. A user's explicit choice should never be wiped by a rule re-run.
+    pub async fn rerun_all(
+        &self,
+        account_ids: &[String],
+        only_uncategorized: bool,
+    ) -> Result<usize> {
+        if account_ids.is_empty() {
+            return Ok(0);
+        }
+        // Hold for the entire read-skip-set + write phase so two reruns can't
+        // interleave (each computes its own skip-set, then both writes fire).
+        let _guard = self.rerun_lock.lock().await;
+        let activities = self
+            .activity_repo
+            .get_activities_by_account_ids(account_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+        let ids: Vec<String> = activities.iter().map(|a| a.id.clone()).collect();
+        let assignments = self.assignment_service.list_for_activities(&ids).await?;
+
+        // Skip-key is (activity_id, taxonomy_id) — never `activity_id` alone.
+        // That preserves cross-taxonomy independence: a manual `income_sources`
+        // assignment must not block a `spending_categories` rule for the same
+        // activity. We also no longer hardcode the taxonomy ids — we trust the
+        // assignment row's own `source` field.
+        //
+        // - `manual_keys`: pairs that must never be overwritten (manual wins).
+        // - `any_keys`:    pairs with any existing assignment — used only when
+        //   `only_uncategorized=true` to block rule-overwrites of rule/import/ai
+        //   assignments.
+        let mut manual_keys: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut any_keys: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for a in &assignments {
+            let key = (a.activity_id.clone(), a.taxonomy_id.clone());
+            if a.source == "manual" {
+                manual_keys.insert(key.clone());
+            }
+            any_keys.insert(key);
+        }
+
+        let rules = self.repo.list().await?;
+        let compiled = compile_rules(&rules);
+
+        let mut matched_count = 0usize;
+        let mut writes: Vec<NewActivityTaxonomyAssignment> = Vec::with_capacity(activities.len());
+        for a in &activities {
+            let notes_raw = a.notes.as_deref().unwrap_or("");
+            let notes_upper = notes_raw.to_uppercase();
+            let Some(m) = match_compiled(
+                &compiled,
+                &notes_upper,
+                notes_raw,
+                a.effective_type(),
+                &a.account_id,
+                a.amount.map(|d| d.abs()),
+            ) else {
+                continue;
+            };
+            matched_count += 1;
+            if let (Some(tax_id), Some(cat_id)) =
+                (m.rule.taxonomy_id.clone(), m.rule.category_id.clone())
+            {
+                let key = (a.id.clone(), tax_id.clone());
+                if manual_keys.contains(&key) {
+                    continue;
+                }
+                if only_uncategorized && any_keys.contains(&key) {
+                    continue;
+                }
+                writes.push(NewActivityTaxonomyAssignment {
+                    id: None,
+                    activity_id: a.id.clone(),
+                    taxonomy_id: tax_id,
+                    category_id: cat_id,
+                    weight: 10_000,
+                    source: "rule".to_string(),
+                });
+            }
+        }
+
+        self.assignment_service
+            .bulk_apply_rule_assignments(writes, only_uncategorized)
+            .await?;
+        Ok(matched_count)
+    }
+}
+
+fn validate_rule_pattern(match_type: &RuleMatchType, pattern: &str) -> Result<()> {
+    if !matches!(match_type, RuleMatchType::Regex) {
+        return Ok(());
+    }
+    if pattern.len() > MAX_REGEX_PATTERN_LEN {
+        return Err(SpendingError::InvalidInput {
+            message: format!("Regex pattern must be {MAX_REGEX_PATTERN_LEN} characters or fewer"),
+        }
+        .into());
+    }
+    compile_regex_pattern(pattern).map_err(|err| SpendingError::InvalidInput {
+        message: format!("Invalid regex pattern: {err}"),
+    })?;
+    Ok(())
+}
+
+/// Validate a normalized amount condition. Callers normalize first (no
+/// operator ⇒ no values, non-`between` ⇒ no upper value), so this only has to
+/// check what the user could still get wrong.
+fn validate_rule_amount(
+    op: Option<RuleAmountOp>,
+    value: Option<Decimal>,
+    value2: Option<Decimal>,
+) -> Result<()> {
+    let Some(op) = op else {
+        return Ok(());
+    };
+    let Some(value) = value else {
+        return Err(SpendingError::InvalidInput {
+            message: "Amount condition requires a value".to_string(),
+        }
+        .into());
+    };
+    if value < Decimal::ZERO || value2.is_some_and(|v| v < Decimal::ZERO) {
+        return Err(SpendingError::InvalidInput {
+            message: "Amount values cannot be negative".to_string(),
+        }
+        .into());
+    }
+    if op == RuleAmountOp::Between {
+        let Some(value2) = value2 else {
+            return Err(SpendingError::InvalidInput {
+                message: "Between amount condition requires an upper value".to_string(),
+            }
+            .into());
+        };
+        if value > value2 {
+            return Err(SpendingError::InvalidInput {
+                message: "Amount range lower value must be less than or equal to the upper value"
+                    .to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_rule_scope(is_global: bool, account_id: Option<&str>) -> Result<()> {
+    if is_global && account_id.is_some() {
+        return Err(SpendingError::GlobalRuleHasAccount.into());
+    }
+    if !is_global && account_id.unwrap_or_default().is_empty() {
+        return Err(SpendingError::InvalidInput {
+            message: "Account-scoped rules require accountId".to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::activity_assignments::{
+        ActivityTaxonomyAssignment, ActivityTaxonomyAssignmentRepositoryTrait,
+    };
+    use async_trait::async_trait;
+    use chrono::{DateTime, NaiveDate, Utc};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use wealthfolio_core::activities::{
+        Activity, ActivityBulkMutationResult, ActivitySearchResponse, ActivityStatus,
+        ActivityUpdate, ActivityUpsert, BulkUpsertResult, IncomeData, NewActivity, Sort,
+    };
+
+    struct MockRulesRepo {
+        rules: Mutex<Vec<CategorizationRule>>,
+    }
+
+    #[async_trait]
+    impl CategorizationRulesRepositoryTrait for MockRulesRepo {
+        async fn list(&self) -> Result<Vec<CategorizationRule>> {
+            Ok(self.rules.lock().unwrap().clone())
+        }
+        async fn get(&self, id: &str) -> Result<Option<CategorizationRule>> {
+            Ok(self
+                .rules
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|rule| rule.id == id)
+                .cloned())
+        }
+        async fn create(&self, n: NewCategorizationRule) -> Result<CategorizationRule> {
+            let now = Utc::now().naive_utc();
+            let rule = CategorizationRule {
+                id: n.id.unwrap_or_else(|| {
+                    format!("rule-{}", now.and_utc().timestamp_nanos_opt().unwrap())
+                }),
+                name: n.name,
+                pattern: n.pattern,
+                match_type: n.match_type,
+                taxonomy_id: n.taxonomy_id,
+                category_id: n.category_id,
+                activity_type: n.activity_type,
+                amount_op: n.amount_op,
+                amount_value: n.amount_value,
+                amount_value2: n.amount_value2,
+                priority: n.priority,
+                is_global: n.is_global,
+                account_id: n.account_id,
+                preset_id: None,
+                preset_rule_key: None,
+                preset_version: None,
+                preset_modified: false,
+                created_at: now,
+                updated_at: now,
+            };
+            self.rules.lock().unwrap().push(rule.clone());
+            Ok(rule)
+        }
+        async fn update(
+            &self,
+            id: &str,
+            p: UpdateCategorizationRule,
+        ) -> Result<CategorizationRule> {
+            let mut rules = self.rules.lock().unwrap();
+            let rule = rules
+                .iter_mut()
+                .find(|rule| rule.id == id)
+                .expect("rule exists");
+            if let Some(v) = p.name {
+                rule.name = v;
+            }
+            if let Some(v) = p.pattern {
+                rule.pattern = v;
+            }
+            if let Some(v) = p.match_type {
+                rule.match_type = v;
+            }
+            if let Some(v) = p.taxonomy_id {
+                rule.taxonomy_id = v;
+            }
+            if let Some(v) = p.category_id {
+                rule.category_id = v;
+            }
+            if let Some(v) = p.activity_type {
+                rule.activity_type = v;
+            }
+            if let Some(v) = p.amount_op {
+                rule.amount_op = v;
+            }
+            if let Some(v) = p.amount_value {
+                rule.amount_value = v;
+            }
+            if let Some(v) = p.amount_value2 {
+                rule.amount_value2 = v;
+            }
+            if let Some(v) = p.priority {
+                rule.priority = v;
+            }
+            if let Some(v) = p.is_global {
+                rule.is_global = v;
+            }
+            if let Some(v) = p.account_id {
+                rule.account_id = v;
+            }
+            rule.updated_at = Utc::now().naive_utc();
+            Ok(rule.clone())
+        }
+        async fn upsert(&self, n: NewCategorizationRule) -> Result<CategorizationRule> {
+            let id = n.id.clone().expect("upsert requires an explicit id");
+            let exists = self.rules.lock().unwrap().iter().any(|rule| rule.id == id);
+            if exists {
+                let patch = UpdateCategorizationRule {
+                    name: Some(n.name),
+                    pattern: Some(n.pattern),
+                    match_type: Some(n.match_type),
+                    taxonomy_id: Some(n.taxonomy_id),
+                    category_id: Some(n.category_id),
+                    activity_type: Some(n.activity_type),
+                    amount_op: Some(n.amount_op),
+                    amount_value: Some(n.amount_value),
+                    amount_value2: Some(n.amount_value2),
+                    priority: Some(n.priority),
+                    is_global: Some(n.is_global),
+                    account_id: Some(n.account_id),
+                };
+                self.update(&id, patch).await
+            } else {
+                self.create(n).await
+            }
+        }
+
+        async fn delete(&self, _id: &str) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[derive(Default)]
+    struct MockAssignmentRepo {
+        existing: Mutex<Vec<ActivityTaxonomyAssignment>>,
+        writes: Mutex<Vec<NewActivityTaxonomyAssignment>>,
+    }
+
+    #[async_trait]
+    impl ActivityTaxonomyAssignmentRepositoryTrait for MockAssignmentRepo {
+        async fn list_for_activity(&self, _: &str) -> Result<Vec<ActivityTaxonomyAssignment>> {
+            unimplemented!()
+        }
+        async fn list_for_activities(
+            &self,
+            ids: &[String],
+        ) -> Result<Vec<ActivityTaxonomyAssignment>> {
+            let id_set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+            Ok(self
+                .existing
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|a| id_set.contains(a.activity_id.as_str()))
+                .cloned()
+                .collect())
+        }
+        async fn upsert(
+            &self,
+            _: NewActivityTaxonomyAssignment,
+        ) -> Result<ActivityTaxonomyAssignment> {
+            unimplemented!()
+        }
+        async fn assign_many_single_select(
+            &self,
+            items: Vec<NewActivityTaxonomyAssignment>,
+        ) -> Result<Vec<ActivityTaxonomyAssignment>> {
+            self.writes.lock().unwrap().extend(items.iter().cloned());
+            // Mirror real DB: a successful write becomes visible to subsequent
+            // `list_for_activities` calls. Replaces any prior row with the
+            // same (activity_id, taxonomy_id) pair to match the storage layer's
+            // single-select delete-then-insert semantics.
+            let rows: Vec<ActivityTaxonomyAssignment> = items
+                .into_iter()
+                .map(|n| ActivityTaxonomyAssignment {
+                    id: format!("row-{}-{}", n.activity_id, n.taxonomy_id),
+                    activity_id: n.activity_id,
+                    taxonomy_id: n.taxonomy_id,
+                    category_id: n.category_id,
+                    weight: n.weight,
+                    source: n.source,
+                    created_at: Utc::now().naive_utc(),
+                    updated_at: Utc::now().naive_utc(),
+                })
+                .collect();
+            {
+                let mut existing = self.existing.lock().unwrap();
+                for row in &rows {
+                    existing.retain(|a| {
+                        !(a.activity_id == row.activity_id && a.taxonomy_id == row.taxonomy_id)
+                    });
+                    existing.push(row.clone());
+                }
+            }
+            Ok(rows)
+        }
+
+        async fn assign_many_single_select_clearing_splits(
+            &self,
+            items: Vec<NewActivityTaxonomyAssignment>,
+        ) -> Result<Vec<ActivityTaxonomyAssignment>> {
+            self.assign_many_single_select(items).await
+        }
+        async fn assign_rule_many_single_select(
+            &self,
+            items: Vec<NewActivityTaxonomyAssignment>,
+            only_uncategorized: bool,
+        ) -> Result<Vec<ActivityTaxonomyAssignment>> {
+            let mut rows = Vec::new();
+            let mut existing = self.existing.lock().unwrap();
+            for item in items {
+                let current: Vec<ActivityTaxonomyAssignment> = existing
+                    .iter()
+                    .filter(|a| {
+                        a.activity_id == item.activity_id && a.taxonomy_id == item.taxonomy_id
+                    })
+                    .cloned()
+                    .collect();
+                if current
+                    .iter()
+                    .any(|a| a.source.eq_ignore_ascii_case("manual"))
+                {
+                    continue;
+                }
+                if only_uncategorized && !current.is_empty() {
+                    continue;
+                }
+                self.writes.lock().unwrap().push(item.clone());
+                let row = ActivityTaxonomyAssignment {
+                    id: format!("row-{}-{}", item.activity_id, item.taxonomy_id),
+                    activity_id: item.activity_id,
+                    taxonomy_id: item.taxonomy_id,
+                    category_id: item.category_id,
+                    weight: item.weight,
+                    source: item.source,
+                    created_at: Utc::now().naive_utc(),
+                    updated_at: Utc::now().naive_utc(),
+                };
+                existing.retain(|a| {
+                    !(a.activity_id == row.activity_id && a.taxonomy_id == row.taxonomy_id)
+                });
+                existing.push(row.clone());
+                rows.push(row);
+            }
+            Ok(rows)
+        }
+        async fn delete(&self, _id: &str) -> Result<()> {
+            unimplemented!()
+        }
+        async fn clear_for_taxonomy(&self, _: &str, _: &str) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    struct MockActivityRepo {
+        activities: Vec<Activity>,
+    }
+
+    fn mk_activity(id: &str, account: &str, notes: &str) -> Activity {
+        Activity {
+            id: id.to_string(),
+            account_id: account.to_string(),
+            asset_id: None,
+            activity_type: "WITHDRAWAL".to_string(),
+            activity_type_override: None,
+            source_type: None,
+            subtype: None,
+            status: ActivityStatus::Posted,
+            activity_date: Utc::now(),
+            settlement_date: None,
+            quantity: None,
+            unit_price: None,
+            amount: None,
+            fee: None,
+            tax: None,
+            currency: "USD".to_string(),
+            fx_rate: None,
+            notes: Some(notes.to_string()),
+            metadata: None,
+            source_system: None,
+            source_record_id: None,
+            source_group_id: None,
+            idempotency_key: None,
+            import_run_id: None,
+            is_user_modified: false,
+            needs_review: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[async_trait]
+    impl ActivityRepositoryTrait for MockActivityRepo {
+        fn get_activity(&self, _: &str) -> wealthfolio_core::Result<Activity> {
+            unimplemented!()
+        }
+        fn get_activities(&self) -> wealthfolio_core::Result<Vec<Activity>> {
+            Ok(self.activities.clone())
+        }
+        fn get_activities_by_account_id(&self, _: &str) -> wealthfolio_core::Result<Vec<Activity>> {
+            unimplemented!()
+        }
+        fn get_activities_by_account_ids(
+            &self,
+            ids: &[String],
+        ) -> wealthfolio_core::Result<Vec<Activity>> {
+            let set: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+            Ok(self
+                .activities
+                .iter()
+                .filter(|a| set.contains(a.account_id.as_str()))
+                .cloned()
+                .collect())
+        }
+        fn get_trading_activities(&self) -> wealthfolio_core::Result<Vec<Activity>> {
+            unimplemented!()
+        }
+        fn get_income_activities(&self) -> wealthfolio_core::Result<Vec<Activity>> {
+            unimplemented!()
+        }
+
+        fn search_activities(
+            &self,
+            _: i64,
+            _: i64,
+            _: Option<Vec<String>>,
+            _: Option<Vec<String>>,
+            _: Option<String>,
+            _: Option<Sort>,
+            _: Option<bool>,
+            _: Option<NaiveDate>,
+            _: Option<NaiveDate>,
+            _: Option<Vec<String>>,
+            _: Option<Vec<String>>,
+        ) -> wealthfolio_core::Result<ActivitySearchResponse> {
+            unimplemented!()
+        }
+        async fn create_activity(&self, _: NewActivity) -> wealthfolio_core::Result<Activity> {
+            unimplemented!()
+        }
+        async fn update_activity(&self, _: ActivityUpdate) -> wealthfolio_core::Result<Activity> {
+            unimplemented!()
+        }
+        async fn delete_activity(&self, _: String) -> wealthfolio_core::Result<Activity> {
+            unimplemented!()
+        }
+        async fn link_transfer_activities(
+            &self,
+            _: String,
+            _: String,
+        ) -> wealthfolio_core::Result<(Activity, Activity)> {
+            unimplemented!()
+        }
+        async fn unlink_transfer_activities(
+            &self,
+            _: String,
+            _: String,
+        ) -> wealthfolio_core::Result<(Activity, Activity)> {
+            unimplemented!()
+        }
+        async fn bulk_mutate_activities(
+            &self,
+            _: Vec<NewActivity>,
+            _: Vec<ActivityUpdate>,
+            _: Vec<String>,
+        ) -> wealthfolio_core::Result<ActivityBulkMutationResult> {
+            unimplemented!()
+        }
+        async fn create_activities(&self, _: Vec<NewActivity>) -> wealthfolio_core::Result<usize> {
+            unimplemented!()
+        }
+        fn get_first_activity_date(
+            &self,
+            _: Option<&[String]>,
+        ) -> wealthfolio_core::Result<Option<DateTime<Utc>>> {
+            unimplemented!()
+        }
+
+        fn get_income_activities_data(
+            &self,
+            _: Option<&[String]>,
+        ) -> wealthfolio_core::Result<Vec<IncomeData>> {
+            unimplemented!()
+        }
+        fn get_first_activity_date_overall(&self) -> wealthfolio_core::Result<DateTime<Utc>> {
+            unimplemented!()
+        }
+        fn get_activity_bounds_for_assets(
+            &self,
+            _: &[String],
+        ) -> wealthfolio_core::Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>>
+        {
+            unimplemented!()
+        }
+        fn get_holdings_snapshot_bounds_for_assets(
+            &self,
+            _: &[String],
+        ) -> wealthfolio_core::Result<HashMap<String, (Option<NaiveDate>, Option<NaiveDate>)>>
+        {
+            unimplemented!()
+        }
+        fn check_existing_duplicates(
+            &self,
+            _: &[String],
+        ) -> wealthfolio_core::Result<HashMap<String, String>> {
+            unimplemented!()
+        }
+        async fn bulk_upsert(
+            &self,
+            _: Vec<ActivityUpsert>,
+        ) -> wealthfolio_core::Result<BulkUpsertResult> {
+            unimplemented!()
+        }
+        async fn reassign_asset(&self, _: &str, _: &str) -> wealthfolio_core::Result<u32> {
+            unimplemented!()
+        }
+        async fn get_activity_accounts_and_currencies_by_asset_id(
+            &self,
+            _: &str,
+        ) -> wealthfolio_core::Result<(Vec<String>, Vec<String>)> {
+            unimplemented!()
+        }
+    }
+
+    fn mk_rule(id: &str, pattern: &str, tax: &str, cat: &str, priority: i32) -> CategorizationRule {
+        CategorizationRule {
+            id: id.to_string(),
+            name: id.to_string(),
+            pattern: pattern.to_string(),
+            match_type: RuleMatchType::Contains,
+            taxonomy_id: Some(tax.to_string()),
+            category_id: Some(cat.to_string()),
+            activity_type: None,
+            amount_op: None,
+            amount_value: None,
+            amount_value2: None,
+            priority,
+            is_global: true,
+            account_id: None,
+            preset_id: None,
+            preset_rule_key: None,
+            preset_version: None,
+            preset_modified: false,
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        }
+    }
+
+    fn mk_assignment(
+        activity_id: &str,
+        tax: &str,
+        cat: &str,
+        source: &str,
+    ) -> ActivityTaxonomyAssignment {
+        ActivityTaxonomyAssignment {
+            id: format!("a-{activity_id}-{tax}"),
+            activity_id: activity_id.to_string(),
+            taxonomy_id: tax.to_string(),
+            category_id: cat.to_string(),
+            weight: 10_000,
+            source: source.to_string(),
+            created_at: Utc::now().naive_utc(),
+            updated_at: Utc::now().naive_utc(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rerun_does_not_skip_cross_taxonomy_for_manual_income() {
+        // Activity has a manual income_sources assignment and NO spending_categories
+        // assignment. A rule targeting spending_categories should still apply.
+        let rule = mk_rule("r1", "AMAZON", "spending_categories", "cat_food", 10);
+        let rules_repo = Arc::new(MockRulesRepo {
+            rules: Mutex::new(vec![rule]),
+        });
+        let assignment_repo = Arc::new(MockAssignmentRepo {
+            existing: Mutex::new(vec![mk_assignment(
+                "act1",
+                "income_sources",
+                "src_paycheck",
+                "manual",
+            )]),
+            writes: Mutex::new(vec![]),
+        });
+        let activity_repo = Arc::new(MockActivityRepo {
+            activities: vec![mk_activity("act1", "acct1", "AMAZON ORDER #123")],
+        });
+        let assignment_service = Arc::new(ActivityTaxonomyAssignmentService::new(
+            assignment_repo.clone() as Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        ));
+        let svc = CategorizationRulesService::new(
+            rules_repo as Arc<dyn CategorizationRulesRepositoryTrait>,
+            activity_repo as Arc<dyn ActivityRepositoryTrait>,
+            assignment_service,
+        );
+
+        let matched = svc
+            .rerun_all(&["acct1".to_string()], /* only_uncategorized */ false)
+            .await
+            .unwrap();
+        assert_eq!(matched, 1, "rule should have matched");
+
+        let writes = assignment_repo.writes.lock().unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "spending_categories assignment should be written"
+        );
+        assert_eq!(writes[0].activity_id, "act1");
+        assert_eq!(writes[0].taxonomy_id, "spending_categories");
+        assert_eq!(writes[0].category_id, "cat_food");
+
+        // The existing manual income_sources row is untouched — nothing was
+        // written targeting (act1, income_sources).
+        assert!(!writes.iter().any(|w| w.taxonomy_id == "income_sources"));
+        let still_there = assignment_repo
+            .existing
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|a| a.taxonomy_id == "income_sources" && a.source == "manual");
+        assert!(still_there);
+    }
+
+    #[tokio::test]
+    async fn rerun_preserves_manual_same_taxonomy() {
+        let rule = mk_rule("r1", "AMAZON", "spending_categories", "cat_food", 10);
+        let rules_repo = Arc::new(MockRulesRepo {
+            rules: Mutex::new(vec![rule]),
+        });
+        let assignment_repo = Arc::new(MockAssignmentRepo {
+            existing: Mutex::new(vec![mk_assignment(
+                "act1",
+                "spending_categories",
+                "cat_other",
+                "manual",
+            )]),
+            writes: Mutex::new(vec![]),
+        });
+        let activity_repo = Arc::new(MockActivityRepo {
+            activities: vec![mk_activity("act1", "acct1", "AMAZON ORDER #123")],
+        });
+        let assignment_service = Arc::new(ActivityTaxonomyAssignmentService::new(
+            assignment_repo.clone() as Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        ));
+        let svc = CategorizationRulesService::new(
+            rules_repo as Arc<dyn CategorizationRulesRepositoryTrait>,
+            activity_repo as Arc<dyn ActivityRepositoryTrait>,
+            assignment_service,
+        );
+
+        let _ = svc.rerun_all(&["acct1".to_string()], false).await.unwrap();
+        let writes = assignment_repo.writes.lock().unwrap();
+        assert!(
+            writes.is_empty(),
+            "manual same-taxonomy must block the rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_rerun_all_do_not_interleave() {
+        // Two reruns are spawned concurrently against the same single matching
+        // activity with `only_uncategorized=true`. With the rerun_lock in place,
+        // the first rerun's write becomes visible to the second's skip-set
+        // (the mock now mirrors writes into `existing`), so the second rerun
+        // writes nothing. Without the lock, both skip-sets are built before
+        // either write fires and the activity is written twice.
+        let rule = mk_rule("r1", "AMAZON", "spending_categories", "cat_food", 10);
+        let rules_repo = Arc::new(MockRulesRepo {
+            rules: Mutex::new(vec![rule]),
+        });
+        let assignment_repo = Arc::new(MockAssignmentRepo::default());
+        let activity_repo = Arc::new(MockActivityRepo {
+            activities: vec![mk_activity("act1", "acct1", "AMAZON ORDER #123")],
+        });
+        let assignment_service = Arc::new(ActivityTaxonomyAssignmentService::new(
+            assignment_repo.clone() as Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        ));
+        let svc = Arc::new(CategorizationRulesService::new(
+            rules_repo as Arc<dyn CategorizationRulesRepositoryTrait>,
+            activity_repo as Arc<dyn ActivityRepositoryTrait>,
+            assignment_service,
+        ));
+
+        let svc_a = svc.clone();
+        let svc_b = svc.clone();
+        let (a, b) = tokio::join!(
+            tokio::spawn(async move {
+                svc_a
+                    .rerun_all(&["acct1".to_string()], /* only_uncategorized */ true)
+                    .await
+            }),
+            tokio::spawn(async move {
+                svc_b
+                    .rerun_all(&["acct1".to_string()], /* only_uncategorized */ true)
+                    .await
+            }),
+        );
+        a.unwrap().unwrap();
+        b.unwrap().unwrap();
+
+        let writes = assignment_repo.writes.lock().unwrap();
+        assert_eq!(
+            writes.len(),
+            1,
+            "with serialized reruns, the second rerun's skip-set must see the first's write and skip — got {} writes ({:?})",
+            writes.len(),
+            writes
+                .iter()
+                .map(|w| (w.activity_id.clone(), w.taxonomy_id.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_global_with_account_id() {
+        let rules_repo = Arc::new(MockRulesRepo {
+            rules: Mutex::new(vec![]),
+        });
+        let assignment_repo = Arc::new(MockAssignmentRepo::default());
+        let assignment_service = Arc::new(ActivityTaxonomyAssignmentService::new(
+            assignment_repo as Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        ));
+        let activity_repo = Arc::new(MockActivityRepo { activities: vec![] });
+        let svc = CategorizationRulesService::new(
+            rules_repo as Arc<dyn CategorizationRulesRepositoryTrait>,
+            activity_repo as Arc<dyn ActivityRepositoryTrait>,
+            assignment_service,
+        );
+
+        let err = svc
+            .create(NewCategorizationRule {
+                id: None,
+                name: "x".to_string(),
+                pattern: "AMAZON".to_string(),
+                match_type: RuleMatchType::Contains,
+                taxonomy_id: Some("spending_categories".to_string()),
+                category_id: Some("cat_food".to_string()),
+                activity_type: None,
+                amount_op: None,
+                amount_value: None,
+                amount_value2: None,
+                priority: 1,
+                is_global: true,
+                account_id: Some("acct1".to_string()),
+            })
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("global rule cannot also have an account_id"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_account_scope_without_account_id() {
+        let rules_repo = Arc::new(MockRulesRepo {
+            rules: Mutex::new(vec![]),
+        });
+        let assignment_repo = Arc::new(MockAssignmentRepo::default());
+        let assignment_service = Arc::new(ActivityTaxonomyAssignmentService::new(
+            assignment_repo as Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        ));
+        let activity_repo = Arc::new(MockActivityRepo { activities: vec![] });
+        let svc = CategorizationRulesService::new(
+            rules_repo as Arc<dyn CategorizationRulesRepositoryTrait>,
+            activity_repo as Arc<dyn ActivityRepositoryTrait>,
+            assignment_service,
+        );
+
+        let err = svc
+            .create(NewCategorizationRule {
+                id: None,
+                name: "x".to_string(),
+                pattern: "AMAZON".to_string(),
+                match_type: RuleMatchType::Contains,
+                taxonomy_id: Some("spending_categories".to_string()),
+                category_id: Some("cat_food".to_string()),
+                activity_type: None,
+                amount_op: None,
+                amount_value: None,
+                amount_value2: None,
+                priority: 1,
+                is_global: false,
+                account_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Account-scoped rules require accountId"));
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_regex_pattern() {
+        let rules_repo = Arc::new(MockRulesRepo {
+            rules: Mutex::new(vec![]),
+        });
+        let assignment_repo = Arc::new(MockAssignmentRepo::default());
+        let assignment_service = Arc::new(ActivityTaxonomyAssignmentService::new(
+            assignment_repo as Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        ));
+        let activity_repo = Arc::new(MockActivityRepo { activities: vec![] });
+        let svc = CategorizationRulesService::new(
+            rules_repo as Arc<dyn CategorizationRulesRepositoryTrait>,
+            activity_repo as Arc<dyn ActivityRepositoryTrait>,
+            assignment_service,
+        );
+
+        let err = svc
+            .create(NewCategorizationRule {
+                id: None,
+                name: "bad regex".to_string(),
+                pattern: "(unclosed".to_string(),
+                match_type: RuleMatchType::Regex,
+                taxonomy_id: Some("spending_categories".to_string()),
+                category_id: Some("cat_food".to_string()),
+                activity_type: None,
+                amount_op: None,
+                amount_value: None,
+                amount_value2: None,
+                priority: 1,
+                is_global: true,
+                account_id: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid regex pattern"));
+    }
+
+    #[tokio::test]
+    async fn update_rejects_invalid_regex_pattern() {
+        let rules_repo = Arc::new(MockRulesRepo {
+            rules: Mutex::new(vec![mk_rule(
+                "rule-1",
+                "AMAZON",
+                "spending_categories",
+                "cat_food",
+                1,
+            )]),
+        });
+        let assignment_repo = Arc::new(MockAssignmentRepo::default());
+        let assignment_service = Arc::new(ActivityTaxonomyAssignmentService::new(
+            assignment_repo as Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        ));
+        let activity_repo = Arc::new(MockActivityRepo { activities: vec![] });
+        let svc = CategorizationRulesService::new(
+            rules_repo as Arc<dyn CategorizationRulesRepositoryTrait>,
+            activity_repo as Arc<dyn ActivityRepositoryTrait>,
+            assignment_service,
+        );
+
+        let err = svc
+            .update(
+                "rule-1",
+                UpdateCategorizationRule {
+                    pattern: Some("(unclosed".to_string()),
+                    match_type: Some(RuleMatchType::Regex),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid regex pattern"));
+    }
+
+    fn dec(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    fn mk_svc(
+        rules: Vec<CategorizationRule>,
+        activities: Vec<Activity>,
+    ) -> (
+        CategorizationRulesService,
+        Arc<MockRulesRepo>,
+        Arc<MockAssignmentRepo>,
+    ) {
+        let rules_repo = Arc::new(MockRulesRepo {
+            rules: Mutex::new(rules),
+        });
+        let assignment_repo = Arc::new(MockAssignmentRepo::default());
+        let assignment_service = Arc::new(ActivityTaxonomyAssignmentService::new(
+            assignment_repo.clone() as Arc<dyn ActivityTaxonomyAssignmentRepositoryTrait>,
+        ));
+        let activity_repo = Arc::new(MockActivityRepo { activities });
+        let svc = CategorizationRulesService::new(
+            rules_repo.clone() as Arc<dyn CategorizationRulesRepositoryTrait>,
+            activity_repo as Arc<dyn ActivityRepositoryTrait>,
+            assignment_service,
+        );
+        (svc, rules_repo, assignment_repo)
+    }
+
+    fn base_new_rule() -> NewCategorizationRule {
+        NewCategorizationRule {
+            id: None,
+            name: "amount rule".to_string(),
+            pattern: "AMAZON".to_string(),
+            match_type: RuleMatchType::Contains,
+            taxonomy_id: Some("spending_categories".to_string()),
+            category_id: Some("cat_food".to_string()),
+            activity_type: None,
+            amount_op: None,
+            amount_value: None,
+            amount_value2: None,
+            priority: 1,
+            is_global: true,
+            account_id: None,
+        }
+    }
+
+    #[test]
+    fn validate_rule_amount_matrix() {
+        // Positive: every operator with a value; between inclusive of equal bounds; zero.
+        for op in [
+            RuleAmountOp::Eq,
+            RuleAmountOp::Gt,
+            RuleAmountOp::Gte,
+            RuleAmountOp::Lt,
+            RuleAmountOp::Lte,
+        ] {
+            assert!(validate_rule_amount(Some(op), Some(dec("10.50")), None).is_ok());
+        }
+        assert!(validate_rule_amount(
+            Some(RuleAmountOp::Between),
+            Some(dec("10")),
+            Some(dec("20"))
+        )
+        .is_ok());
+        assert!(validate_rule_amount(
+            Some(RuleAmountOp::Between),
+            Some(dec("10")),
+            Some(dec("10"))
+        )
+        .is_ok());
+        assert!(validate_rule_amount(Some(RuleAmountOp::Eq), Some(dec("0")), None).is_ok());
+        assert!(validate_rule_amount(None, None, None).is_ok());
+
+        // Negative: missing value, missing upper, swapped bounds, negative values.
+        assert!(validate_rule_amount(Some(RuleAmountOp::Gt), None, None).is_err());
+        assert!(validate_rule_amount(Some(RuleAmountOp::Between), Some(dec("10")), None).is_err());
+        assert!(validate_rule_amount(
+            Some(RuleAmountOp::Between),
+            Some(dec("20")),
+            Some(dec("10"))
+        )
+        .is_err());
+        assert!(validate_rule_amount(Some(RuleAmountOp::Gt), Some(dec("-1")), None).is_err());
+        assert!(
+            validate_rule_amount(Some(RuleAmountOp::Between), Some(dec("1")), Some(dec("-2")))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_normalizes_amount_condition() {
+        let (svc, _, _) = mk_svc(vec![], vec![]);
+
+        // Values without an operator are dropped rather than stored.
+        let mut no_op = base_new_rule();
+        no_op.amount_value = Some(dec("50"));
+        no_op.amount_value2 = Some(dec("60"));
+        let created = svc.create(no_op).await.unwrap();
+        assert_eq!(created.amount_op, None);
+        assert_eq!(created.amount_value, None);
+        assert_eq!(created.amount_value2, None);
+
+        // A non-between operator drops the stale upper value.
+        let mut gt = base_new_rule();
+        gt.amount_op = Some(RuleAmountOp::Gt);
+        gt.amount_value = Some(dec("100"));
+        gt.amount_value2 = Some(dec("200"));
+        let created = svc.create(gt).await.unwrap();
+        assert_eq!(created.amount_op, Some(RuleAmountOp::Gt));
+        assert_eq!(created.amount_value, Some(dec("100")));
+        assert_eq!(created.amount_value2, None);
+    }
+
+    #[tokio::test]
+    async fn create_rejects_invalid_amount_conditions() {
+        let (svc, _, _) = mk_svc(vec![], vec![]);
+
+        let mut missing_value = base_new_rule();
+        missing_value.amount_op = Some(RuleAmountOp::Gte);
+        let err = svc.create(missing_value).await.unwrap_err();
+        assert!(err.to_string().contains("requires a value"));
+
+        let mut swapped = base_new_rule();
+        swapped.amount_op = Some(RuleAmountOp::Between);
+        swapped.amount_value = Some(dec("55"));
+        swapped.amount_value2 = Some(dec("45"));
+        let err = svc.create(swapped).await.unwrap_err();
+        assert!(err.to_string().contains("less than or equal"));
+
+        let mut negative = base_new_rule();
+        negative.amount_op = Some(RuleAmountOp::Lt);
+        negative.amount_value = Some(dec("-5"));
+        let err = svc.create(negative).await.unwrap_err();
+        assert!(err.to_string().contains("cannot be negative"));
+    }
+
+    #[tokio::test]
+    async fn update_clearing_op_clears_values() {
+        let mut rule = mk_rule("r1", "AMAZON", "spending_categories", "cat_food", 1);
+        rule.amount_op = Some(RuleAmountOp::Between);
+        rule.amount_value = Some(dec("10"));
+        rule.amount_value2 = Some(dec("20"));
+        let (svc, _, _) = mk_svc(vec![rule], vec![]);
+
+        let updated = svc
+            .update(
+                "r1",
+                UpdateCategorizationRule {
+                    amount_op: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.amount_op, None);
+        assert_eq!(updated.amount_value, None);
+        assert_eq!(updated.amount_value2, None);
+    }
+
+    #[tokio::test]
+    async fn update_changing_op_from_between_drops_upper_value() {
+        let mut rule = mk_rule("r1", "AMAZON", "spending_categories", "cat_food", 1);
+        rule.amount_op = Some(RuleAmountOp::Between);
+        rule.amount_value = Some(dec("10"));
+        rule.amount_value2 = Some(dec("20"));
+        let (svc, _, _) = mk_svc(vec![rule], vec![]);
+
+        let updated = svc
+            .update(
+                "r1",
+                UpdateCategorizationRule {
+                    amount_op: Some(Some(RuleAmountOp::Gt)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.amount_op, Some(RuleAmountOp::Gt));
+        assert_eq!(updated.amount_value, Some(dec("10")));
+        assert_eq!(updated.amount_value2, None);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_swapped_between_bounds() {
+        let mut rule = mk_rule("r1", "AMAZON", "spending_categories", "cat_food", 1);
+        rule.amount_op = Some(RuleAmountOp::Between);
+        rule.amount_value = Some(dec("10"));
+        rule.amount_value2 = Some(dec("20"));
+        let (svc, _, _) = mk_svc(vec![rule], vec![]);
+
+        // Raising the lower value above the existing upper must be rejected.
+        let err = svc
+            .update(
+                "r1",
+                UpdateCategorizationRule {
+                    amount_value: Some(Some(dec("100"))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("less than or equal"));
+    }
+
+    fn mk_activity_amt(id: &str, account: &str, notes: &str, amount: &str) -> Activity {
+        let mut a = mk_activity(id, account, notes);
+        a.amount = Some(amount.parse().unwrap());
+        a
+    }
+
+    #[tokio::test]
+    async fn rerun_applies_amount_condition() {
+        let mut rule = mk_rule("r1", "TRANSFER", "spending_categories", "cat_savings", 5);
+        rule.amount_op = Some(RuleAmountOp::Gte);
+        rule.amount_value = Some(dec("1000"));
+        let (svc, _, assignment_repo) = mk_svc(
+            vec![rule],
+            vec![
+                mk_activity_amt("small", "acct1", "TRANSFER TO SAVINGS", "50"),
+                mk_activity_amt("large", "acct1", "TRANSFER TO SAVINGS", "1500"),
+                // Signed amounts are compared unsigned.
+                mk_activity_amt("negative", "acct1", "TRANSFER TO SAVINGS", "-2000"),
+                // No amount at all: never matches an amount-conditioned rule.
+                mk_activity("no_amount", "acct1", "TRANSFER TO SAVINGS"),
+            ],
+        );
+
+        let matched = svc.rerun_all(&["acct1".to_string()], false).await.unwrap();
+        assert_eq!(matched, 2);
+
+        let writes = assignment_repo.writes.lock().unwrap();
+        let mut written: Vec<&str> = writes.iter().map(|w| w.activity_id.as_str()).collect();
+        written.sort();
+        assert_eq!(written, vec!["large", "negative"]);
+    }
+}
