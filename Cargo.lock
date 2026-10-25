@@ -8146,7 +8146,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-agent-tools"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8165,7 +8165,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-app"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
@@ -8217,7 +8217,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-business"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8240,7 +8240,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-core"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -8284,7 +8284,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-http"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "rcgen",
  "reqwest 0.13.5",
@@ -8295,7 +8295,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-market-data"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -8318,7 +8318,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-mcp"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "async-trait",
  "axum",
@@ -8344,7 +8344,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-portfolio-engine"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "chrono",
  "chrono-tz",
@@ -8360,7 +8360,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-server"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "argon2",
@@ -8412,7 +8412,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-spending"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8432,7 +8432,7 @@ dependencies = [
 
 [[package]]
 name = "wealthfolio-storage-sqlite"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8463,7 +8463,7 @@ dependencies = [
 
 [[package]]
 name = "wealthlog-agent-install"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "semver",
  "serde",
@@ -8475,7 +8475,7 @@ dependencies = [
 
 [[package]]
 name = "wealthlog-cli"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "anyhow",
  "clap",

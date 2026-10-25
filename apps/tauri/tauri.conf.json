@@ -17,14 +17,14 @@
     "category": "public.app-category.finance",
     "createUpdaterArtifacts": false,
     "macOS": {
-      "bundleVersion": "0.0.3",
+      "bundleVersion": "0.0.4",
       "minimumSystemVersion": "12.0",
       "infoPlist": "Info.plist"
     }
   },
   "productName": "Wealthlog",
   "mainBinaryName": "Wealthlog",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "identifier": "local.kanelogger.wealthlog",
   "app": {
     "withGlobalTauri": false,

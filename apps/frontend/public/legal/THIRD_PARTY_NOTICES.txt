@@ -1,4 +1,4 @@
-THIRD-PARTY NOTICES — Wealthlog 0.0.3
+THIRD-PARTY NOTICES — Wealthlog 0.0.4
 
 Wealthlog includes code from Wealthfolio, based on commit
 bfcd6d6202ceb4922d0be85aa5666d1802eda456. Wealthfolio is a trademark
