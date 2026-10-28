@@ -24,27 +24,27 @@ export function usePortfolioMutations() {
     mutationFn: (portfolio: NewPortfolio) => createPortfolio(portfolio),
     onSuccess: () => {
       invalidate();
-      toast.success("Portfolio created successfully.");
+      toast.success("投资组合创建成功。");
     },
-    onError: () => toast.error("Failed to create portfolio."),
+    onError: () => toast.error("创建投资组合失败。"),
   });
 
   const updateMutation = useMutation({
     mutationFn: (portfolio: PortfolioWithAccounts) => updatePortfolioEntry(portfolio),
     onSuccess: () => {
       invalidate();
-      toast.success("Portfolio updated successfully.");
+      toast.success("投资组合更新成功。");
     },
-    onError: () => toast.error("Failed to update portfolio."),
+    onError: () => toast.error("更新投资组合失败。"),
   });
 
   const deleteMutation = useMutation({
     mutationFn: (portfolioId: string) => deletePortfolio(portfolioId),
     onSuccess: () => {
       invalidate();
-      toast.success("Portfolio deleted successfully.");
+      toast.success("投资组合删除成功。");
     },
-    onError: () => toast.error("Failed to delete portfolio."),
+    onError: () => toast.error("删除投资组合失败。"),
   });
 
   return { createMutation, updateMutation, deleteMutation };

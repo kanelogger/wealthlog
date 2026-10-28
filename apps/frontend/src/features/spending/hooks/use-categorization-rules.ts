@@ -34,9 +34,9 @@ export function useCategorizationRuleMutations() {
     mutationFn: (rule: NewCategorizationRule) => createCategorizationRule(rule),
     onSuccess: () => {
       invalidate();
-      toast.success("Rule created.");
+      toast.success("规则已创建。");
     },
-    onError: () => toast.error("Failed to create rule."),
+    onError: () => toast.error("创建规则失败。"),
   });
 
   const update = useMutation({
@@ -44,18 +44,18 @@ export function useCategorizationRuleMutations() {
       updateCategorizationRule(id, patch),
     onSuccess: () => {
       invalidate();
-      toast.success("Rule updated.");
+      toast.success("规则已更新。");
     },
-    onError: () => toast.error("Failed to update rule."),
+    onError: () => toast.error("更新规则失败。"),
   });
 
   const remove = useMutation({
     mutationFn: (id: string) => deleteCategorizationRule(id),
     onSuccess: () => {
       invalidate();
-      toast.success("Rule deleted.");
+      toast.success("规则已删除。");
     },
-    onError: () => toast.error("Failed to delete rule."),
+    onError: () => toast.error("删除规则失败。"),
   });
 
   const rerun = useMutation({
@@ -63,10 +63,10 @@ export function useCategorizationRuleMutations() {
     onSuccess: (count, onlyUncategorized) => {
       // Rerun touches every cash activity's category — refresh report/budget too.
       invalidateSpendingCaches(qc);
-      const verb = onlyUncategorized ? "Categorized" : "Re-categorized";
-      toast.success(`${verb} ${count} activit${count === 1 ? "y" : "ies"}.`);
+      const verb = onlyUncategorized ? "已分类" : "已重新分类";
+      toast.success(`${verb} ${count} 笔活动。`);
     },
-    onError: () => toast.error("Failed to re-run rules."),
+    onError: () => toast.error("重新执行规则失败。"),
   });
 
   return { create, update, remove, rerun };

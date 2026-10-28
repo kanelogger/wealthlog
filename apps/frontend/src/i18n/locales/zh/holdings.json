@@ -252,5 +252,7 @@
     "status_update_balance": "更新余额",
     "update_balance": "更新余额",
     "schedule": "还款计划"
-  }
+  },
+  "unknown": "未分类",
+  "allocation_residual": "其他{{name}}"
 }

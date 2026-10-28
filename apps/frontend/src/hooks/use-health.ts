@@ -39,18 +39,18 @@ export function useRunHealthChecks(options?: { navigate?: (path: string) => void
       queryClient.setQueryData([QueryKeys.HEALTH_STATUS], data);
       const issueCount = data.issues?.length ?? 0;
       if (issueCount === 0) {
-        toast.success("All checks passed", { description: "No issues found." });
+        toast.success("全部检查通过", { description: "未发现问题。" });
       } else {
-        toast.error(`${issueCount} issue${issueCount > 1 ? "s" : ""} found`, {
-          description: "Review the details in the Health Center.",
+        toast.error(`发现 ${issueCount} 个问题`, {
+          description: "请在健康中心查看详情。",
           action: options?.navigate
-            ? { label: "View", onClick: () => options.navigate!("/health") }
+            ? { label: "查看", onClick: () => options.navigate!("/health") }
             : undefined,
         });
       }
     },
     onError: (error: Error) => {
-      toast.error("Health check failed", { description: error.message });
+      toast.error("健康检查失败", { description: error.message });
     },
   });
 }
@@ -66,10 +66,10 @@ export function useDismissHealthIssue() {
       dismissHealthIssue(issueId, dataHash),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [QueryKeys.HEALTH_STATUS] });
-      toast.success("Issue dismissed");
+      toast.success("已忽略问题");
     },
     onError: (error: Error) => {
-      toast.error("Failed to dismiss issue", { description: error.message });
+      toast.error("忽略问题失败", { description: error.message });
     },
   });
 }
@@ -84,10 +84,10 @@ export function useRestoreHealthIssue() {
     mutationFn: restoreHealthIssue,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [QueryKeys.HEALTH_STATUS] });
-      toast.success("Issue restored");
+      toast.success("已恢复问题");
     },
     onError: (error: Error) => {
-      toast.error("Failed to restore issue", { description: error.message });
+      toast.error("恢复问题失败", { description: error.message });
     },
   });
 }
@@ -119,21 +119,21 @@ export function useExecuteHealthFix() {
       queryClient.invalidateQueries({ queryKey: [QueryKeys.PORTFOLIO_ALLOCATIONS] });
       // Skip toast for sync actions — global event listeners handle feedback
       if (actionId === "rebuild_account_history") {
-        toast.success("History rebuild started", {
-          description: "Health will refresh after recalculation finishes.",
+        toast.success("已开始重建历史数据", {
+          description: "重新计算完成后将刷新健康状态。",
         });
       } else if (actionId !== "sync_prices" && actionId !== "retry_sync") {
-        toast.success("Fix applied successfully");
+        toast.success("修复成功");
       }
     },
     onError: (error: Error, action) => {
       if (action.id === "sync_prices" || action.id === "retry_sync") {
-        toast.error("Market Data Sync Failed", {
+        toast.error("行情数据同步失败", {
           id: "market-sync-error",
           description: `${error.message}. Please try again later.`,
         });
       } else {
-        toast.error("Fix failed", { description: error.message });
+        toast.error("修复失败", { description: error.message });
       }
     },
   });
@@ -163,10 +163,10 @@ export function useUpdateHealthConfig() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [QueryKeys.HEALTH_CONFIG] });
       queryClient.invalidateQueries({ queryKey: [QueryKeys.HEALTH_STATUS] });
-      toast.success("Configuration updated");
+      toast.success("配置已更新");
     },
     onError: (error: Error) => {
-      toast.error("Failed to update configuration", { description: error.message });
+      toast.error("更新配置失败", { description: error.message });
     },
   });
 }

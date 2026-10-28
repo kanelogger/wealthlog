@@ -92,7 +92,7 @@ export function useAssignActivityCategory() {
       });
       invalidateSpendingCaches(queryClient);
     },
-    onError: () => toast.error("Failed to set category."),
+    onError: () => toast.error("设置分类失败。"),
   });
 }
 
@@ -103,7 +103,7 @@ export function useBulkAssignCategories() {
     onSuccess: () => {
       invalidateSpendingCaches(queryClient);
     },
-    onError: () => toast.error("Failed to apply categories."),
+    onError: () => toast.error("应用分类失败。"),
   });
 }
 
@@ -118,7 +118,7 @@ export function useUnassignActivityCategory() {
       });
       invalidateSpendingCaches(queryClient);
     },
-    onError: () => toast.error("Failed to clear category."),
+    onError: () => toast.error("清除分类失败。"),
   });
 }
 
@@ -135,7 +135,7 @@ export function useReplaceActivitySplits() {
       });
       invalidateSpendingCaches(queryClient);
     },
-    onError: () => toast.error("Failed to save split."),
+    onError: () => toast.error("保存拆分失败。"),
   });
 }
 
@@ -149,7 +149,7 @@ export function useClearActivitySplits() {
       });
       invalidateSpendingCaches(queryClient);
     },
-    onError: () => toast.error("Failed to clear split."),
+    onError: () => toast.error("清除拆分失败。"),
   });
 }
 
@@ -161,6 +161,6 @@ export function useSetActivityEvent() {
     onSuccess: () => {
       invalidateSpendingCaches(queryClient);
     },
-    onError: () => toast.error("Failed to set event."),
+    onError: () => toast.error("设置事件失败。"),
   });
 }

@@ -37,6 +37,7 @@ interface CategoryFormValues {
 
 interface CategoryFormProps {
   category?: TaxonomyCategory;
+  categoryLabel?: string;
   taxonomyId: string;
   taxonomyColor?: string;
   isSystem?: boolean;
@@ -58,6 +59,7 @@ function generateKey(name: string): string {
 
 export function CategoryForm({
   category,
+  categoryLabel,
   taxonomyId,
   taxonomyColor,
   isSystem,
@@ -85,7 +87,7 @@ export function CategoryForm({
   const form = useForm<CategoryFormValues>({
     resolver: zodResolver(categoryFormSchema),
     defaultValues: {
-      name: category?.name ?? "",
+      name: categoryLabel ?? category?.name ?? "",
       key: category?.key ?? "",
       color: category?.color ?? taxonomyColor ?? "#808080",
       description: category?.description ?? "",
@@ -95,12 +97,12 @@ export function CategoryForm({
   // Reset form when category changes
   useEffect(() => {
     form.reset({
-      name: category?.name ?? "",
+      name: categoryLabel ?? category?.name ?? "",
       key: category?.key ?? "",
       color: category?.color ?? taxonomyColor ?? "#808080",
       description: category?.description ?? "",
     });
-  }, [category, taxonomyColor, form]);
+  }, [category, categoryLabel, taxonomyColor, form]);
 
   // Auto-generate key from name in create mode
   const watchName = form.watch("name");
@@ -127,7 +129,8 @@ export function CategoryForm({
       } else if (category) {
         await updateMutation.mutateAsync({
           ...category,
-          name: values.name,
+          // Translated labels are presentation only unless the user edits the name.
+          name: values.name === categoryLabel ? category.name : values.name,
           key: values.key,
           color: values.color,
           description: values.description ?? null,
@@ -169,7 +172,7 @@ export function CategoryForm({
             style={{ backgroundColor: currentColor }}
           />
           <h3 className="text-lg font-semibold">
-            {isCreateMode ? t("settings:tax_new_category") : category?.name}
+            {isCreateMode ? t("settings:tax_new_category") : (categoryLabel ?? category?.name)}
           </h3>
         </div>
         <Button variant="ghost" size="icon" onClick={onClose}>
@@ -285,7 +288,9 @@ export function CategoryForm({
                   <AlertDialogHeader>
                     <AlertDialogTitle>{t("settings:tax_delete_category")}</AlertDialogTitle>
                     <AlertDialogDescription>
-                      {t("settings:tax_delete_confirm_desc", { name: category?.name })}
+                      {t("settings:tax_delete_confirm_desc", {
+                        name: categoryLabel ?? category?.name,
+                      })}
                     </AlertDialogDescription>
                   </AlertDialogHeader>
                   <AlertDialogFooter>

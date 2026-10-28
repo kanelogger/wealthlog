@@ -45,25 +45,25 @@ const SEVERITY_CONFIG: Record<
   { label: string; bgColor: string; textColor: string; dotColor: string }
 > = {
   INFO: {
-    label: "Info",
+    label: "提示",
     bgColor: "bg-muted",
     textColor: "text-muted-foreground",
     dotColor: "bg-muted-foreground",
   },
   WARNING: {
-    label: "Warning",
+    label: "警告",
     bgColor: "bg-warning/15",
     textColor: "text-warning",
     dotColor: "bg-warning",
   },
   ERROR: {
-    label: "Error",
+    label: "错误",
     bgColor: "bg-destructive/10",
     textColor: "text-destructive",
     dotColor: "bg-destructive",
   },
   CRITICAL: {
-    label: "Critical",
+    label: "严重",
     bgColor: "bg-destructive/15",
     textColor: "text-destructive",
     dotColor: "bg-destructive",

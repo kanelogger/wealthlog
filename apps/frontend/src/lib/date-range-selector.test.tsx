@@ -6,7 +6,7 @@ describe("DateRangeSelector calendar anchor", () => {
   it("uses the supplied day when choosing a preset", () => {
     const onChange = vi.fn();
     render(<DateRangeSelector value={undefined} onChange={onChange} asOf={new Date(2027, 0, 1)} />);
-    fireEvent.click(screen.getByRole("button", { name: "1M" }));
+    fireEvent.click(screen.getByRole("button", { name: "1月" }));
     expect(onChange).toHaveBeenLastCalledWith({
       from: new Date(2026, 11, 1),
       to: new Date(2027, 0, 1),

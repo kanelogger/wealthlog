@@ -51,10 +51,6 @@ const RISK_LABEL_KEYS: Record<string, string> = {
   unknown: "holdings:risk_none",
 };
 
-function normalizeRiskName(name: string): string {
-  return name.toLowerCase().trim();
-}
-
 export function CompactAllocationStrip({
   title,
   allocation,
@@ -76,12 +72,16 @@ export function CompactAllocationStrip({
       // Fixed order: Low → Medium → High → Unknown
       // Always include all slots to preserve mental model consistency
       const ordered = RISK_ORDER.map((riskLevel) => {
-        const found = cats.find((c) => normalizeRiskName(c.categoryName) === riskLevel);
+        const found = cats.find(
+          (c) =>
+            c.categoryId.toLowerCase() === riskLevel ||
+            (riskLevel === "unknown" && c.categoryId === "__UNKNOWN__"),
+        );
         const value = found?.value ?? 0;
         const percent = total > 0 ? (value / total) * 100 : 0;
         return {
           id: found?.categoryId ?? riskLevel,
-          name: found?.categoryName ?? riskLevel.charAt(0).toUpperCase() + riskLevel.slice(1),
+          name: found?.categoryName ?? t(RISK_LABEL_KEYS[riskLevel]),
           label: RISK_LABEL_KEYS[riskLevel] ? t(RISK_LABEL_KEYS[riskLevel]) : riskLevel,
           value,
           percent,

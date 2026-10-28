@@ -14,7 +14,7 @@ export const PORTFOLIO_ACCOUNT_TYPE = "PORTFOLIO";
 export function createPortfolioAccount(baseCurrency: string) {
   return {
     id: PORTFOLIO_SCOPE_ID,
-    name: "All Portfolio",
+    name: "全部投资组合",
     accountType: PORTFOLIO_ACCOUNT_TYPE as never,
     balance: 0,
     currency: baseCurrency,
@@ -566,12 +566,12 @@ export type InstrumentType = (typeof InstrumentType)[keyof typeof InstrumentType
 
 /** Display options for instrument type filters */
 export const INSTRUMENT_TYPE_OPTIONS = [
-  { value: InstrumentType.EQUITY, label: "Equity" },
-  { value: InstrumentType.CRYPTO, label: "Crypto" },
-  { value: InstrumentType.FX, label: "FX" },
-  { value: InstrumentType.OPTION, label: "Option" },
-  { value: InstrumentType.METAL, label: "Metal" },
-  { value: InstrumentType.BOND, label: "Bond" },
+  { value: InstrumentType.EQUITY, label: "股票" },
+  { value: InstrumentType.CRYPTO, label: "加密资产" },
+  { value: InstrumentType.FX, label: "外汇" },
+  { value: InstrumentType.OPTION, label: "期权" },
+  { value: InstrumentType.METAL, label: "贵金属" },
+  { value: InstrumentType.BOND, label: "债券" },
 ] as const;
 
 /**
@@ -583,15 +583,15 @@ export const INSTRUMENT_TYPE_OPTIONS = [
 export const HOLDING_CATEGORY_FILTERS = [
   {
     id: "investments",
-    label: "Investments",
+    label: "投资",
     assetKinds: ["INVESTMENT", "PRIVATE_EQUITY"],
   },
   {
     id: "assets",
-    label: "Personal Assets",
+    label: "个人资产",
     assetKinds: ["PROPERTY", "VEHICLE", "COLLECTIBLE", "PRECIOUS_METAL", "OTHER"],
   },
-  { id: "liabilities", label: "Liabilities", assetKinds: ["LIABILITY"] },
+  { id: "liabilities", label: "负债", assetKinds: ["LIABILITY"] },
 ] as const;
 
 export type HoldingCategoryFilterId = (typeof HOLDING_CATEGORY_FILTERS)[number]["id"];

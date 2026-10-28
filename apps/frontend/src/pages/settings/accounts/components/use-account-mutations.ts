@@ -24,7 +24,7 @@ export function useAccountMutations({ onSuccess = () => undefined }: UseAccountM
   const handleError = (action: string) => {
     toast({
       title: `Uh oh! Something went wrong ${action} this account.`,
-      description: "Please try again or report an issue if the problem persists.",
+      description: "请重试；若问题持续，请反馈问题。",
       variant: "destructive",
     });
   };

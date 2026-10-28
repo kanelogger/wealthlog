@@ -71,7 +71,7 @@ export function useSetApiKey() {
     },
     onError: (error) => {
       toast({
-        title: "Failed to save API key",
+        title: "保存 API 密钥失败",
         description: error.message,
         variant: "destructive",
       });
@@ -88,7 +88,7 @@ export function useDeleteApiKey() {
     },
     onError: (error) => {
       toast({
-        title: "Failed to delete API key",
+        title: "删除 API 密钥失败",
         description: error.message,
         variant: "destructive",
       });

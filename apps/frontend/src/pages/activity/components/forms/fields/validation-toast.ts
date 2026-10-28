@@ -93,9 +93,9 @@ export function showValidationToast<T extends FieldValues>(
     const fieldName = formatFieldName(issue.fieldPath);
     return `${fieldName}: ${issue.message}`;
   });
-  const suffix = issues.length > 3 ? ` (+${issues.length - 3} more)` : "";
+  const suffix = issues.length > 3 ? `（另有 ${issues.length - 3} 项）` : "";
 
-  toast.error("Please fix form errors", {
+  toast.error("请修正表单错误", {
     id: "activity-form-validation",
     description: `${lines.join(" • ")}${suffix}`,
   });
@@ -119,7 +119,7 @@ export function createValidatedSubmit<T extends FieldValues>(
       await handler(event);
     } catch (err) {
       console.error("[ActivityForm] Unhandled submit error:", err);
-      toast.error("An unexpected error occurred", {
+      toast.error("发生未知错误", {
         description: err instanceof Error ? err.message : String(err),
       });
     }

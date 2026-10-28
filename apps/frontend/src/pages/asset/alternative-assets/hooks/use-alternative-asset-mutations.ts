@@ -49,7 +49,7 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
     onSuccess: async (response) => {
       await invalidateQueries();
       toast({
-        title: "Asset created successfully",
+        title: "资产创建成功",
         variant: "success",
       });
       options.onCreateSuccess?.(response);
@@ -57,8 +57,8 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
     onError: (error) => {
       logger.error(`Error creating alternative asset: ${error}`);
       toast({
-        title: "Failed to create asset",
-        description: "Please try again or report an issue if the problem persists.",
+        title: "创建资产失败",
+        description: "请重试；若问题持续，请反馈问题。",
         variant: "destructive",
       });
     },
@@ -70,7 +70,7 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
     onSuccess: async () => {
       await invalidateQueries();
       toast({
-        title: "Valuation updated successfully",
+        title: "估值更新成功",
         variant: "success",
       });
       options.onUpdateSuccess?.();
@@ -78,8 +78,8 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
     onError: (error) => {
       logger.error(`Error updating valuation: ${error}`);
       toast({
-        title: "Failed to update valuation",
-        description: "Please try again or report an issue if the problem persists.",
+        title: "更新估值失败",
+        description: "请重试；若问题持续，请反馈问题。",
         variant: "destructive",
       });
     },
@@ -90,7 +90,7 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
     onSuccess: async () => {
       await invalidateQueries();
       toast({
-        title: "Asset deleted successfully",
+        title: "资产删除成功",
         variant: "success",
       });
       options.onDeleteSuccess?.();
@@ -98,8 +98,8 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
     onError: (error) => {
       logger.error(`Error deleting alternative asset: ${error}`);
       toast({
-        title: "Failed to delete asset",
-        description: "Please try again or report an issue if the problem persists.",
+        title: "删除资产失败",
+        description: "请重试；若问题持续，请反馈问题。",
         variant: "destructive",
       });
     },
@@ -116,15 +116,15 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
     onSuccess: async () => {
       await invalidateQueries();
       toast({
-        title: "Liability linked successfully",
+        title: "负债关联成功",
         variant: "success",
       });
     },
     onError: (error) => {
       logger.error(`Error linking liability: ${error}`);
       toast({
-        title: "Failed to link liability",
-        description: "Please try again or report an issue if the problem persists.",
+        title: "关联负债失败",
+        description: "请重试；若问题持续，请反馈问题。",
         variant: "destructive",
       });
     },
@@ -135,15 +135,15 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
     onSuccess: async () => {
       await invalidateQueries();
       toast({
-        title: "Liability unlinked successfully",
+        title: "负债关联已取消",
         variant: "success",
       });
     },
     onError: (error) => {
       logger.error(`Error unlinking liability: ${error}`);
       toast({
-        title: "Failed to unlink liability",
-        description: "Please try again or report an issue if the problem persists.",
+        title: "取消负债关联失败",
+        description: "请重试；若问题持续，请反馈问题。",
         variant: "destructive",
       });
     },
@@ -172,8 +172,8 @@ export function useAlternativeAssetMutations(options: UseAlternativeAssetMutatio
       // The details sheet explains a refused loan setup itself.
       if (isLoanRefusal(error)) return;
       toast({
-        title: "Failed to save details",
-        description: "Please try again or report an issue if the problem persists.",
+        title: "保存详情失败",
+        description: "请重试；若问题持续，请反馈问题。",
         variant: "destructive",
       });
     },

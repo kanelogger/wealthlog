@@ -43,7 +43,7 @@ export function useCreateAlternativeAsset(options?: UseAlternativeAssetMutations
       invalidatePerformanceCaches(queryClient);
 
       toast({
-        title: "Asset created successfully",
+        title: "资产创建成功",
         description: `Created ${data.assetId}`,
         variant: "success",
       });
@@ -53,7 +53,7 @@ export function useCreateAlternativeAsset(options?: UseAlternativeAssetMutations
     onError: (error) => {
       logger.error(`Error creating alternative asset: ${error}`);
       toast({
-        title: "Failed to create asset",
+        title: "创建资产失败",
         description: "There was a problem creating the asset. Please try again.",
         variant: "destructive",
       });
@@ -86,8 +86,8 @@ export function useUpdateValuation(options?: UseAlternativeAssetMutationsOptions
       invalidatePerformanceCaches(queryClient);
 
       toast({
-        title: "Valuation updated",
-        description: "The asset valuation has been updated successfully.",
+        title: "估值已更新",
+        description: "资产估值已更新。",
         variant: "success",
       });
 
@@ -96,7 +96,7 @@ export function useUpdateValuation(options?: UseAlternativeAssetMutationsOptions
     onError: (error) => {
       logger.error(`Error updating valuation: ${error}`);
       toast({
-        title: "Failed to update valuation",
+        title: "更新估值失败",
         description: "There was a problem updating the valuation. Please try again.",
         variant: "destructive",
       });
@@ -121,8 +121,8 @@ export function useDeleteAlternativeAsset(options?: UseAlternativeAssetMutations
       invalidatePerformanceCaches(queryClient);
 
       toast({
-        title: "Asset deleted",
-        description: "The asset and its associated data have been removed.",
+        title: "资产已删除",
+        description: "资产及其关联数据已移除。",
         variant: "success",
       });
 
@@ -131,7 +131,7 @@ export function useDeleteAlternativeAsset(options?: UseAlternativeAssetMutations
     onError: (error) => {
       logger.error(`Error deleting alternative asset: ${error}`);
       toast({
-        title: "Failed to delete asset",
+        title: "删除资产失败",
         description: "There was a problem deleting the asset. Please try again.",
         variant: "destructive",
       });
@@ -162,8 +162,8 @@ export function useLinkLiability(options?: UseAlternativeAssetMutationsOptions) 
       queryClient.invalidateQueries({ queryKey: [QueryKeys.NET_WORTH_HISTORY] });
 
       toast({
-        title: "Liability linked",
-        description: "The liability has been linked to the asset.",
+        title: "负债已关联",
+        description: "负债已与资产关联。",
         variant: "success",
       });
 
@@ -172,7 +172,7 @@ export function useLinkLiability(options?: UseAlternativeAssetMutationsOptions) 
     onError: (error) => {
       logger.error(`Error linking liability: ${error}`);
       toast({
-        title: "Failed to link liability",
+        title: "关联负债失败",
         description: "There was a problem linking the liability. Please try again.",
         variant: "destructive",
       });
@@ -198,8 +198,8 @@ export function useUnlinkLiability(options?: UseAlternativeAssetMutationsOptions
       queryClient.invalidateQueries({ queryKey: [QueryKeys.NET_WORTH_HISTORY] });
 
       toast({
-        title: "Liability unlinked",
-        description: "The liability has been unlinked from the asset.",
+        title: "已取消负债关联",
+        description: "已取消负债与资产的关联。",
         variant: "success",
       });
 
@@ -208,7 +208,7 @@ export function useUnlinkLiability(options?: UseAlternativeAssetMutationsOptions
     onError: (error) => {
       logger.error(`Error unlinking liability: ${error}`);
       toast({
-        title: "Failed to unlink liability",
+        title: "取消负债关联失败",
         description: "There was a problem unlinking the liability. Please try again.",
         variant: "destructive",
       });

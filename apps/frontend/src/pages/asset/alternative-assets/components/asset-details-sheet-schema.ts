@@ -7,73 +7,69 @@ import { parseLocalDate } from "@/lib/utils";
 
 // Property types
 export const PROPERTY_TYPES = [
-  { value: "residence", label: "Residence" },
-  { value: "rental", label: "Rental Property" },
-  { value: "land", label: "Land" },
-  { value: "commercial", label: "Commercial" },
+  { value: "residence", label: "住宅" },
+  { value: "rental", label: "出租物业" },
+  { value: "land", label: "土地" },
+  { value: "commercial", label: "商业物业" },
 ] as const;
 
 // Collectible types
 export const COLLECTIBLE_TYPES = [
-  { value: "art", label: "Art" },
-  { value: "wine", label: "Wine" },
-  { value: "watch", label: "Watch" },
-  { value: "jewelry", label: "Jewelry" },
-  { value: "memorabilia", label: "Memorabilia" },
+  { value: "art", label: "艺术品" },
+  { value: "wine", label: "葡萄酒" },
+  { value: "watch", label: "腕表" },
+  { value: "jewelry", label: "珠宝" },
+  { value: "memorabilia", label: "纪念品" },
 ] as const;
 
 // Metal types (re-exported for convenience)
 export const METAL_TYPES = [
-  { value: "gold", label: "Gold" },
-  { value: "silver", label: "Silver" },
-  { value: "platinum", label: "Platinum" },
-  { value: "palladium", label: "Palladium" },
+  { value: "gold", label: "黄金" },
+  { value: "silver", label: "白银" },
+  { value: "platinum", label: "铂金" },
+  { value: "palladium", label: "钯金" },
 ] as const;
 
 // Weight units (re-exported for convenience)
 export const WEIGHT_UNITS = [
-  { value: "oz", label: "Troy Ounce (oz)" },
-  { value: "g", label: "Gram (g)" },
-  { value: "kg", label: "Kilogram (kg)" },
+  { value: "oz", label: "金衡盎司（oz）" },
+  { value: "g", label: "克（g）" },
+  { value: "kg", label: "千克（kg）" },
 ] as const;
 
 // Liability types (re-exported for convenience)
 export const LIABILITY_TYPES = [
-  { value: "mortgage", label: "Mortgage" },
-  { value: "auto_loan", label: "Auto Loan" },
-  { value: "student_loan", label: "Student Loan" },
-  { value: "credit_card", label: "Credit Card" },
-  { value: "personal_loan", label: "Personal Loan" },
-  { value: "heloc", label: "HELOC" },
-  { value: "other", label: "Other" },
+  { value: "mortgage", label: "房贷" },
+  { value: "auto_loan", label: "车贷" },
+  { value: "student_loan", label: "助学贷款" },
+  { value: "credit_card", label: "信用卡" },
+  { value: "personal_loan", label: "个人贷款" },
+  { value: "heloc", label: "住房净值信用额度（HELOC）" },
+  { value: "other", label: "其他" },
 ] as const;
 
 // Vehicle types (optional, for future use)
 export const VEHICLE_TYPES = [
-  { value: "car", label: "Car" },
-  { value: "motorcycle", label: "Motorcycle" },
-  { value: "boat", label: "Boat" },
-  { value: "rv", label: "RV" },
+  { value: "car", label: "汽车" },
+  { value: "motorcycle", label: "摩托车" },
+  { value: "boat", label: "船艇" },
+  { value: "rv", label: "房车" },
 ] as const;
 
 // Base schema for common fields across all asset types
 const baseSchema = z.object({
   // Name field (required, editable)
-  name: z.string().min(1, "Name is required").max(100, "Name must be less than 100 characters"),
+  name: z.string().min(1, "名称为必填项").max(100, "名称不能超过 100 个字符"),
   // Common fields for all types
-  purchasePrice: z.coerce
-    .number()
-    .positive("Purchase price must be greater than 0")
-    .optional()
-    .nullable(),
+  purchasePrice: z.coerce.number().positive("购买价格必须大于 0").optional().nullable(),
   purchaseDate: z.date().optional().nullable(),
-  notes: z.string().max(1000, "Notes must be less than 1000 characters").optional().nullable(),
+  notes: z.string().max(1000, "备注不能超过 1000 个字符").optional().nullable(),
 });
 
 // Property-specific schema
 export const propertyDetailsSchema = baseSchema.extend({
   kind: z.literal(AlternativeAssetKind.PROPERTY),
-  address: z.string().max(200, "Address must be less than 200 characters").optional().nullable(),
+  address: z.string().max(200, "地址不能超过 200 个字符").optional().nullable(),
   propertyType: z.enum(["residence", "rental", "land", "commercial"]).optional().nullable(),
 });
 
@@ -81,35 +77,23 @@ export const propertyDetailsSchema = baseSchema.extend({
 export const vehicleDetailsSchema = baseSchema.extend({
   kind: z.literal(AlternativeAssetKind.VEHICLE),
   vehicleType: z.enum(["car", "motorcycle", "boat", "rv"]).optional().nullable(),
-  description: z
-    .string()
-    .max(200, "Description must be less than 200 characters")
-    .optional()
-    .nullable(),
+  description: z.string().max(200, "描述不能超过 200 个字符").optional().nullable(),
 });
 
 // Collectible-specific schema
 export const collectibleDetailsSchema = baseSchema.extend({
   kind: z.literal(AlternativeAssetKind.COLLECTIBLE),
   collectibleType: z.enum(["art", "wine", "watch", "jewelry", "memorabilia"]).optional().nullable(),
-  description: z
-    .string()
-    .max(200, "Description must be less than 200 characters")
-    .optional()
-    .nullable(),
+  description: z.string().max(200, "描述不能超过 200 个字符").optional().nullable(),
 });
 
 // Precious metal-specific schema
 export const preciousMetalDetailsSchema = baseSchema.extend({
   kind: z.literal(AlternativeAssetKind.PRECIOUS_METAL),
   metalType: z.enum(["gold", "silver", "platinum", "palladium"]).optional().nullable(),
-  quantity: z.coerce.number().positive("Quantity must be greater than 0").optional().nullable(),
+  quantity: z.coerce.number().positive("数量必须大于 0").optional().nullable(),
   unit: z.enum(["oz", "g", "kg"]).optional().nullable(),
-  description: z
-    .string()
-    .max(200, "Description must be less than 200 characters")
-    .optional()
-    .nullable(),
+  description: z.string().max(200, "描述不能超过 200 个字符").optional().nullable(),
 });
 
 // Liability-specific schema
@@ -127,11 +111,7 @@ export const liabilityDetailsSchema = baseSchema.extend({
     ])
     .optional()
     .nullable(),
-  originalAmount: z.coerce
-    .number()
-    .positive("Original amount must be greater than 0")
-    .optional()
-    .nullable(),
+  originalAmount: z.coerce.number().positive("初始金额必须大于 0").optional().nullable(),
   originationDate: z.date().optional().nullable(),
   amortizationYears: z.number().int().min(0).max(100).optional().nullable(),
   amortizationMonths: z.number().int().min(0).max(1200).optional().nullable(),
@@ -139,8 +119,8 @@ export const liabilityDetailsSchema = baseSchema.extend({
   amortizationEndDate: z.date().optional().nullable(),
   interestRate: z.coerce
     .number()
-    .min(0, "Interest rate must be 0 or greater")
-    .max(100, "Interest rate must be 100 or less")
+    .min(0, "利率不能小于 0")
+    .max(100, "利率不能超过 100")
     .optional()
     .nullable(),
   automaticLoan: z.boolean().optional(),
@@ -159,11 +139,7 @@ export const liabilityDetailsSchema = baseSchema.extend({
 // Other asset schema (generic)
 export const otherDetailsSchema = baseSchema.extend({
   kind: z.literal(AlternativeAssetKind.OTHER),
-  description: z
-    .string()
-    .max(200, "Description must be less than 200 characters")
-    .optional()
-    .nullable(),
+  description: z.string().max(200, "描述不能超过 200 个字符").optional().nullable(),
 });
 
 /** Loan messages are translation keys; the sheet translates them. */

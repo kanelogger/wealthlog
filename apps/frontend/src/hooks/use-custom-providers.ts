@@ -30,7 +30,7 @@ export function useCreateCustomProvider() {
     },
     onError: (error: Error) => {
       toast({
-        title: "Failed to create custom provider",
+        title: "创建自定义数据源失败",
         description: error.message,
         variant: "destructive",
       });
@@ -48,7 +48,7 @@ export function useUpdateCustomProvider() {
     },
     onError: (error: Error) => {
       toast({
-        title: "Failed to update custom provider",
+        title: "更新自定义数据源失败",
         description: error.message,
         variant: "destructive",
       });
@@ -65,7 +65,7 @@ export function useDeleteCustomProvider() {
     },
     onError: (error: Error) => {
       toast({
-        title: "Failed to delete custom provider",
+        title: "删除自定义数据源失败",
         description: error.message,
         variant: "destructive",
       });
@@ -78,7 +78,7 @@ export function useTestCustomProviderSource() {
     mutationFn: (payload: TestSourceRequest) => testCustomProviderSource(payload),
     onError: (error: Error) => {
       toast({
-        title: "Source test failed",
+        title: "数据源测试失败",
         description: error.message,
         variant: "destructive",
       });

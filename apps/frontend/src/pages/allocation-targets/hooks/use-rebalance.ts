@@ -1,3 +1,6 @@
+import { useCallback } from "react";
+import { useTranslation } from "react-i18next";
+import { localizeRebalancePlan } from "@/lib/taxonomy-labels";
 import { useQuery } from "@tanstack/react-query";
 import { calculateRebalancePlan, canonicalizeEligibleAssetIds } from "@/adapters";
 import { accountScopeKey } from "../components/target-scope";
@@ -5,6 +8,7 @@ import type { AccountScope, RebalancePlan, ScenarioMode } from "@/lib/types";
 
 export interface RebalancePlanParams {
   targetId: string;
+  taxonomyId?: string;
   /** Cash to deploy (the editable amount). */
   cash: number;
   filter: AccountScope;
@@ -27,6 +31,13 @@ export interface CachedRebalancePlan {
  * navigating away from the rebalance view and back shows it without recomputing.
  */
 export function useRebalancePlan(params: RebalancePlanParams) {
+  const { t } = useTranslation();
+  const taxonomyId = params.taxonomyId;
+  const select = useCallback(
+    (data: CachedRebalancePlan) =>
+      taxonomyId ? { ...data, plan: localizeRebalancePlan(data.plan, taxonomyId, t) } : data,
+    [taxonomyId, t],
+  );
   const eligibleAssetIds = canonicalizeEligibleAssetIds(params.eligibleAssetIds);
 
   return useQuery({
@@ -49,6 +60,7 @@ export function useRebalancePlan(params: RebalancePlanParams) {
       return { plan, sourceKey: params.sourceKey };
     },
     enabled: false,
+    select,
     staleTime: Infinity,
     gcTime: 30 * 60 * 1000,
   });

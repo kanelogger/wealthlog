@@ -536,7 +536,7 @@ export function useActivityForm({
         }
       } catch (err) {
         const message = extractErrorMessage(err);
-        toast.error("Failed to save activity", { description: message });
+        toast.error("保存活动失败", { description: message });
         logger.error(`Activity Form Submit Error: ${JSON.stringify({ error: err, formData })}`);
       }
     },

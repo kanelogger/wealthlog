@@ -26,28 +26,40 @@ const BENCHMARKS = [
   {
     groupKey: "benchmark_group_us_indices",
     items: [
-      { symbol: "^GSPC", name: "S&P 500", descriptionKey: "benchmark_desc_large_cap_us" },
-      { symbol: "^NDX", name: "Nasdaq 100", descriptionKey: "benchmark_desc_large_cap_tech_us" },
-      { symbol: "^RUT", name: "Russell 2000", descriptionKey: "benchmark_desc_small_cap_us" },
-      { symbol: "^DJI", name: "Dow Jones", descriptionKey: "benchmark_desc_blue_chip_us" },
+      { symbol: "^GSPC", name: "标普 500", descriptionKey: "benchmark_desc_large_cap_us" },
+      { symbol: "^NDX", name: "纳斯达克 100", descriptionKey: "benchmark_desc_large_cap_tech_us" },
+      { symbol: "^RUT", name: "罗素 2000", descriptionKey: "benchmark_desc_small_cap_us" },
+      { symbol: "^DJI", name: "道琼斯指数", descriptionKey: "benchmark_desc_blue_chip_us" },
     ],
   },
   {
     groupKey: "benchmark_group_european_indices",
     items: [
-      { symbol: "^FTSE", name: "FTSE 100", descriptionKey: "benchmark_desc_large_cap_uk" },
+      { symbol: "^FTSE", name: "富时 100", descriptionKey: "benchmark_desc_large_cap_uk" },
       {
         symbol: "^STOXX50E",
-        name: "EURO STOXX 50",
+        name: "欧洲斯托克 50",
         descriptionKey: "benchmark_desc_european_blue_chip",
       },
-      { symbol: "^GDAXI", name: "DAX", descriptionKey: "benchmark_desc_german_blue_chip" },
-      { symbol: "^FCHI", name: "CAC 40", descriptionKey: "benchmark_desc_french_large_cap" },
-      { symbol: "^IBEX", name: "IBEX 35", descriptionKey: "benchmark_desc_spanish_large_cap" },
-      { symbol: "^AEX", name: "AEX", descriptionKey: "benchmark_desc_dutch_blue_chip" },
+      {
+        symbol: "^GDAXI",
+        name: "德国 DAX 指数",
+        descriptionKey: "benchmark_desc_german_blue_chip",
+      },
+      {
+        symbol: "^FCHI",
+        name: "法国 CAC 40 指数",
+        descriptionKey: "benchmark_desc_french_large_cap",
+      },
+      {
+        symbol: "^IBEX",
+        name: "西班牙 IBEX 35 指数",
+        descriptionKey: "benchmark_desc_spanish_large_cap",
+      },
+      { symbol: "^AEX", name: "荷兰 AEX 指数", descriptionKey: "benchmark_desc_dutch_blue_chip" },
       {
         symbol: "^OMX",
-        name: "OMX Stockholm 30",
+        name: "斯德哥尔摩 OMX 30",
         descriptionKey: "benchmark_desc_swedish_large_cap",
       },
     ],
@@ -55,18 +67,26 @@ const BENCHMARKS = [
   {
     groupKey: "benchmark_group_asian_indices",
     items: [
-      { symbol: "^N225", name: "Nikkei 225", descriptionKey: "benchmark_desc_japanese_large_cap" },
-      { symbol: "^HSI", name: "Hang Seng", descriptionKey: "benchmark_desc_hong_kong_large_cap" },
+      { symbol: "^N225", name: "日经 225", descriptionKey: "benchmark_desc_japanese_large_cap" },
+      { symbol: "^HSI", name: "恒生指数", descriptionKey: "benchmark_desc_hong_kong_large_cap" },
       {
         symbol: "000001.SS",
-        name: "Shanghai Composite",
+        name: "上证指数",
         descriptionKey: "benchmark_desc_chinese_a_shares",
       },
-      { symbol: "^KS11", name: "KOSPI", descriptionKey: "benchmark_desc_south_korean" },
-      { symbol: "^TWII", name: "Taiwan Weighted", descriptionKey: "benchmark_desc_taiwanese" },
-      { symbol: "^AXJO", name: "ASX 200", descriptionKey: "benchmark_desc_australian_large_cap" },
-      { symbol: "^BSESN", name: "BSE Sensex", descriptionKey: "benchmark_desc_indian_large_cap" },
-      { symbol: "^NSEI", name: "NIFTY 50", descriptionKey: "benchmark_desc_indian_blue_chip" },
+      { symbol: "^KS11", name: "韩国 KOSPI 指数", descriptionKey: "benchmark_desc_south_korean" },
+      { symbol: "^TWII", name: "台湾加权指数", descriptionKey: "benchmark_desc_taiwanese" },
+      {
+        symbol: "^AXJO",
+        name: "澳大利亚 ASX 200",
+        descriptionKey: "benchmark_desc_australian_large_cap",
+      },
+      {
+        symbol: "^BSESN",
+        name: "印度孟买 SENSEX 指数",
+        descriptionKey: "benchmark_desc_indian_large_cap",
+      },
+      { symbol: "^NSEI", name: "印度 NIFTY 50", descriptionKey: "benchmark_desc_indian_blue_chip" },
     ],
   },
   {
@@ -74,19 +94,19 @@ const BENCHMARKS = [
     items: [
       {
         symbol: "EEM",
-        name: "MSCI Emerging Markets",
+        name: "MSCI 新兴市场",
         descriptionKey: "benchmark_desc_emerging_market",
         exchangeMic: "ARCX",
       },
       {
         symbol: "ACWI",
-        name: "MSCI All Country World",
+        name: "MSCI 全球市场",
         descriptionKey: "benchmark_desc_global_equity",
         exchangeMic: "XNAS",
       },
       {
         symbol: "IEFA",
-        name: "Core MSCI EAFE",
+        name: "MSCI 欧澳远东核心市场",
         descriptionKey: "benchmark_desc_eafe",
         exchangeMic: "ARCX",
       },
@@ -97,25 +117,25 @@ const BENCHMARKS = [
     items: [
       {
         symbol: "VOO",
-        name: "Vanguard S&P 500",
+        name: "Vanguard 标普 500",
         descriptionKey: "benchmark_desc_sp500_fund",
         exchangeMic: "ARCX",
       },
       {
         symbol: "VTI",
-        name: "Vanguard Total Stock",
+        name: "Vanguard 美国全市场股票",
         descriptionKey: "benchmark_desc_total_us_market",
         exchangeMic: "ARCX",
       },
       {
         symbol: "VEA",
-        name: "Vanguard FTSE Developed",
+        name: "Vanguard 富时发达市场",
         descriptionKey: "benchmark_desc_developed_ex_us",
         exchangeMic: "ARCX",
       },
       {
         symbol: "VWO",
-        name: "Vanguard FTSE Emerging",
+        name: "Vanguard 富时新兴市场",
         descriptionKey: "benchmark_desc_emerging_markets",
         exchangeMic: "ARCX",
       },

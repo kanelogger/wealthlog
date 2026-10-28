@@ -7,7 +7,7 @@ const LEGACY_PORTFOLIO_ACCOUNT_ID = "TOTAL";
 export const ALL_PORTFOLIO_ITEM: TrackedItem = {
   id: PORTFOLIO_SCOPE_ID,
   type: "account",
-  name: "All Portfolio",
+  name: "全部投资组合",
   accountScope: { type: "all" },
 };
 

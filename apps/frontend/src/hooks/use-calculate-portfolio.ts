@@ -15,8 +15,8 @@ export function useUpdatePortfolioMutation() {
     onError: (error) => {
       queryClient.invalidateQueries();
       toast({
-        title: "Failed to update portfolio data.",
-        description: "Please try again or report an issue if the problem persists.",
+        title: "更新投资组合数据失败。",
+        description: "请重试；若问题持续，请反馈问题。",
         variant: "destructive",
       });
       logger.error(`Error calculating historical data: ${String(error)}`);
@@ -34,8 +34,8 @@ export function useRecalculatePortfolioMutation() {
     onError: (error) => {
       queryClient.invalidateQueries();
       toast({
-        title: "Failed to recalculate portfolio.",
-        description: "Please try again or report an issue if the problem persists.",
+        title: "重新计算投资组合失败。",
+        description: "请重试；若问题持续，请反馈问题。",
         variant: "destructive",
       });
       console.warn("Error recalculating portfolio:", error);

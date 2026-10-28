@@ -78,7 +78,13 @@
     "currentAllocationDescription": "从您今日的持仓开始",
     "noCurrentHoldings": "无当前持仓",
     "moreTemplates": "更多模板",
-    "buildFromScratch": "从零开始构建"
+    "buildFromScratch": "从零开始构建",
+    "risk": {
+      "Conservative": "稳健",
+      "Moderate": "均衡",
+      "Aggressive": "进取",
+      "From holdings": "来自持仓"
+    }
   },
   "mode": {
     "cashFlowOnly": "仅现金流",
@@ -358,5 +364,23 @@
     "protectedAccountsNote": "不会从这些账户生成卖出。",
     "addAccount": "添加账户",
     "allAccountsProtected": "所有账户均受保护"
+  },
+  "reason": {
+    "weight": "{{action}} {{symbol}}：{{category}}{{direction}}目标 {{bps}} 个基点。",
+    "below": "低于",
+    "above": "高于",
+    "drift": "{{action}} {{symbol}}：减小{{category}}的配置偏离。",
+    "portfolio": "投资组合",
+    "manual": "{{category}}低于目标，当前没有已分类持仓，请手动配置。"
+  },
+  "warningDetail": {
+    "noBuy": "{{category}}中没有可分类持仓，请手动向该类别配置 {{amount}}。",
+    "taggedCash": "{{category}}中有 {{amount}} 已分类现金，未计入可投入现金；请先转移或重新分类这部分现金，再调整该类别。",
+    "missingQuote": "{{symbol}}：整股模式缺少有效价格，已跳过。",
+    "unclassified": "{{symbol}}尚未按此目标分类，已从计划中排除；完成分类后即可纳入。",
+    "partial": "{{symbol}}仅完成部分分类，计划只计入已知配置，其余部分已忽略。",
+    "blockSell": "已跳过卖出 {{symbol}}：设置了禁止卖出约束。",
+    "avoidSell": "已跳过从该账户卖出 {{symbol}}：设置了避免卖出约束。",
+    "turnover": "已达到 {{percent}}% 的换手上限，投资组合总额 {{total}} 中已卖出 {{sold}}。"
   }
 }

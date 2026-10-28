@@ -191,7 +191,7 @@ export function buildGroupWeights({
     if (!b) {
       b = {
         id: targetId,
-        name: "Other",
+        name: "其他",
         color: null,
         icon: null,
         spent: 0,

@@ -70,7 +70,7 @@ export function useExchangeRates() {
     onError: (error) => {
       logger.error(`Error adding exchange rate: ${error}`);
       toast({
-        title: "Error adding exchange rate",
+        title: "添加汇率失败",
         description: `There was a problem adding the exchange rate: ${error?.message}`,
         variant: "destructive",
       });
@@ -86,7 +86,7 @@ export function useExchangeRates() {
     onError: (error) => {
       logger.error(`Error deleting exchange rate: ${error}`);
       toast({
-        title: "Error deleting exchange rate",
+        title: "删除汇率失败",
         description: `There was a problem deleting the exchange rate: ${error?.message}`,
         variant: "destructive",
       });

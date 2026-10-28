@@ -1,3 +1,4 @@
+import { getAllocationCategoryLabel } from "@/lib/taxonomy-labels";
 import { useTranslation } from "react-i18next";
 import { cn } from "@/lib/utils";
 import type { CategoryAllocation } from "@/lib/types";
@@ -12,35 +13,6 @@ interface PresetBarProps {
   weights: Record<string, number>;
   colorMap: Record<string, string>;
 }
-
-const CATEGORY_LABELS: Record<string, string> = {
-  CASH: "Cash",
-  EQUITY: "Equity",
-  FIXED_INCOME: "Fixed Income",
-  REAL_ESTATE: "Real Estate",
-  COMMODITIES: "Commodities",
-  ALTERNATIVES: "Alternatives",
-  DIGITAL_ASSETS: "Digital Assets",
-  "10": "Energy",
-  "15": "Materials",
-  "20": "Industrials",
-  "25": "Consumer Discretionary",
-  "30": "Consumer Staples",
-  "35": "Health Care",
-  "40": "Financials",
-  "45": "Information Technology",
-  "50": "Communication Services",
-  "55": "Utilities",
-  "60": "Real Estate",
-  LOW: "Low",
-  MEDIUM: "Medium",
-  HIGH: "High",
-  R10: "Europe",
-  R20: "Americas",
-  R30: "Asia",
-  R40: "Africa",
-  R50: "Oceania",
-};
 
 const RISK_BADGE: Record<string, string> = {
   Conservative: "bg-[#dfe8dc] text-[#4f6544] dark:bg-green-900/30 dark:text-green-300",
@@ -105,7 +77,12 @@ export function ModelPresetPicker({
   };
 
   function categoryLabel(categoryId: string): string {
-    return categoryNames[categoryId] ?? CATEGORY_LABELS[categoryId] ?? categoryId;
+    const name =
+      categoryNames[categoryId] ??
+      t(`settings:tax_category_labels.${taxonomyId}.${categoryId}.source`, {
+        defaultValue: categoryId,
+      });
+    return getAllocationCategoryLabel(taxonomyId, categoryId, name, t);
   }
 
   function colorMapForWeights(weights: Record<string, number>): Record<string, string> {
@@ -161,7 +138,7 @@ export function ModelPresetPicker({
               RISK_BADGE[preset.risk] ?? "bg-muted text-muted-foreground",
             )}
           >
-            {preset.risk}
+            {t(`allocation:presets.risk.${preset.risk}`, { defaultValue: preset.risk })}
           </span>
           {selected === preset.id && (
             <span className="bg-foreground text-background flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px]">

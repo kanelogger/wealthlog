@@ -360,6 +360,17 @@
   "ai_providers_description": "配置 AI 提供商以获取投资组合洞察。",
   "ai_providers_load_error": "加载 AI 提供商失败",
   "tax_page_description": "管理资产分类层级，如行业、地区和资产类别。",
+  "tax_labels": {
+    "instrument_type": "金融工具类型",
+    "asset_classes": "资产类别",
+    "industries_gics": "行业（GICS）",
+    "regions": "地区",
+    "risk_category": "风险等级",
+    "custom_groups": "自定义分组",
+    "spending_categories": "支出分类",
+    "income_sources": "收入来源",
+    "savings_categories": "储蓄分类"
+  },
   "tax_export_success": "分类导出成功",
   "tax_export_error": "导出分类失败",
   "tax_select_category_details": "选择一个类别以查看详情",
@@ -1112,5 +1123,3015 @@
   "backup_password_optional": "如果备份没有密码，请留空。",
   "backup_password_help_title": "关于备份密码",
   "backup_show_fewer": "收起",
-  "backup_show_older_other": "显示其余 {{count}} 项"
+  "backup_show_older_other": "显示其余 {{count}} 项",
+  "tax_category_labels": {
+    "instrument_type": {
+      "EQUITY_SECURITY": {
+        "source": "Stocks",
+        "label": "股票"
+      },
+      "DEBT_SECURITY": {
+        "source": "Bonds",
+        "label": "债券"
+      },
+      "FUND": {
+        "source": "Funds",
+        "label": "基金"
+      },
+      "ETP": {
+        "source": "ETFs",
+        "label": "交易所交易基金（ETF）"
+      },
+      "DERIVATIVE": {
+        "source": "Options & Futures",
+        "label": "期权与期货"
+      },
+      "CASH_FX": {
+        "source": "Cash & FX",
+        "label": "现金与外汇"
+      },
+      "STRUCTURED": {
+        "source": "Structured Notes",
+        "label": "结构性票据"
+      },
+      "REAL_ASSET": {
+        "source": "Physical Assets",
+        "label": "实物资产"
+      },
+      "DIGITAL_ASSET": {
+        "source": "Crypto",
+        "label": "加密资产"
+      },
+      "PRIVATE_VEHICLE": {
+        "source": "Private Investments",
+        "label": "私募投资"
+      },
+      "OTHER": {
+        "source": "Other",
+        "label": "其他"
+      },
+      "STOCK_COMMON": {
+        "source": "Stock",
+        "label": "普通股"
+      },
+      "STOCK_PREFERRED": {
+        "source": "Preferred Stock",
+        "label": "优先股"
+      },
+      "DEPOSITARY_RECEIPT": {
+        "source": "ADR / GDR",
+        "label": "存托凭证（ADR / GDR）"
+      },
+      "EQUITY_WARRANT_RIGHT": {
+        "source": "Warrant / Right",
+        "label": "认股权证与认购权"
+      },
+      "PARTNERSHIP_UNIT": {
+        "source": "Partnership / Trust Unit",
+        "label": "合伙份额与信托单位"
+      },
+      "BOND_GOVERNMENT": {
+        "source": "Government Bond",
+        "label": "政府债券"
+      },
+      "BOND_CORPORATE": {
+        "source": "Corporate Bond",
+        "label": "公司债券"
+      },
+      "BOND_MUNICIPAL": {
+        "source": "Municipal Bond",
+        "label": "市政债券"
+      },
+      "BOND_CONVERTIBLE": {
+        "source": "Convertible / Hybrid Bond",
+        "label": "可转换债券与混合债券"
+      },
+      "MONEY_MARKET_DEBT": {
+        "source": "T-Bills / CDs / Commercial Paper",
+        "label": "短期国债、存单与商业票据"
+      },
+      "FUND_MUTUAL": {
+        "source": "Mutual Fund",
+        "label": "共同基金"
+      },
+      "FUND_CLOSED_END": {
+        "source": "Closed-End Fund (CEF)",
+        "label": "封闭式基金（CEF）"
+      },
+      "FUND_PRIVATE": {
+        "source": "Private / Hedge Fund",
+        "label": "私募基金与对冲基金"
+      },
+      "FUND_FOF": {
+        "source": "Fund of Funds",
+        "label": "基金中的基金（FOF）"
+      },
+      "ETF": {
+        "source": "ETF",
+        "label": "交易所交易基金（ETF）"
+      },
+      "ETN": {
+        "source": "ETN",
+        "label": "交易所交易票据（ETN）"
+      },
+      "ETC": {
+        "source": "Commodity ETP (ETC/ETP)",
+        "label": "商品交易所交易产品（ETC / ETP）"
+      },
+      "OPTION": {
+        "source": "Option",
+        "label": "期权"
+      },
+      "FUTURE": {
+        "source": "Futures",
+        "label": "期货"
+      },
+      "OTC_DERIVATIVE": {
+        "source": "Forward / Swap (OTC)",
+        "label": "场外远期与互换"
+      },
+      "CFD": {
+        "source": "CFD",
+        "label": "差价合约（CFD）"
+      },
+      "CASH": {
+        "source": "Cash Balance",
+        "label": "现金余额"
+      },
+      "DEPOSIT": {
+        "source": "Bank Deposit / Sweep",
+        "label": "银行存款与自动转存"
+      },
+      "FX_POSITION": {
+        "source": "Currency Position",
+        "label": "外汇头寸"
+      },
+      "STRUCTURED_NOTE": {
+        "source": "Structured Note",
+        "label": "结构性票据"
+      },
+      "MARKET_LINKED_NOTE": {
+        "source": "Market-Linked Note",
+        "label": "市场挂钩票据"
+      },
+      "CREDIT_LINKED_NOTE": {
+        "source": "Credit-Linked Note",
+        "label": "信用挂钩票据"
+      },
+      "PHYSICAL_COMMODITY": {
+        "source": "Physical Commodity",
+        "label": "实物商品"
+      },
+      "PHYSICAL_METAL": {
+        "source": "Physical Gold / Silver",
+        "label": "实物黄金与白银"
+      },
+      "DIRECT_REAL_ESTATE": {
+        "source": "Direct Real Estate",
+        "label": "直接持有的房地产"
+      },
+      "CRYPTO_NATIVE": {
+        "source": "Cryptocurrency",
+        "label": "加密货币"
+      },
+      "STABLECOIN": {
+        "source": "Stablecoin",
+        "label": "稳定币"
+      },
+      "TOKENIZED_SECURITY": {
+        "source": "Tokenized Asset",
+        "label": "代币化资产"
+      },
+      "PRIVATE_COMPANY": {
+        "source": "Private Company Shares",
+        "label": "非上市公司股权"
+      },
+      "PRIVATE_LOAN": {
+        "source": "Private Loan / Note",
+        "label": "私人贷款与借据"
+      },
+      "SPV": {
+        "source": "SPV / Private Vehicle",
+        "label": "特殊目的载体（SPV）与私募载体"
+      },
+      "OTHER_UNKNOWN": {
+        "source": "Unknown Instrument",
+        "label": "未知金融工具"
+      },
+      "SYNTHETIC_INTERNAL": {
+        "source": "Synthetic / Internal Position",
+        "label": "合成与内部头寸"
+      }
+    },
+    "risk_category": {
+      "UNKNOWN": {
+        "source": "Unknown",
+        "label": "未知"
+      },
+      "LOW": {
+        "source": "Low",
+        "label": "低风险"
+      },
+      "MEDIUM": {
+        "source": "Medium",
+        "label": "中风险"
+      },
+      "HIGH": {
+        "source": "High",
+        "label": "高风险"
+      }
+    },
+    "asset_classes": {
+      "CASH": {
+        "source": "Cash",
+        "label": "现金"
+      },
+      "EQUITY": {
+        "source": "Equity",
+        "label": "权益类资产"
+      },
+      "FIXED_INCOME": {
+        "source": "Fixed Income",
+        "label": "固定收益"
+      },
+      "REAL_ESTATE": {
+        "source": "Real Estate",
+        "label": "房地产"
+      },
+      "COMMODITIES": {
+        "source": "Commodities",
+        "label": "大宗商品"
+      },
+      "ALTERNATIVES": {
+        "source": "Alternatives",
+        "label": "另类投资"
+      },
+      "DIGITAL_ASSETS": {
+        "source": "Digital Assets",
+        "label": "数字资产"
+      },
+      "CASH_BANK_DEPOSITS": {
+        "source": "Bank Deposits",
+        "label": "银行存款"
+      },
+      "CASH_TREASURY_BILLS": {
+        "source": "Treasury Bills",
+        "label": "短期国债"
+      },
+      "CASH_MONEY_MARKET": {
+        "source": "Money Market",
+        "label": "货币市场"
+      },
+      "CASH_ULTRA_SHORT": {
+        "source": "Ultra-Short Duration",
+        "label": "超短久期资产"
+      },
+      "CASH_STABLE_VALUE": {
+        "source": "Stable Value",
+        "label": "稳定价值产品"
+      },
+      "EQUITY_PUBLIC": {
+        "source": "Public Stocks",
+        "label": "上市股票"
+      },
+      "EQUITY_PRIVATE": {
+        "source": "Private Equity",
+        "label": "私募股权"
+      },
+      "EQUITY_PRIVATE_BUYOUT": {
+        "source": "Buyout",
+        "label": "并购投资"
+      },
+      "EQUITY_PRIVATE_GROWTH": {
+        "source": "Growth Equity",
+        "label": "成长型股权"
+      },
+      "EQUITY_PRIVATE_VC": {
+        "source": "Venture Capital",
+        "label": "风险投资"
+      },
+      "EQUITY_PRIVATE_SECONDARIES": {
+        "source": "Secondaries",
+        "label": "私募股权二级市场"
+      },
+      "EQUITY_PRIVATE_REAL_ASSETS": {
+        "source": "Private Real Assets",
+        "label": "私募实物资产"
+      },
+      "FI_SOVEREIGN": {
+        "source": "Sovereign Bonds",
+        "label": "主权债券"
+      },
+      "FI_CORPORATE": {
+        "source": "Corporate Bonds",
+        "label": "公司债券"
+      },
+      "FI_MUNICIPAL": {
+        "source": "Municipal Bonds",
+        "label": "市政债券"
+      },
+      "FI_AGENCY_SUPRA": {
+        "source": "Agency & Supranational",
+        "label": "机构与超国家组织债券"
+      },
+      "FI_EM_DEBT": {
+        "source": "Emerging Market Debt",
+        "label": "新兴市场债务"
+      },
+      "FI_INFLATION_LINKED": {
+        "source": "Inflation-Linked Bonds",
+        "label": "通胀挂钩债券"
+      },
+      "FI_SECURITIZED": {
+        "source": "Securitized Debt",
+        "label": "证券化债务"
+      },
+      "FI_LOANS_FRN": {
+        "source": "Loans / Floating Rate",
+        "label": "贷款与浮动利率资产"
+      },
+      "FI_CONVERTIBLE": {
+        "source": "Convertible Bonds",
+        "label": "可转换债券"
+      },
+      "FI_PREFERRED": {
+        "source": "Preferred Securities",
+        "label": "优先证券"
+      },
+      "FI_SECURITIZED_MBS": {
+        "source": "Mortgage-Backed Securities",
+        "label": "住房抵押贷款支持证券（MBS）"
+      },
+      "FI_SECURITIZED_ABS": {
+        "source": "Asset-Backed Securities",
+        "label": "资产支持证券（ABS）"
+      },
+      "FI_SECURITIZED_CMBS": {
+        "source": "Commercial MBS",
+        "label": "商业房地产抵押贷款支持证券（CMBS）"
+      },
+      "RE_PUBLIC_REITS": {
+        "source": "Public REITs",
+        "label": "上市房地产投资信托（REITs）"
+      },
+      "RE_PRIVATE": {
+        "source": "Private Real Estate",
+        "label": "私募房地产"
+      },
+      "COMM_ENERGY": {
+        "source": "Energy",
+        "label": "能源"
+      },
+      "COMM_PRECIOUS": {
+        "source": "Precious Metals",
+        "label": "贵金属"
+      },
+      "COMM_INDUSTRIAL": {
+        "source": "Industrial Metals",
+        "label": "工业金属"
+      },
+      "COMM_AGRICULTURE": {
+        "source": "Agriculture",
+        "label": "农产品"
+      },
+      "COMM_LIVESTOCK": {
+        "source": "Livestock",
+        "label": "畜产品"
+      },
+      "COMM_ENERGY_CRUDE_OIL": {
+        "source": "Crude Oil",
+        "label": "原油"
+      },
+      "COMM_ENERGY_NATURAL_GAS": {
+        "source": "Natural Gas",
+        "label": "天然气"
+      },
+      "COMM_ENERGY_REFINED": {
+        "source": "Refined Products",
+        "label": "成品油"
+      },
+      "COMM_ENERGY_POWER": {
+        "source": "Power",
+        "label": "电力"
+      },
+      "COMM_PRECIOUS_GOLD": {
+        "source": "Gold",
+        "label": "黄金"
+      },
+      "COMM_PRECIOUS_SILVER": {
+        "source": "Silver",
+        "label": "白银"
+      },
+      "COMM_PRECIOUS_PLATINUM": {
+        "source": "Platinum",
+        "label": "铂金"
+      },
+      "COMM_PRECIOUS_PALLADIUM": {
+        "source": "Palladium",
+        "label": "钯金"
+      },
+      "COMM_INDUSTRIAL_COPPER": {
+        "source": "Copper",
+        "label": "铜"
+      },
+      "COMM_INDUSTRIAL_ALUMINUM": {
+        "source": "Aluminum",
+        "label": "铝"
+      },
+      "COMM_INDUSTRIAL_NICKEL": {
+        "source": "Nickel",
+        "label": "镍"
+      },
+      "COMM_INDUSTRIAL_ZINC": {
+        "source": "Zinc",
+        "label": "锌"
+      },
+      "COMM_INDUSTRIAL_LITHIUM": {
+        "source": "Lithium",
+        "label": "锂"
+      },
+      "COMM_INDUSTRIAL_OTHER": {
+        "source": "Other Industrial Metals",
+        "label": "其他工业金属"
+      },
+      "COMM_AGRICULTURE_GRAINS": {
+        "source": "Grains",
+        "label": "谷物"
+      },
+      "COMM_AGRICULTURE_SOFTS": {
+        "source": "Softs",
+        "label": "软商品"
+      },
+      "COMM_AGRICULTURE_OILSEEDS": {
+        "source": "Oilseeds",
+        "label": "油籽"
+      },
+      "COMM_LIVESTOCK_CATTLE": {
+        "source": "Cattle",
+        "label": "牛"
+      },
+      "COMM_LIVESTOCK_HOGS": {
+        "source": "Hogs",
+        "label": "生猪"
+      },
+      "ALT_HEDGE_FUNDS": {
+        "source": "Hedge Funds",
+        "label": "对冲基金"
+      },
+      "ALT_PRIVATE_EQUITY": {
+        "source": "Private Equity",
+        "label": "私募股权"
+      },
+      "ALT_PRIVATE_CREDIT": {
+        "source": "Private Credit",
+        "label": "私募信贷"
+      },
+      "ALT_INFRASTRUCTURE": {
+        "source": "Infrastructure",
+        "label": "基础设施"
+      },
+      "ALT_REAL_ASSETS": {
+        "source": "Real Assets (Other)",
+        "label": "其他实物资产"
+      },
+      "ALT_ILS": {
+        "source": "Insurance-Linked Securities",
+        "label": "保险挂钩证券"
+      },
+      "ALT_COLLECTIBLES": {
+        "source": "Collectibles",
+        "label": "收藏品"
+      },
+      "ALT_COLLECT_ART": {
+        "source": "Art",
+        "label": "艺术品"
+      },
+      "ALT_COLLECT_WINE": {
+        "source": "Wine",
+        "label": "葡萄酒"
+      },
+      "ALT_COLLECT_TANGIBLES": {
+        "source": "Tangibles",
+        "label": "其他有形收藏品"
+      },
+      "DA_CRYPTO": {
+        "source": "Cryptocurrencies",
+        "label": "加密货币"
+      },
+      "DA_STABLECOINS": {
+        "source": "Stablecoins",
+        "label": "稳定币"
+      },
+      "DA_DEFI": {
+        "source": "DeFi",
+        "label": "去中心化金融（DeFi）"
+      },
+      "DA_NFTS": {
+        "source": "NFTs",
+        "label": "非同质化代币（NFT）"
+      },
+      "DA_RWA": {
+        "source": "Tokenized Real-World Assets",
+        "label": "代币化现实世界资产"
+      },
+      "DA_CRYPTO_PAYMENTS": {
+        "source": "Payments / Store of Value",
+        "label": "支付与价值储存"
+      },
+      "DA_CRYPTO_LAYER1": {
+        "source": "Layer 1",
+        "label": "第一层区块链"
+      },
+      "DA_CRYPTO_LAYER2": {
+        "source": "Layer 2",
+        "label": "第二层扩容网络"
+      },
+      "DA_STABLECOIN_FIAT": {
+        "source": "Fiat-Backed",
+        "label": "法币抵押型"
+      },
+      "DA_STABLECOIN_CRYPTO": {
+        "source": "Crypto-Backed",
+        "label": "加密资产抵押型"
+      },
+      "DA_STABLECOIN_ALGO": {
+        "source": "Algorithmic",
+        "label": "算法型"
+      }
+    },
+    "industries_gics": {
+      "10": {
+        "source": "Energy",
+        "label": "能源"
+      },
+      "101010": {
+        "source": "Energy Equipment & Services",
+        "label": "能源设备与服务"
+      },
+      "10101010": {
+        "source": "Oil & Gas Drilling",
+        "label": "石油与天然气钻探"
+      },
+      "10101020": {
+        "source": "Oil & Gas Equipment & Services",
+        "label": "石油与天然气设备及服务"
+      },
+      "101020": {
+        "source": "Oil, Gas & Consumable Fuels",
+        "label": "石油、天然气与消耗性燃料"
+      },
+      "10102010": {
+        "source": "Integrated Oil & Gas",
+        "label": "综合石油与天然气"
+      },
+      "10102020": {
+        "source": "Oil & Gas Exploration & Production",
+        "label": "石油与天然气勘探及生产"
+      },
+      "10102030": {
+        "source": "Oil & Gas Refining & Marketing",
+        "label": "石油与天然气炼制及销售"
+      },
+      "10102040": {
+        "source": "Oil & Gas Storage & Transportation",
+        "label": "石油与天然气储运"
+      },
+      "10102050": {
+        "source": "Coal & Consumable Fuels",
+        "label": "煤炭与消耗性燃料"
+      },
+      "15": {
+        "source": "Materials",
+        "label": "原材料"
+      },
+      "151010": {
+        "source": "Chemicals",
+        "label": "化工"
+      },
+      "15101010": {
+        "source": "Commodity Chemicals",
+        "label": "基础化工"
+      },
+      "15101020": {
+        "source": "Diversified Chemicals",
+        "label": "综合化工"
+      },
+      "15101030": {
+        "source": "Fertilizers & Agricultural Chemicals",
+        "label": "化肥与农用化学品"
+      },
+      "15101040": {
+        "source": "Industrial Gases",
+        "label": "工业气体"
+      },
+      "15101050": {
+        "source": "Specialty Chemicals",
+        "label": "特种化学品"
+      },
+      "151020": {
+        "source": "Construction Materials",
+        "label": "建筑材料"
+      },
+      "15102010": {
+        "source": "Construction Materials",
+        "label": "建筑材料"
+      },
+      "151030": {
+        "source": "Containers & Packaging",
+        "label": "容器与包装"
+      },
+      "15103010": {
+        "source": "Metal & Glass Containers",
+        "label": "金属与玻璃容器"
+      },
+      "15103020": {
+        "source": "Paper Packaging",
+        "label": "纸包装"
+      },
+      "151040": {
+        "source": "Metals & Mining",
+        "label": "金属与采矿"
+      },
+      "15104010": {
+        "source": "Aluminum",
+        "label": "铝"
+      },
+      "15104020": {
+        "source": "Diversified Metals & Mining",
+        "label": "综合金属与采矿"
+      },
+      "15104025": {
+        "source": "Copper",
+        "label": "铜"
+      },
+      "15104030": {
+        "source": "Gold",
+        "label": "黄金"
+      },
+      "15104040": {
+        "source": "Precious Metals & Minerals",
+        "label": "贵金属与矿产"
+      },
+      "15104045": {
+        "source": "Silver",
+        "label": "白银"
+      },
+      "15104050": {
+        "source": "Steel",
+        "label": "钢铁"
+      },
+      "151050": {
+        "source": "Paper & Forest Products",
+        "label": "纸与林产品"
+      },
+      "15105010": {
+        "source": "Forest Products",
+        "label": "林产品"
+      },
+      "15105020": {
+        "source": "Paper Products",
+        "label": "纸制品"
+      },
+      "20": {
+        "source": "Industrials",
+        "label": "工业"
+      },
+      "2010": {
+        "source": "Capital Goods",
+        "label": "资本货物"
+      },
+      "201010": {
+        "source": "Aerospace & Defense",
+        "label": "航空航天与国防"
+      },
+      "20101010": {
+        "source": "Aerospace & Defense",
+        "label": "航空航天与国防"
+      },
+      "201020": {
+        "source": "Building Products",
+        "label": "建筑产品"
+      },
+      "20102010": {
+        "source": "Building Products",
+        "label": "建筑产品"
+      },
+      "201030": {
+        "source": "Construction & Engineering",
+        "label": "建筑与工程"
+      },
+      "20103010": {
+        "source": "Construction & Engineering",
+        "label": "建筑与工程"
+      },
+      "201040": {
+        "source": "Electrical Equipment",
+        "label": "电气设备"
+      },
+      "20104010": {
+        "source": "Electrical Components & Equipment",
+        "label": "电气元件与设备"
+      },
+      "20104020": {
+        "source": "Heavy Electrical Equipment",
+        "label": "重型电气设备"
+      },
+      "201050": {
+        "source": "Industrial Conglomerates",
+        "label": "综合工业企业"
+      },
+      "20105010": {
+        "source": "Industrial Conglomerates",
+        "label": "综合工业企业"
+      },
+      "201060": {
+        "source": "Machinery",
+        "label": "机械"
+      },
+      "20106010": {
+        "source": "Construction Machinery & Heavy Trucks",
+        "label": "建筑机械与重型卡车"
+      },
+      "20106015": {
+        "source": "Agricultural & Farm Machinery",
+        "label": "农业机械"
+      },
+      "20106020": {
+        "source": "Industrial Machinery",
+        "label": "工业机械"
+      },
+      "201070": {
+        "source": "Trading Companies & Distributors",
+        "label": "贸易公司与经销商"
+      },
+      "20107010": {
+        "source": "Trading Companies & Distributors",
+        "label": "贸易公司与经销商"
+      },
+      "2020": {
+        "source": "Commercial & Professional Services",
+        "label": "商业与专业服务"
+      },
+      "202010": {
+        "source": "Commercial Services & Supplies",
+        "label": "商业服务与用品"
+      },
+      "20201010": {
+        "source": "Commercial Printing",
+        "label": "商业印刷"
+      },
+      "20201050": {
+        "source": "Environmental & Facilities Services",
+        "label": "环境与设施服务"
+      },
+      "20201060": {
+        "source": "Office Services & Supplies",
+        "label": "办公服务与用品"
+      },
+      "20201070": {
+        "source": "Diversified Support Services",
+        "label": "综合支持服务"
+      },
+      "20201080": {
+        "source": "Security & Alarm Services",
+        "label": "安保与报警服务"
+      },
+      "202020": {
+        "source": "Professional Services",
+        "label": "专业服务"
+      },
+      "20202010": {
+        "source": "Human Resource & Employment Services",
+        "label": "人力资源与就业服务"
+      },
+      "20202020": {
+        "source": "Research & Consulting Services",
+        "label": "研究与咨询服务"
+      },
+      "20202030": {
+        "source": "Data Processing & Outsourced Services",
+        "label": "数据处理与外包服务"
+      },
+      "2030": {
+        "source": "Transportation",
+        "label": "运输"
+      },
+      "203010": {
+        "source": "Air Freight & Logistics",
+        "label": "航空货运与物流"
+      },
+      "20301010": {
+        "source": "Air Freight & Logistics",
+        "label": "航空货运与物流"
+      },
+      "203020": {
+        "source": "Passenger Airlines",
+        "label": "客运航空"
+      },
+      "20302010": {
+        "source": "Passenger Airlines",
+        "label": "客运航空"
+      },
+      "203030": {
+        "source": "Marine",
+        "label": "海运"
+      },
+      "20303010": {
+        "source": "Marine",
+        "label": "海运"
+      },
+      "203040": {
+        "source": "Road & Rail",
+        "label": "公路与铁路"
+      },
+      "20304010": {
+        "source": "Railroads",
+        "label": "铁路运输"
+      },
+      "20304030": {
+        "source": "Cargo Ground Transportation",
+        "label": "地面货运"
+      },
+      "20304040": {
+        "source": "Passenger Ground Transportation",
+        "label": "地面客运"
+      },
+      "203050": {
+        "source": "Transportation Infrastructure",
+        "label": "交通基础设施"
+      },
+      "20305010": {
+        "source": "Airport Services",
+        "label": "机场服务"
+      },
+      "20305020": {
+        "source": "Highways & Railtracks",
+        "label": "公路与铁路设施"
+      },
+      "20305030": {
+        "source": "Marine Ports & Services",
+        "label": "港口与服务"
+      },
+      "25": {
+        "source": "Consumer Discretionary",
+        "label": "可选消费"
+      },
+      "2510": {
+        "source": "Automobiles & Components",
+        "label": "汽车与零部件"
+      },
+      "251010": {
+        "source": "Auto Components",
+        "label": "汽车零部件"
+      },
+      "25101010": {
+        "source": "Auto Parts & Equipment",
+        "label": "汽车零件与设备"
+      },
+      "25101020": {
+        "source": "Tires & Rubber",
+        "label": "轮胎与橡胶"
+      },
+      "251020": {
+        "source": "Automobiles",
+        "label": "汽车"
+      },
+      "25102010": {
+        "source": "Automobile Manufacturers",
+        "label": "汽车制造商"
+      },
+      "25102020": {
+        "source": "Motorcycle Manufacturers",
+        "label": "摩托车制造商"
+      },
+      "2520": {
+        "source": "Consumer Durables & Apparel",
+        "label": "耐用消费品与服装"
+      },
+      "252010": {
+        "source": "Household Durables",
+        "label": "家庭耐用品"
+      },
+      "25201010": {
+        "source": "Consumer Electronics",
+        "label": "消费电子"
+      },
+      "25201020": {
+        "source": "Home Furnishings",
+        "label": "家居用品"
+      },
+      "25201030": {
+        "source": "Homebuilding",
+        "label": "住宅建筑"
+      },
+      "25201040": {
+        "source": "Household Appliances",
+        "label": "家用电器"
+      },
+      "25201050": {
+        "source": "Housewares & Specialties",
+        "label": "家庭用品与特种用品"
+      },
+      "252020": {
+        "source": "Leisure Products",
+        "label": "休闲用品"
+      },
+      "25202010": {
+        "source": "Leisure Products",
+        "label": "休闲用品"
+      },
+      "252030": {
+        "source": "Textiles, Apparel & Luxury Goods",
+        "label": "纺织、服装与奢侈品"
+      },
+      "25203010": {
+        "source": "Apparel, Accessories & Luxury Goods",
+        "label": "服装、配饰与奢侈品"
+      },
+      "25203020": {
+        "source": "Footwear",
+        "label": "鞋类"
+      },
+      "25203030": {
+        "source": "Textiles",
+        "label": "纺织品"
+      },
+      "2530": {
+        "source": "Consumer Services",
+        "label": "消费者服务"
+      },
+      "253010": {
+        "source": "Hotels, Restaurants & Leisure",
+        "label": "酒店、餐饮与休闲"
+      },
+      "25301010": {
+        "source": "Casinos & Gaming",
+        "label": "赌场与博彩"
+      },
+      "25301020": {
+        "source": "Hotels, Resorts & Cruise Lines",
+        "label": "酒店、度假村与邮轮"
+      },
+      "25301030": {
+        "source": "Leisure Facilities",
+        "label": "休闲设施"
+      },
+      "25301040": {
+        "source": "Restaurants",
+        "label": "餐饮"
+      },
+      "253020": {
+        "source": "Diversified Consumer Services",
+        "label": "综合消费者服务"
+      },
+      "25302010": {
+        "source": "Education Services",
+        "label": "教育服务"
+      },
+      "25302020": {
+        "source": "Specialized Consumer Services",
+        "label": "专业消费者服务"
+      },
+      "2550": {
+        "source": "Consumer Discretionary Distribution & Retail",
+        "label": "可选消费品分销与零售"
+      },
+      "255010": {
+        "source": "Distributors",
+        "label": "分销商"
+      },
+      "25501010": {
+        "source": "Distributors",
+        "label": "分销商"
+      },
+      "255030": {
+        "source": "Broadline Retail",
+        "label": "综合零售"
+      },
+      "25503030": {
+        "source": "Broadline Retail",
+        "label": "综合零售"
+      },
+      "255040": {
+        "source": "Specialty Retail",
+        "label": "专营零售"
+      },
+      "25504010": {
+        "source": "Apparel Retail",
+        "label": "服装零售"
+      },
+      "25504020": {
+        "source": "Computer & Electronics Retail",
+        "label": "计算机与电子产品零售"
+      },
+      "25504030": {
+        "source": "Home Improvement Retail",
+        "label": "家装零售"
+      },
+      "25504040": {
+        "source": "Other Specialty Retail",
+        "label": "其他专营零售"
+      },
+      "25504050": {
+        "source": "Automotive Retail",
+        "label": "汽车零售"
+      },
+      "25504060": {
+        "source": "Homefurnishing Retail",
+        "label": "家居零售"
+      },
+      "30": {
+        "source": "Consumer Staples",
+        "label": "必需消费"
+      },
+      "3010": {
+        "source": "Consumer Staples Distribution & Retail",
+        "label": "必需消费品分销与零售"
+      },
+      "301010": {
+        "source": "Consumer Staples Distribution & Retail",
+        "label": "必需消费品分销与零售"
+      },
+      "30101010": {
+        "source": "Drug Retail",
+        "label": "药品零售"
+      },
+      "30101020": {
+        "source": "Food Distributors",
+        "label": "食品分销"
+      },
+      "30101030": {
+        "source": "Food Retail",
+        "label": "食品零售"
+      },
+      "30101040": {
+        "source": "Consumer Staples Merchandise Retail",
+        "label": "必需消费品零售"
+      },
+      "3020": {
+        "source": "Food, Beverage & Tobacco",
+        "label": "食品、饮料与烟草"
+      },
+      "302010": {
+        "source": "Beverages",
+        "label": "饮料"
+      },
+      "30201010": {
+        "source": "Brewers",
+        "label": "啤酒"
+      },
+      "30201020": {
+        "source": "Distillers & Vintners",
+        "label": "烈酒与葡萄酒"
+      },
+      "30201030": {
+        "source": "Soft Drinks",
+        "label": "软饮料"
+      },
+      "302020": {
+        "source": "Food Products",
+        "label": "食品"
+      },
+      "30202010": {
+        "source": "Agricultural Products",
+        "label": "农产品"
+      },
+      "30202030": {
+        "source": "Packaged Foods & Meats",
+        "label": "包装食品与肉类"
+      },
+      "302030": {
+        "source": "Tobacco",
+        "label": "烟草"
+      },
+      "30203010": {
+        "source": "Tobacco",
+        "label": "烟草"
+      },
+      "3030": {
+        "source": "Household & Personal Products",
+        "label": "家庭与个人用品"
+      },
+      "303010": {
+        "source": "Household Products",
+        "label": "家庭用品"
+      },
+      "30301010": {
+        "source": "Household Products",
+        "label": "家庭用品"
+      },
+      "303020": {
+        "source": "Personal Products",
+        "label": "个人用品"
+      },
+      "30302010": {
+        "source": "Personal Products",
+        "label": "个人用品"
+      },
+      "35": {
+        "source": "Health Care",
+        "label": "医疗保健"
+      },
+      "3510": {
+        "source": "Health Care Equipment & Services",
+        "label": "医疗设备与服务"
+      },
+      "351010": {
+        "source": "Health Care Equipment & Supplies",
+        "label": "医疗设备与用品"
+      },
+      "35101010": {
+        "source": "Health Care Equipment",
+        "label": "医疗设备"
+      },
+      "35101020": {
+        "source": "Health Care Supplies",
+        "label": "医疗用品"
+      },
+      "351020": {
+        "source": "Health Care Providers & Services",
+        "label": "医疗服务提供商与服务"
+      },
+      "35102010": {
+        "source": "Health Care Distributors",
+        "label": "医疗产品分销"
+      },
+      "35102015": {
+        "source": "Health Care Services",
+        "label": "医疗服务"
+      },
+      "35102020": {
+        "source": "Health Care Facilities",
+        "label": "医疗设施"
+      },
+      "35102030": {
+        "source": "Managed Health Care",
+        "label": "管理式医疗"
+      },
+      "351030": {
+        "source": "Health Care Technology",
+        "label": "医疗技术"
+      },
+      "35103010": {
+        "source": "Health Care Technology",
+        "label": "医疗技术"
+      },
+      "3520": {
+        "source": "Pharmaceuticals, Biotechnology & Life Sciences",
+        "label": "制药、生物科技与生命科学"
+      },
+      "352010": {
+        "source": "Biotechnology",
+        "label": "生物科技"
+      },
+      "35201010": {
+        "source": "Biotechnology",
+        "label": "生物科技"
+      },
+      "352020": {
+        "source": "Pharmaceuticals",
+        "label": "制药"
+      },
+      "35202010": {
+        "source": "Pharmaceuticals",
+        "label": "制药"
+      },
+      "352030": {
+        "source": "Life Sciences Tools & Services",
+        "label": "生命科学工具与服务"
+      },
+      "35203010": {
+        "source": "Life Sciences Tools & Services",
+        "label": "生命科学工具与服务"
+      },
+      "40": {
+        "source": "Financials",
+        "label": "金融"
+      },
+      "4010": {
+        "source": "Banks",
+        "label": "银行"
+      },
+      "401010": {
+        "source": "Banks",
+        "label": "银行"
+      },
+      "40101010": {
+        "source": "Diversified Banks",
+        "label": "综合银行"
+      },
+      "40101015": {
+        "source": "Regional Banks",
+        "label": "区域银行"
+      },
+      "4020": {
+        "source": "Financial Services",
+        "label": "金融服务"
+      },
+      "402010": {
+        "source": "Financial Services",
+        "label": "金融服务"
+      },
+      "40201020": {
+        "source": "Diversified Financial Services",
+        "label": "综合金融服务"
+      },
+      "40201030": {
+        "source": "Multi-Sector Holdings",
+        "label": "多元行业控股"
+      },
+      "40201040": {
+        "source": "Specialized Finance",
+        "label": "专业金融"
+      },
+      "40201050": {
+        "source": "Commercial & Residential Mortgage Finance",
+        "label": "商业与住宅抵押贷款融资"
+      },
+      "40201060": {
+        "source": "Transaction & Payment Processing Services",
+        "label": "交易与支付处理服务"
+      },
+      "402020": {
+        "source": "Consumer Finance",
+        "label": "消费金融"
+      },
+      "40202010": {
+        "source": "Consumer Finance",
+        "label": "消费金融"
+      },
+      "402030": {
+        "source": "Capital Markets",
+        "label": "资本市场"
+      },
+      "40203010": {
+        "source": "Asset Management & Custody Banks",
+        "label": "资产管理与托管银行"
+      },
+      "40203020": {
+        "source": "Investment Banking & Brokerage",
+        "label": "投资银行与经纪"
+      },
+      "40203030": {
+        "source": "Diversified Capital Markets",
+        "label": "综合资本市场"
+      },
+      "40203040": {
+        "source": "Financial Exchanges & Data",
+        "label": "金融交易所与数据"
+      },
+      "402040": {
+        "source": "Mortgage Real Estate Investment Trusts (REITs)",
+        "label": "抵押型房地产投资信托（REITs）"
+      },
+      "40204010": {
+        "source": "Mortgage REITs",
+        "label": "抵押型房地产投资信托"
+      },
+      "4030": {
+        "source": "Insurance",
+        "label": "保险"
+      },
+      "403010": {
+        "source": "Insurance",
+        "label": "保险"
+      },
+      "40301010": {
+        "source": "Insurance Brokers",
+        "label": "保险经纪"
+      },
+      "40301020": {
+        "source": "Life & Health Insurance",
+        "label": "人寿与健康保险"
+      },
+      "40301030": {
+        "source": "Multi-line Insurance",
+        "label": "综合保险"
+      },
+      "40301040": {
+        "source": "Property & Casualty Insurance",
+        "label": "财产与意外保险"
+      },
+      "40301050": {
+        "source": "Reinsurance",
+        "label": "再保险"
+      },
+      "45": {
+        "source": "Information Technology",
+        "label": "信息技术"
+      },
+      "4510": {
+        "source": "Software & Services",
+        "label": "软件与服务"
+      },
+      "451010": {
+        "source": "Internet Software & Services",
+        "label": "互联网软件与服务"
+      },
+      "45101010": {
+        "source": "Internet Software & Services",
+        "label": "互联网软件与服务"
+      },
+      "451020": {
+        "source": "IT Services",
+        "label": "信息技术服务"
+      },
+      "45102010": {
+        "source": "IT Consulting & Other Services",
+        "label": "信息技术咨询与其他服务"
+      },
+      "45102030": {
+        "source": "Internet Services & Infrastructure",
+        "label": "互联网服务与基础设施"
+      },
+      "451030": {
+        "source": "Software",
+        "label": "软件"
+      },
+      "45103010": {
+        "source": "Application Software",
+        "label": "应用软件"
+      },
+      "45103020": {
+        "source": "Systems Software",
+        "label": "系统软件"
+      },
+      "4520": {
+        "source": "Technology Hardware & Equipment",
+        "label": "技术硬件与设备"
+      },
+      "452010": {
+        "source": "Communications Equipment",
+        "label": "通信设备"
+      },
+      "45201020": {
+        "source": "Communications Equipment",
+        "label": "通信设备"
+      },
+      "452020": {
+        "source": "Technology Hardware, Storage & Peripherals",
+        "label": "技术硬件、存储与外设"
+      },
+      "45202030": {
+        "source": "Technology Hardware, Storage & Peripherals",
+        "label": "技术硬件、存储与外设"
+      },
+      "452030": {
+        "source": "Electronic Equipment, Instruments & Components",
+        "label": "电子设备、仪器与元件"
+      },
+      "45203010": {
+        "source": "Electronic Equipment & Instruments",
+        "label": "电子设备与仪器"
+      },
+      "45203015": {
+        "source": "Electronic Components",
+        "label": "电子元件"
+      },
+      "45203020": {
+        "source": "Electronic Manufacturing Services",
+        "label": "电子制造服务"
+      },
+      "45203030": {
+        "source": "Technology Distributors",
+        "label": "技术产品分销商"
+      },
+      "4530": {
+        "source": "Semiconductors & Semiconductor Equipment",
+        "label": "半导体与半导体设备"
+      },
+      "453010": {
+        "source": "Semiconductors & Semiconductor Equipment",
+        "label": "半导体与半导体设备"
+      },
+      "45301010": {
+        "source": "Semiconductor Equipment",
+        "label": "半导体设备"
+      },
+      "45301020": {
+        "source": "Semiconductors",
+        "label": "半导体"
+      },
+      "50": {
+        "source": "Communication Services",
+        "label": "通信服务"
+      },
+      "5010": {
+        "source": "Telecommunication Services",
+        "label": "电信服务"
+      },
+      "501010": {
+        "source": "Diversified Telecommunication Services",
+        "label": "综合电信服务"
+      },
+      "50101010": {
+        "source": "Alternative Carriers",
+        "label": "其他电信运营商"
+      },
+      "50101020": {
+        "source": "Integrated Telecommunication Services",
+        "label": "一体化电信服务"
+      },
+      "501020": {
+        "source": "Wireless Telecommunication Services",
+        "label": "无线电信服务"
+      },
+      "50102010": {
+        "source": "Wireless Telecommunication Services",
+        "label": "无线电信服务"
+      },
+      "5020": {
+        "source": "Media & Entertainment",
+        "label": "媒体与娱乐"
+      },
+      "502010": {
+        "source": "Media",
+        "label": "媒体"
+      },
+      "50201010": {
+        "source": "Advertising",
+        "label": "广告"
+      },
+      "50201020": {
+        "source": "Broadcasting",
+        "label": "广播电视"
+      },
+      "50201030": {
+        "source": "Cable & Satellite",
+        "label": "有线与卫星电视"
+      },
+      "50201040": {
+        "source": "Publishing",
+        "label": "出版"
+      },
+      "502020": {
+        "source": "Entertainment",
+        "label": "娱乐"
+      },
+      "50202010": {
+        "source": "Movies & Entertainment",
+        "label": "电影与娱乐"
+      },
+      "50202020": {
+        "source": "Interactive Home Entertainment",
+        "label": "互动家庭娱乐"
+      },
+      "502030": {
+        "source": "Interactive Media & Services",
+        "label": "互动媒体与服务"
+      },
+      "50203010": {
+        "source": "Interactive Media & Services",
+        "label": "互动媒体与服务"
+      },
+      "55": {
+        "source": "Utilities",
+        "label": "公用事业"
+      },
+      "551010": {
+        "source": "Electric Utilities",
+        "label": "电力公用事业"
+      },
+      "55101010": {
+        "source": "Electric Utilities",
+        "label": "电力公用事业"
+      },
+      "551020": {
+        "source": "Gas Utilities",
+        "label": "燃气公用事业"
+      },
+      "55102010": {
+        "source": "Gas Utilities",
+        "label": "燃气公用事业"
+      },
+      "551030": {
+        "source": "Multi-Utilities",
+        "label": "综合公用事业"
+      },
+      "55103010": {
+        "source": "Multi-Utilities",
+        "label": "综合公用事业"
+      },
+      "551040": {
+        "source": "Water Utilities",
+        "label": "水务公用事业"
+      },
+      "55104010": {
+        "source": "Water Utilities",
+        "label": "水务公用事业"
+      },
+      "551050": {
+        "source": "Independent Power and Renewable Electricity Producers",
+        "label": "独立发电与可再生能源发电商"
+      },
+      "55105010": {
+        "source": "Independent Power Producers & Energy Traders",
+        "label": "独立发电商与能源交易商"
+      },
+      "55105020": {
+        "source": "Renewable Electricity",
+        "label": "可再生能源发电"
+      },
+      "60": {
+        "source": "Real Estate",
+        "label": "房地产"
+      },
+      "6010": {
+        "source": "Equity Real Estate Investment Trusts (REITs)",
+        "label": "权益型房地产投资信托（REITs）"
+      },
+      "601010": {
+        "source": "Diversified REITs",
+        "label": "多元化房地产投资信托"
+      },
+      "60101010": {
+        "source": "Diversified REITs",
+        "label": "多元化房地产投资信托"
+      },
+      "601025": {
+        "source": "Industrial REITs",
+        "label": "工业房地产投资信托"
+      },
+      "60102510": {
+        "source": "Industrial REITs",
+        "label": "工业房地产投资信托"
+      },
+      "601030": {
+        "source": "Hotel & Resort REITs",
+        "label": "酒店与度假村房地产投资信托"
+      },
+      "60103010": {
+        "source": "Hotel & Resort REITs",
+        "label": "酒店与度假村房地产投资信托"
+      },
+      "601040": {
+        "source": "Office REITs",
+        "label": "办公房地产投资信托"
+      },
+      "60104010": {
+        "source": "Office REITs",
+        "label": "办公房地产投资信托"
+      },
+      "601050": {
+        "source": "Health Care REITs",
+        "label": "医疗房地产投资信托"
+      },
+      "60105010": {
+        "source": "Health Care REITs",
+        "label": "医疗房地产投资信托"
+      },
+      "601060": {
+        "source": "Residential REITs",
+        "label": "住宅房地产投资信托"
+      },
+      "60106010": {
+        "source": "Multi-Family Residential REITs",
+        "label": "多户住宅房地产投资信托"
+      },
+      "60106020": {
+        "source": "Single-Family Residential REITs",
+        "label": "独栋住宅房地产投资信托"
+      },
+      "601070": {
+        "source": "Retail REITs",
+        "label": "零售房地产投资信托"
+      },
+      "60107010": {
+        "source": "Retail REITs",
+        "label": "零售房地产投资信托"
+      },
+      "601080": {
+        "source": "Specialized REITs",
+        "label": "专业房地产投资信托"
+      },
+      "60108010": {
+        "source": "Other Specialized REITs",
+        "label": "其他专业房地产投资信托"
+      },
+      "60108020": {
+        "source": "Self-Storage REITs",
+        "label": "自助仓储房地产投资信托"
+      },
+      "60108030": {
+        "source": "Telecom Tower REITs",
+        "label": "通信塔房地产投资信托"
+      },
+      "60108040": {
+        "source": "Timber REITs",
+        "label": "林地房地产投资信托"
+      },
+      "60108050": {
+        "source": "Data Center REITs",
+        "label": "数据中心房地产投资信托"
+      },
+      "6020": {
+        "source": "Real Estate Management & Development",
+        "label": "房地产管理与开发"
+      },
+      "602010": {
+        "source": "Real Estate Management & Development",
+        "label": "房地产管理与开发"
+      },
+      "60201010": {
+        "source": "Diversified Real Estate Activities",
+        "label": "综合房地产业务"
+      },
+      "60201020": {
+        "source": "Real Estate Operating Companies",
+        "label": "房地产运营公司"
+      },
+      "60201030": {
+        "source": "Real Estate Development",
+        "label": "房地产开发"
+      },
+      "60201040": {
+        "source": "Real Estate Services",
+        "label": "房地产服务"
+      }
+    },
+    "regions": {
+      "R10": {
+        "source": "Europe",
+        "label": "欧洲"
+      },
+      "R20": {
+        "source": "Americas",
+        "label": "美洲"
+      },
+      "R30": {
+        "source": "Asia",
+        "label": "亚洲"
+      },
+      "R40": {
+        "source": "Africa",
+        "label": "非洲"
+      },
+      "R50": {
+        "source": "Oceania",
+        "label": "大洋洲"
+      },
+      "R1010": {
+        "source": "Northern Europe",
+        "label": "北欧"
+      },
+      "R1020": {
+        "source": "Western Europe",
+        "label": "西欧"
+      },
+      "R1030": {
+        "source": "Eastern Europe",
+        "label": "东欧"
+      },
+      "R1040": {
+        "source": "Southern Europe",
+        "label": "南欧"
+      },
+      "R2010": {
+        "source": "Northern America",
+        "label": "北美洲"
+      },
+      "R2020": {
+        "source": "Central America",
+        "label": "中美洲"
+      },
+      "R2030": {
+        "source": "Caribbean",
+        "label": "加勒比地区"
+      },
+      "R2040": {
+        "source": "South America",
+        "label": "南美洲"
+      },
+      "R3010": {
+        "source": "Western Asia",
+        "label": "西亚"
+      },
+      "R3020": {
+        "source": "Central Asia",
+        "label": "中亚"
+      },
+      "R3030": {
+        "source": "Eastern Asia",
+        "label": "东亚"
+      },
+      "R3040": {
+        "source": "Southern Asia",
+        "label": "南亚"
+      },
+      "R3050": {
+        "source": "South-eastern Asia",
+        "label": "东南亚"
+      },
+      "R4010": {
+        "source": "Northern Africa",
+        "label": "北非"
+      },
+      "R4020": {
+        "source": "Western Africa",
+        "label": "西非"
+      },
+      "R4030": {
+        "source": "Eastern Africa",
+        "label": "东非"
+      },
+      "R4040": {
+        "source": "Middle Africa",
+        "label": "中非"
+      },
+      "R4050": {
+        "source": "Southern Africa",
+        "label": "南部非洲"
+      },
+      "R5010": {
+        "source": "Australia and New Zealand",
+        "label": "澳大利亚与新西兰"
+      },
+      "R5020": {
+        "source": "Melanesia",
+        "label": "美拉尼西亚"
+      },
+      "R5030": {
+        "source": "Micronesia",
+        "label": "密克罗尼西亚"
+      },
+      "R5040": {
+        "source": "Polynesia",
+        "label": "波利尼西亚"
+      },
+      "country_DK": {
+        "source": "Denmark",
+        "label": "丹麦"
+      },
+      "country_EE": {
+        "source": "Estonia",
+        "label": "爱沙尼亚"
+      },
+      "country_FI": {
+        "source": "Finland",
+        "label": "芬兰"
+      },
+      "country_GB": {
+        "source": "United Kingdom",
+        "label": "英国"
+      },
+      "country_IS": {
+        "source": "Iceland",
+        "label": "冰岛"
+      },
+      "country_IE": {
+        "source": "Ireland",
+        "label": "爱尔兰"
+      },
+      "country_LV": {
+        "source": "Latvia",
+        "label": "拉脱维亚"
+      },
+      "country_LT": {
+        "source": "Lithuania",
+        "label": "立陶宛"
+      },
+      "country_NO": {
+        "source": "Norway",
+        "label": "挪威"
+      },
+      "country_SE": {
+        "source": "Sweden",
+        "label": "瑞典"
+      },
+      "country_AT": {
+        "source": "Austria",
+        "label": "奥地利"
+      },
+      "country_BE": {
+        "source": "Belgium",
+        "label": "比利时"
+      },
+      "country_FR": {
+        "source": "France",
+        "label": "法国"
+      },
+      "country_DE": {
+        "source": "Germany",
+        "label": "德国"
+      },
+      "country_LI": {
+        "source": "Liechtenstein",
+        "label": "列支敦士登"
+      },
+      "country_LU": {
+        "source": "Luxembourg",
+        "label": "卢森堡"
+      },
+      "country_MC": {
+        "source": "Monaco",
+        "label": "摩纳哥"
+      },
+      "country_NL": {
+        "source": "Netherlands",
+        "label": "荷兰"
+      },
+      "country_CH": {
+        "source": "Switzerland",
+        "label": "瑞士"
+      },
+      "country_BY": {
+        "source": "Belarus",
+        "label": "白俄罗斯"
+      },
+      "country_BG": {
+        "source": "Bulgaria",
+        "label": "保加利亚"
+      },
+      "country_CZ": {
+        "source": "Czechia",
+        "label": "捷克"
+      },
+      "country_HU": {
+        "source": "Hungary",
+        "label": "匈牙利"
+      },
+      "country_PL": {
+        "source": "Poland",
+        "label": "波兰"
+      },
+      "country_RO": {
+        "source": "Romania",
+        "label": "罗马尼亚"
+      },
+      "country_RU": {
+        "source": "Russian Federation",
+        "label": "俄罗斯"
+      },
+      "country_SK": {
+        "source": "Slovakia",
+        "label": "斯洛伐克"
+      },
+      "country_UA": {
+        "source": "Ukraine",
+        "label": "乌克兰"
+      },
+      "country_AL": {
+        "source": "Albania",
+        "label": "阿尔巴尼亚"
+      },
+      "country_AD": {
+        "source": "Andorra",
+        "label": "安道尔"
+      },
+      "country_BA": {
+        "source": "Bosnia and Herzegovina",
+        "label": "波斯尼亚和黑塞哥维那"
+      },
+      "country_HR": {
+        "source": "Croatia",
+        "label": "克罗地亚"
+      },
+      "country_GI": {
+        "source": "Gibraltar",
+        "label": "直布罗陀"
+      },
+      "country_GR": {
+        "source": "Greece",
+        "label": "希腊"
+      },
+      "country_IT": {
+        "source": "Italy",
+        "label": "意大利"
+      },
+      "country_MT": {
+        "source": "Malta",
+        "label": "马耳他"
+      },
+      "country_ME": {
+        "source": "Montenegro",
+        "label": "黑山"
+      },
+      "country_PT": {
+        "source": "Portugal",
+        "label": "葡萄牙"
+      },
+      "country_SM": {
+        "source": "San Marino",
+        "label": "圣马力诺"
+      },
+      "country_RS": {
+        "source": "Serbia",
+        "label": "塞尔维亚"
+      },
+      "country_ES": {
+        "source": "Spain",
+        "label": "西班牙"
+      },
+      "country_VA": {
+        "source": "Holy See",
+        "label": "梵蒂冈"
+      },
+      "country_BM": {
+        "source": "Bermuda",
+        "label": "百慕大"
+      },
+      "country_CA": {
+        "source": "Canada",
+        "label": "加拿大"
+      },
+      "country_GL": {
+        "source": "Greenland",
+        "label": "格陵兰"
+      },
+      "country_MX": {
+        "source": "Mexico",
+        "label": "墨西哥"
+      },
+      "country_PM": {
+        "source": "Saint Pierre and Miquelon",
+        "label": "圣皮埃尔和密克隆群岛"
+      },
+      "country_US": {
+        "source": "United States",
+        "label": "美国"
+      },
+      "country_BZ": {
+        "source": "Belize",
+        "label": "伯利兹"
+      },
+      "country_CR": {
+        "source": "Costa Rica",
+        "label": "哥斯达黎加"
+      },
+      "country_SV": {
+        "source": "El Salvador",
+        "label": "萨尔瓦多"
+      },
+      "country_GT": {
+        "source": "Guatemala",
+        "label": "危地马拉"
+      },
+      "country_HN": {
+        "source": "Honduras",
+        "label": "洪都拉斯"
+      },
+      "country_NI": {
+        "source": "Nicaragua",
+        "label": "尼加拉瓜"
+      },
+      "country_PA": {
+        "source": "Panama",
+        "label": "巴拿马"
+      },
+      "country_VI": {
+        "source": "Virgin Islands (U.S.)",
+        "label": "美属维尔京群岛"
+      },
+      "country_AI": {
+        "source": "Anguilla",
+        "label": "安圭拉"
+      },
+      "country_AG": {
+        "source": "Antigua and Barbuda",
+        "label": "安提瓜和巴布达"
+      },
+      "country_AW": {
+        "source": "Aruba",
+        "label": "阿鲁巴"
+      },
+      "country_BS": {
+        "source": "Bahamas",
+        "label": "巴哈马"
+      },
+      "country_BB": {
+        "source": "Barbados",
+        "label": "巴巴多斯"
+      },
+      "country_VG": {
+        "source": "Virgin Islands (British)",
+        "label": "英属维尔京群岛"
+      },
+      "country_KY": {
+        "source": "Cayman Islands",
+        "label": "开曼群岛"
+      },
+      "country_CU": {
+        "source": "Cuba",
+        "label": "古巴"
+      },
+      "country_DM": {
+        "source": "Dominica",
+        "label": "多米尼克"
+      },
+      "country_DO": {
+        "source": "Dominican Republic",
+        "label": "多米尼加共和国"
+      },
+      "country_GD": {
+        "source": "Grenada",
+        "label": "格林纳达"
+      },
+      "country_GP": {
+        "source": "Guadeloupe",
+        "label": "瓜德罗普"
+      },
+      "country_HT": {
+        "source": "Haiti",
+        "label": "海地"
+      },
+      "country_JM": {
+        "source": "Jamaica",
+        "label": "牙买加"
+      },
+      "country_MQ": {
+        "source": "Martinique",
+        "label": "马提尼克"
+      },
+      "country_MS": {
+        "source": "Montserrat",
+        "label": "蒙特塞拉特"
+      },
+      "country_PR": {
+        "source": "Puerto Rico",
+        "label": "波多黎各"
+      },
+      "country_MF": {
+        "source": "Saint Martin (French part)",
+        "label": "法属圣马丁"
+      },
+      "country_SX": {
+        "source": "Sint Maarten (Dutch part)",
+        "label": "荷属圣马丁"
+      },
+      "country_BL": {
+        "source": "Saint Barthélemy",
+        "label": "圣巴泰勒米"
+      },
+      "country_KN": {
+        "source": "Saint Kitts and Nevis",
+        "label": "圣基茨和尼维斯"
+      },
+      "country_LC": {
+        "source": "Saint Lucia",
+        "label": "圣卢西亚"
+      },
+      "country_VC": {
+        "source": "Saint Vincent and the Grenadines",
+        "label": "圣文森特和格林纳丁斯"
+      },
+      "country_TT": {
+        "source": "Trinidad and Tobago",
+        "label": "特立尼达和多巴哥"
+      },
+      "country_TC": {
+        "source": "Turks and Caicos Islands",
+        "label": "特克斯和凯科斯群岛"
+      },
+      "country_AR": {
+        "source": "Argentina",
+        "label": "阿根廷"
+      },
+      "country_BO": {
+        "source": "Bolivia",
+        "label": "玻利维亚"
+      },
+      "country_BR": {
+        "source": "Brazil",
+        "label": "巴西"
+      },
+      "country_CL": {
+        "source": "Chile",
+        "label": "智利"
+      },
+      "country_CO": {
+        "source": "Colombia",
+        "label": "哥伦比亚"
+      },
+      "country_EC": {
+        "source": "Ecuador",
+        "label": "厄瓜多尔"
+      },
+      "country_FK": {
+        "source": "Falkland Islands (Malvinas)",
+        "label": "福克兰群岛"
+      },
+      "country_GF": {
+        "source": "French Guiana",
+        "label": "法属圭亚那"
+      },
+      "country_GY": {
+        "source": "Guyana",
+        "label": "圭亚那"
+      },
+      "country_PY": {
+        "source": "Paraguay",
+        "label": "巴拉圭"
+      },
+      "country_PE": {
+        "source": "Peru",
+        "label": "秘鲁"
+      },
+      "country_SR": {
+        "source": "Suriname",
+        "label": "苏里南"
+      },
+      "country_UY": {
+        "source": "Uruguay",
+        "label": "乌拉圭"
+      },
+      "country_VE": {
+        "source": "Venezuela",
+        "label": "委内瑞拉"
+      },
+      "country_AM": {
+        "source": "Armenia",
+        "label": "亚美尼亚"
+      },
+      "country_AZ": {
+        "source": "Azerbaijan",
+        "label": "阿塞拜疆"
+      },
+      "country_BH": {
+        "source": "Bahrain",
+        "label": "巴林"
+      },
+      "country_CY": {
+        "source": "Cyprus",
+        "label": "塞浦路斯"
+      },
+      "country_GE": {
+        "source": "Georgia",
+        "label": "格鲁吉亚"
+      },
+      "country_IQ": {
+        "source": "Iraq",
+        "label": "伊拉克"
+      },
+      "country_IL": {
+        "source": "Israel",
+        "label": "以色列"
+      },
+      "country_JO": {
+        "source": "Jordan",
+        "label": "约旦"
+      },
+      "country_KW": {
+        "source": "Kuwait",
+        "label": "科威特"
+      },
+      "country_LB": {
+        "source": "Lebanon",
+        "label": "黎巴嫩"
+      },
+      "country_OM": {
+        "source": "Oman",
+        "label": "阿曼"
+      },
+      "country_QA": {
+        "source": "Qatar",
+        "label": "卡塔尔"
+      },
+      "country_SA": {
+        "source": "Saudi Arabia",
+        "label": "沙特阿拉伯"
+      },
+      "country_SY": {
+        "source": "Syrian Arab Republic",
+        "label": "叙利亚"
+      },
+      "country_TR": {
+        "source": "Turkey",
+        "label": "土耳其"
+      },
+      "country_AE": {
+        "source": "United Arab Emirates",
+        "label": "阿拉伯联合酋长国"
+      },
+      "country_YE": {
+        "source": "Yemen",
+        "label": "也门"
+      },
+      "country_KZ": {
+        "source": "Kazakhstan",
+        "label": "哈萨克斯坦"
+      },
+      "country_KG": {
+        "source": "Kyrgyzstan",
+        "label": "吉尔吉斯斯坦"
+      },
+      "country_TJ": {
+        "source": "Tajikistan",
+        "label": "塔吉克斯坦"
+      },
+      "country_TM": {
+        "source": "Turkmenistan",
+        "label": "土库曼斯坦"
+      },
+      "country_UZ": {
+        "source": "Uzbekistan",
+        "label": "乌兹别克斯坦"
+      },
+      "country_CN": {
+        "source": "China",
+        "label": "中国"
+      },
+      "country_HK": {
+        "source": "Hong Kong",
+        "label": "中国香港特别行政区"
+      },
+      "country_JP": {
+        "source": "Japan",
+        "label": "日本"
+      },
+      "country_MO": {
+        "source": "Macao",
+        "label": "中国澳门特别行政区"
+      },
+      "country_MN": {
+        "source": "Mongolia",
+        "label": "蒙古"
+      },
+      "country_KP": {
+        "source": "Korea (North)",
+        "label": "朝鲜"
+      },
+      "country_KR": {
+        "source": "Korea (South)",
+        "label": "韩国"
+      },
+      "country_TW": {
+        "source": "Taiwan",
+        "label": "台湾"
+      },
+      "country_AF": {
+        "source": "Afghanistan",
+        "label": "阿富汗"
+      },
+      "country_BD": {
+        "source": "Bangladesh",
+        "label": "孟加拉国"
+      },
+      "country_BT": {
+        "source": "Bhutan",
+        "label": "不丹"
+      },
+      "country_IN": {
+        "source": "India",
+        "label": "印度"
+      },
+      "country_IR": {
+        "source": "Iran",
+        "label": "伊朗"
+      },
+      "country_MV": {
+        "source": "Maldives",
+        "label": "马尔代夫"
+      },
+      "country_NP": {
+        "source": "Nepal",
+        "label": "尼泊尔"
+      },
+      "country_PK": {
+        "source": "Pakistan",
+        "label": "巴基斯坦"
+      },
+      "country_LK": {
+        "source": "Sri Lanka",
+        "label": "斯里兰卡"
+      },
+      "country_BN": {
+        "source": "Brunei Darussalam",
+        "label": "文莱"
+      },
+      "country_KH": {
+        "source": "Cambodia",
+        "label": "柬埔寨"
+      },
+      "country_ID": {
+        "source": "Indonesia",
+        "label": "印度尼西亚"
+      },
+      "country_LA": {
+        "source": "Lao PDR",
+        "label": "老挝"
+      },
+      "country_MY": {
+        "source": "Malaysia",
+        "label": "马来西亚"
+      },
+      "country_MM": {
+        "source": "Myanmar",
+        "label": "缅甸"
+      },
+      "country_PH": {
+        "source": "Philippines",
+        "label": "菲律宾"
+      },
+      "country_SG": {
+        "source": "Singapore",
+        "label": "新加坡"
+      },
+      "country_TH": {
+        "source": "Thailand",
+        "label": "泰国"
+      },
+      "country_TL": {
+        "source": "Timor-Leste",
+        "label": "东帝汶"
+      },
+      "country_VN": {
+        "source": "Viet Nam",
+        "label": "越南"
+      },
+      "country_DZ": {
+        "source": "Algeria",
+        "label": "阿尔及利亚"
+      },
+      "country_EG": {
+        "source": "Egypt",
+        "label": "埃及"
+      },
+      "country_LY": {
+        "source": "Libya",
+        "label": "利比亚"
+      },
+      "country_MA": {
+        "source": "Morocco",
+        "label": "摩洛哥"
+      },
+      "country_SD": {
+        "source": "Sudan",
+        "label": "苏丹"
+      },
+      "country_TN": {
+        "source": "Tunisia",
+        "label": "突尼斯"
+      },
+      "country_BJ": {
+        "source": "Benin",
+        "label": "贝宁"
+      },
+      "country_BF": {
+        "source": "Burkina Faso",
+        "label": "布基纳法索"
+      },
+      "country_CV": {
+        "source": "Cabo Verde",
+        "label": "佛得角"
+      },
+      "country_GM": {
+        "source": "Gambia",
+        "label": "冈比亚"
+      },
+      "country_GH": {
+        "source": "Ghana",
+        "label": "加纳"
+      },
+      "country_GN": {
+        "source": "Guinea",
+        "label": "几内亚"
+      },
+      "country_GW": {
+        "source": "Guinea-Bissau",
+        "label": "几内亚比绍"
+      },
+      "country_LR": {
+        "source": "Liberia",
+        "label": "利比里亚"
+      },
+      "country_ML": {
+        "source": "Mali",
+        "label": "马里"
+      },
+      "country_MR": {
+        "source": "Mauritania",
+        "label": "毛里塔尼亚"
+      },
+      "country_NE": {
+        "source": "Niger",
+        "label": "尼日尔"
+      },
+      "country_NG": {
+        "source": "Nigeria",
+        "label": "尼日利亚"
+      },
+      "country_SN": {
+        "source": "Senegal",
+        "label": "塞内加尔"
+      },
+      "country_SL": {
+        "source": "Sierra Leone",
+        "label": "塞拉利昂"
+      },
+      "country_SH": {
+        "source": "Saint Helena, ATC",
+        "label": "圣赫勒拿"
+      },
+      "country_TG": {
+        "source": "Togo",
+        "label": "多哥"
+      },
+      "country_IO": {
+        "source": "British Indian Ocean Territory",
+        "label": "英属印度洋领地"
+      },
+      "country_BI": {
+        "source": "Burundi",
+        "label": "布隆迪"
+      },
+      "country_KM": {
+        "source": "Comoros",
+        "label": "科摩罗"
+      },
+      "country_DJ": {
+        "source": "Djibouti",
+        "label": "吉布提"
+      },
+      "country_ER": {
+        "source": "Eritrea",
+        "label": "厄立特里亚"
+      },
+      "country_ET": {
+        "source": "Ethiopia",
+        "label": "埃塞俄比亚"
+      },
+      "country_TF": {
+        "source": "French Southern Territories",
+        "label": "法属南部领地"
+      },
+      "country_KE": {
+        "source": "Kenya",
+        "label": "肯尼亚"
+      },
+      "country_MG": {
+        "source": "Madagascar",
+        "label": "马达加斯加"
+      },
+      "country_MW": {
+        "source": "Malawi",
+        "label": "马拉维"
+      },
+      "country_MU": {
+        "source": "Mauritius",
+        "label": "毛里求斯"
+      },
+      "country_YT": {
+        "source": "Mayotte",
+        "label": "马约特"
+      },
+      "country_MZ": {
+        "source": "Mozambique",
+        "label": "莫桑比克"
+      },
+      "country_RE": {
+        "source": "Réunion",
+        "label": "留尼汪"
+      },
+      "country_RW": {
+        "source": "Rwanda",
+        "label": "卢旺达"
+      },
+      "country_SC": {
+        "source": "Seychelles",
+        "label": "塞舌尔"
+      },
+      "country_SO": {
+        "source": "Somalia",
+        "label": "索马里"
+      },
+      "country_SS": {
+        "source": "South Sudan",
+        "label": "南苏丹"
+      },
+      "country_TZ": {
+        "source": "Tanzania",
+        "label": "坦桑尼亚"
+      },
+      "country_UG": {
+        "source": "Uganda",
+        "label": "乌干达"
+      },
+      "country_ZM": {
+        "source": "Zambia",
+        "label": "赞比亚"
+      },
+      "country_ZW": {
+        "source": "Zimbabwe",
+        "label": "津巴布韦"
+      },
+      "country_AO": {
+        "source": "Angola",
+        "label": "安哥拉"
+      },
+      "country_CM": {
+        "source": "Cameroon",
+        "label": "喀麦隆"
+      },
+      "country_CF": {
+        "source": "Central African Republic",
+        "label": "中非共和国"
+      },
+      "country_TD": {
+        "source": "Chad",
+        "label": "乍得"
+      },
+      "country_CG": {
+        "source": "Congo",
+        "label": "刚果（布）"
+      },
+      "country_CD": {
+        "source": "Congo, Democratic Republic of the",
+        "label": "刚果（金）"
+      },
+      "country_GQ": {
+        "source": "Equatorial Guinea",
+        "label": "赤道几内亚"
+      },
+      "country_GA": {
+        "source": "Gabon",
+        "label": "加蓬"
+      },
+      "country_ST": {
+        "source": "São Tomé and Príncipe",
+        "label": "圣多美和普林西比"
+      },
+      "country_BW": {
+        "source": "Botswana",
+        "label": "博茨瓦纳"
+      },
+      "country_LS": {
+        "source": "Lesotho",
+        "label": "莱索托"
+      },
+      "country_NA": {
+        "source": "Namibia",
+        "label": "纳米比亚"
+      },
+      "country_ZA": {
+        "source": "South Africa",
+        "label": "南非"
+      },
+      "country_SZ": {
+        "source": "Eswatini",
+        "label": "斯威士兰"
+      },
+      "country_AU": {
+        "source": "Australia",
+        "label": "澳大利亚"
+      },
+      "country_NZ": {
+        "source": "New Zealand",
+        "label": "新西兰"
+      },
+      "country_NF": {
+        "source": "Norfolk Island",
+        "label": "诺福克岛"
+      },
+      "country_FJ": {
+        "source": "Fiji",
+        "label": "斐济"
+      },
+      "country_NC": {
+        "source": "New Caledonia",
+        "label": "新喀里多尼亚"
+      },
+      "country_PG": {
+        "source": "Papua New Guinea",
+        "label": "巴布亚新几内亚"
+      },
+      "country_VU": {
+        "source": "Vanuatu",
+        "label": "瓦努阿图"
+      },
+      "country_GU": {
+        "source": "Guam",
+        "label": "关岛"
+      },
+      "country_KI": {
+        "source": "Kiribati",
+        "label": "基里巴斯"
+      },
+      "country_MH": {
+        "source": "Marshall Islands",
+        "label": "马绍尔群岛"
+      },
+      "country_FM": {
+        "source": "Micronesia (Federated States of)",
+        "label": "密克罗尼西亚"
+      },
+      "country_NR": {
+        "source": "Nauru",
+        "label": "瑙鲁"
+      },
+      "country_MP": {
+        "source": "Northern Mariana Islands",
+        "label": "北马里亚纳群岛"
+      },
+      "country_PW": {
+        "source": "Palau",
+        "label": "帕劳"
+      },
+      "country_AS": {
+        "source": "American Samoa",
+        "label": "美属萨摩亚"
+      },
+      "country_CK": {
+        "source": "Cook Islands",
+        "label": "库克群岛"
+      },
+      "country_PF": {
+        "source": "French Polynesia",
+        "label": "法属波利尼西亚"
+      },
+      "country_NU": {
+        "source": "Niue",
+        "label": "纽埃"
+      },
+      "country_PN": {
+        "source": "Pitcairn",
+        "label": "皮特凯恩群岛"
+      },
+      "country_WS": {
+        "source": "Samoa",
+        "label": "萨摩亚"
+      },
+      "country_TK": {
+        "source": "Tokelau",
+        "label": "托克劳"
+      },
+      "country_TO": {
+        "source": "Tonga",
+        "label": "汤加"
+      },
+      "country_TV": {
+        "source": "Tuvalu",
+        "label": "图瓦卢"
+      },
+      "country_WF": {
+        "source": "Wallis and Futuna",
+        "label": "瓦利斯和富图纳"
+      }
+    },
+    "spending_categories": {
+      "cat_housing": {
+        "source": "Housing",
+        "label": "住房"
+      },
+      "cat_groceries": {
+        "source": "Groceries",
+        "label": "日用食品"
+      },
+      "cat_food": {
+        "source": "Food & Dining",
+        "label": "餐饮"
+      },
+      "cat_transport": {
+        "source": "Transportation",
+        "label": "交通"
+      },
+      "cat_shopping": {
+        "source": "Shopping",
+        "label": "购物"
+      },
+      "cat_entertainment": {
+        "source": "Entertainment",
+        "label": "娱乐"
+      },
+      "cat_health": {
+        "source": "Health & Wellness",
+        "label": "健康保健"
+      },
+      "cat_bills": {
+        "source": "Bills & Utilities",
+        "label": "账单与公用事业"
+      },
+      "cat_personal": {
+        "source": "Personal Care",
+        "label": "个人护理"
+      },
+      "cat_education": {
+        "source": "Education",
+        "label": "教育"
+      },
+      "cat_travel": {
+        "source": "Travel",
+        "label": "旅行"
+      },
+      "cat_gifts": {
+        "source": "Gifts & Donations",
+        "label": "礼物与捐赠"
+      },
+      "cat_fees": {
+        "source": "Fees & Charges",
+        "label": "手续费"
+      },
+      "cat_other_expense": {
+        "source": "Other Expenses",
+        "label": "其他支出"
+      },
+      "cat_housing_rent": {
+        "source": "Rent/Mortgage",
+        "label": "房租与房贷"
+      },
+      "cat_housing_utilities": {
+        "source": "Utilities",
+        "label": "水电燃气"
+      },
+      "cat_housing_insurance": {
+        "source": "Home Insurance",
+        "label": "住房保险"
+      },
+      "cat_housing_maintenance": {
+        "source": "Maintenance & Repairs",
+        "label": "维护与修缮"
+      },
+      "cat_housing_furnishing": {
+        "source": "Furnishing",
+        "label": "家居布置"
+      },
+      "cat_food_restaurants": {
+        "source": "Restaurants",
+        "label": "餐厅"
+      },
+      "cat_food_coffee": {
+        "source": "Coffee Shops",
+        "label": "咖啡店"
+      },
+      "cat_food_delivery": {
+        "source": "Food Delivery",
+        "label": "外卖"
+      },
+      "cat_food_alcohol": {
+        "source": "Bars & Alcohol",
+        "label": "酒吧与酒类"
+      },
+      "cat_transport_gas": {
+        "source": "Gas & Fuel",
+        "label": "燃油"
+      },
+      "cat_transport_parking": {
+        "source": "Parking",
+        "label": "停车"
+      },
+      "cat_transport_public": {
+        "source": "Public Transit",
+        "label": "公共交通"
+      },
+      "cat_transport_rideshare": {
+        "source": "Rideshare & Taxi",
+        "label": "网约车与出租车"
+      },
+      "cat_transport_maintenance": {
+        "source": "Car Maintenance",
+        "label": "汽车保养"
+      },
+      "cat_transport_insurance": {
+        "source": "Auto Insurance",
+        "label": "汽车保险"
+      },
+      "cat_shopping_clothing": {
+        "source": "Clothing",
+        "label": "服装"
+      },
+      "cat_shopping_electronics": {
+        "source": "Electronics",
+        "label": "电子产品"
+      },
+      "cat_shopping_home": {
+        "source": "Home Goods",
+        "label": "家居用品"
+      },
+      "cat_shopping_online": {
+        "source": "Online Shopping",
+        "label": "网购"
+      },
+      "cat_entertainment_streaming": {
+        "source": "Streaming Services",
+        "label": "流媒体服务"
+      },
+      "cat_entertainment_movies": {
+        "source": "Movies & Events",
+        "label": "电影与活动"
+      },
+      "cat_entertainment_games": {
+        "source": "Games & Apps",
+        "label": "游戏与应用"
+      },
+      "cat_entertainment_hobbies": {
+        "source": "Hobbies",
+        "label": "兴趣爱好"
+      },
+      "cat_entertainment_sports": {
+        "source": "Sports & Recreation",
+        "label": "运动与休闲"
+      },
+      "cat_health_medical": {
+        "source": "Medical",
+        "label": "医疗"
+      },
+      "cat_health_pharmacy": {
+        "source": "Pharmacy",
+        "label": "药品"
+      },
+      "cat_health_dental": {
+        "source": "Dental",
+        "label": "牙科"
+      },
+      "cat_health_vision": {
+        "source": "Vision",
+        "label": "视力保健"
+      },
+      "cat_health_fitness": {
+        "source": "Gym & Fitness",
+        "label": "健身"
+      },
+      "cat_health_insurance": {
+        "source": "Health Insurance",
+        "label": "医疗保险"
+      },
+      "cat_bills_phone": {
+        "source": "Phone",
+        "label": "电话费"
+      },
+      "cat_bills_internet": {
+        "source": "Internet",
+        "label": "网络费"
+      },
+      "cat_bills_subscriptions": {
+        "source": "Subscriptions",
+        "label": "订阅"
+      },
+      "cat_bills_software": {
+        "source": "Software & Services",
+        "label": "软件与服务"
+      },
+      "cat_fees_bank": {
+        "source": "Bank Fees",
+        "label": "银行手续费"
+      },
+      "cat_fees_atm": {
+        "source": "ATM Fees",
+        "label": "取款手续费"
+      },
+      "cat_fees_interest": {
+        "source": "Interest Charges",
+        "label": "利息费用"
+      },
+      "cat_fees_late": {
+        "source": "Late Fees",
+        "label": "逾期费用"
+      }
+    },
+    "savings_categories": {
+      "cat_savings": {
+        "source": "Savings",
+        "label": "储蓄"
+      },
+      "cat_savings_emergency": {
+        "source": "Emergency Fund",
+        "label": "应急资金"
+      },
+      "cat_savings_retirement": {
+        "source": "Retirement",
+        "label": "退休储蓄"
+      },
+      "cat_savings_investments": {
+        "source": "Investment Contributions",
+        "label": "投资投入"
+      },
+      "cat_savings_short_term": {
+        "source": "Short-Term Savings",
+        "label": "短期储蓄"
+      },
+      "cat_savings_education": {
+        "source": "Education / 529",
+        "label": "教育储蓄与 529 计划"
+      },
+      "cat_savings_charitable": {
+        "source": "Charitable Reserve",
+        "label": "慈善储备金"
+      }
+    },
+    "income_sources": {
+      "cat_income_employment": {
+        "source": "Employment",
+        "label": "受雇收入"
+      },
+      "cat_income_selfemploy": {
+        "source": "Self-Employment",
+        "label": "自雇收入"
+      },
+      "cat_income_investment": {
+        "source": "Investment Income",
+        "label": "投资收益"
+      },
+      "cat_income_other": {
+        "source": "Other Income",
+        "label": "其他收入"
+      },
+      "cat_income_salary": {
+        "source": "Salary",
+        "label": "工资"
+      },
+      "cat_income_bonus": {
+        "source": "Bonus",
+        "label": "奖金"
+      },
+      "cat_income_commission": {
+        "source": "Commission",
+        "label": "佣金"
+      },
+      "cat_income_freelance": {
+        "source": "Freelance",
+        "label": "自由职业收入"
+      },
+      "cat_income_business": {
+        "source": "Business Income",
+        "label": "经营收入"
+      },
+      "cat_income_dividends": {
+        "source": "Dividends",
+        "label": "股息"
+      },
+      "cat_income_interest": {
+        "source": "Interest",
+        "label": "利息"
+      },
+      "cat_income_rental": {
+        "source": "Rental Income",
+        "label": "租金收入"
+      },
+      "cat_income_capital_gains": {
+        "source": "Capital Gains",
+        "label": "资本利得"
+      },
+      "cat_income_gifts": {
+        "source": "Gifts Received",
+        "label": "收到的礼物"
+      },
+      "cat_income_refunds": {
+        "source": "Refunds",
+        "label": "退款"
+      },
+      "cat_income_reimbursements": {
+        "source": "Reimbursements",
+        "label": "报销"
+      },
+      "cat_income_tax_refund": {
+        "source": "Tax Refund",
+        "label": "退税"
+      }
+    }
+  },
+  "budget_group_labels": {
+    "032ecb02-5912-42e8-9724-2cd566fc08d5": {
+      "source": "Needs",
+      "label": "必要开支"
+    },
+    "a409e0d6-9152-49c8-a5b4-a147a8ac636e": {
+      "source": "Wants",
+      "label": "非必要开支"
+    },
+    "1fb6f2a3-3245-4702-83e8-ab116458d13e": {
+      "source": "Savings",
+      "label": "储蓄"
+    },
+    "8cbd26c8-e3b2-4176-8c61-e5c11e10b808": {
+      "source": "Giving",
+      "label": "赠与"
+    },
+    "3ff71753-5dd5-4372-9ca2-63d8d9a04851": {
+      "source": "Personal",
+      "label": "个人开支"
+    },
+    "6e25d097-0c73-4521-9407-d47e8dfb73e2": {
+      "source": "Other",
+      "label": "其他"
+    }
+  },
+  "event_type_labels": {
+    "255600dc-c2a3-47e0-979d-a602c21fc337": {
+      "source": "Travel",
+      "label": "旅行"
+    },
+    "51e3eedb-5484-45ba-a525-6b88209c46ed": {
+      "source": "Holiday",
+      "label": "节假日"
+    },
+    "d9871ccb-5396-4c70-ac08-5b07ed90e64a": {
+      "source": "Business",
+      "label": "商务"
+    },
+    "22442173-c794-45bf-97ee-9b3f9a7c8ba3": {
+      "source": "Education",
+      "label": "教育"
+    },
+    "94fc13ed-ac40-466b-8071-64f1e3c72204": {
+      "source": "Medical",
+      "label": "医疗"
+    },
+    "1aaab8fb-8fd9-4543-bd46-d9ee4a5a8564": {
+      "source": "Special Occasion",
+      "label": "特殊场合"
+    },
+    "fa4812ee-e06e-4117-a819-e4d88b7acbaf": {
+      "source": "Other",
+      "label": "其他"
+    }
+  }
 }

@@ -100,8 +100,8 @@ export const CLIENT_PRESETS: ClientPreset[] = [
   },
   {
     id: "generic",
-    label: "Generic HTTP",
-    location: "Any client that speaks Streamable HTTP",
+    label: "通用 HTTP",
+    location: "支持 Streamable HTTP 的客户端",
     build: (url, token) => ({
       url,
       headers: clientHeaders(token),

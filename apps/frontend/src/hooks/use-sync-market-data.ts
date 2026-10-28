@@ -22,7 +22,7 @@ export function useSyncMarketDataMutation(refetchAll = false, refetchRecentDays?
     },
     onError: (error: Error) => {
       toast({
-        title: "Failed to sync market data",
+        title: "同步行情数据失败",
         description: error.message,
         variant: "destructive",
       });

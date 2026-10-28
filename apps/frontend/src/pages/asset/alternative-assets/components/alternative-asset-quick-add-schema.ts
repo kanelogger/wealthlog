@@ -6,37 +6,37 @@ import type { LoanInterestMethod, LoanPaymentFrequency } from "../lib/loan-event
 
 // Metal types for precious metals
 export const METAL_TYPES = [
-  { value: "gold", label: "Gold" },
-  { value: "silver", label: "Silver" },
-  { value: "platinum", label: "Platinum" },
-  { value: "palladium", label: "Palladium" },
+  { value: "gold", label: "黄金" },
+  { value: "silver", label: "白银" },
+  { value: "platinum", label: "铂金" },
+  { value: "palladium", label: "钯金" },
 ] as const;
 
 // Weight units for precious metals
 export const WEIGHT_UNITS = [
-  { value: "oz", label: "Troy Ounce (oz)" },
-  { value: "g", label: "Gram (g)" },
-  { value: "kg", label: "Kilogram (kg)" },
+  { value: "oz", label: "金衡盎司（oz）" },
+  { value: "g", label: "克（g）" },
+  { value: "kg", label: "千克（kg）" },
 ] as const;
 
 // Liability types. Credit cards are accounts, so new liabilities can't use that type.
 export const LIABILITY_TYPES = [
-  { value: "mortgage", label: "Mortgage" },
-  { value: "auto_loan", label: "Auto Loan" },
-  { value: "student_loan", label: "Student Loan" },
-  { value: "personal_loan", label: "Personal Loan" },
-  { value: "heloc", label: "HELOC" },
-  { value: "other", label: "Other" },
+  { value: "mortgage", label: "房贷" },
+  { value: "auto_loan", label: "车贷" },
+  { value: "student_loan", label: "助学贷款" },
+  { value: "personal_loan", label: "个人贷款" },
+  { value: "heloc", label: "住房净值信用额度（HELOC）" },
+  { value: "other", label: "其他" },
 ] as const;
 
 // Asset type options for the type selector
 export const ASSET_KIND_OPTIONS = [
-  { value: AlternativeAssetKind.PROPERTY, label: "Property" },
-  { value: AlternativeAssetKind.VEHICLE, label: "Vehicle" },
-  { value: AlternativeAssetKind.COLLECTIBLE, label: "Collectible" },
-  { value: AlternativeAssetKind.PRECIOUS_METAL, label: "Precious Metal" },
-  { value: AlternativeAssetKind.LIABILITY, label: "Liability" },
-  { value: AlternativeAssetKind.OTHER, label: "Other" },
+  { value: AlternativeAssetKind.PROPERTY, label: "房产" },
+  { value: AlternativeAssetKind.VEHICLE, label: "车辆" },
+  { value: AlternativeAssetKind.COLLECTIBLE, label: "收藏品" },
+  { value: AlternativeAssetKind.PRECIOUS_METAL, label: "贵金属" },
+  { value: AlternativeAssetKind.LIABILITY, label: "负债" },
+  { value: AlternativeAssetKind.OTHER, label: "其他" },
 ] as const;
 
 export const liabilityQuickAddSchema = z
@@ -79,22 +79,22 @@ export const alternativeAssetQuickAddSchema = z
     ]),
 
     // Common fields
-    name: z.string().min(1, "Name is required").max(100, "Name must be less than 100 characters"),
-    currency: z.string().min(1, "Currency is required"),
+    name: z.string().min(1, "名称为必填项").max(100, "名称不能超过 100 个字符"),
+    currency: z.string().min(1, "币种为必填项"),
     quantity: z.coerce
       .number({
-        required_error: "Please enter a valid quantity.",
-        invalid_type_error: "Quantity must be a number.",
+        required_error: "请输入有效数量。",
+        invalid_type_error: "数量必须为数字。",
       })
-      .positive("Quantity must be greater than 0"),
+      .positive("数量必须大于 0"),
     currentValue: z.coerce
       .number({
-        required_error: "Please enter a valid value.",
-        invalid_type_error: "Value must be a number.",
+        required_error: "请输入有效金额。",
+        invalid_type_error: "金额必须为数字。",
       })
-      .min(0, "Value cannot be negative"),
+      .min(0, "金额不能为负数"),
     valueDate: z.date({
-      required_error: "Value date is required",
+      required_error: "估值日期为必填项",
     }),
 
     // Property-specific: has mortgage checkbox

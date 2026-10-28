@@ -25,7 +25,7 @@ export function useAccessTokens() {
     onError: (error) => {
       logger.error(`Error creating personal access token: ${String(error)}`);
       toast({
-        title: "Failed to create token",
+        title: "创建令牌失败",
         description: error instanceof Error ? error.message : "An unknown error occurred",
         variant: "destructive",
       });
@@ -36,12 +36,12 @@ export function useAccessTokens() {
     mutationFn: (id: string) => deleteAgentAccessToken(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: [QueryKeys.AGENT_ACCESS_TOKENS] });
-      toast({ title: "Token removed", variant: "success" });
+      toast({ title: "令牌已移除", variant: "success" });
     },
     onError: (error) => {
       logger.error(`Error removing personal access token: ${String(error)}`);
       toast({
-        title: "Failed to remove token",
+        title: "移除令牌失败",
         description: error instanceof Error ? error.message : "An unknown error occurred",
         variant: "destructive",
       });

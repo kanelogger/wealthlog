@@ -1,3 +1,6 @@
+import { useCallback } from "react";
+import { useTranslation } from "react-i18next";
+import { getCategoryLabel, getTaxonomyLabel, localizeTaxonomy } from "@/lib/taxonomy-labels";
 import {
   assignAssetToCategory,
   createCategory,
@@ -68,10 +71,18 @@ function invalidateAllocationTargetDriftCaches(
  * - scope="asset" (default for legacy rows): asset classifications shown in Settings → Classifications
  * - scope="activity": spending, income, and savings taxonomies shown in Spending → Categories
  */
-export function useTaxonomies(options?: { scope?: TaxonomyScope }) {
+export function useTaxonomies(options?: { scope?: TaxonomyScope; localize?: boolean }) {
+  const { t } = useTranslation();
+  const localize = options?.localize !== false;
+  const select = useCallback(
+    (rows: Taxonomy[]) =>
+      localize ? rows.map((row) => ({ ...row, name: getTaxonomyLabel(row, t) })) : rows,
+    [localize, t],
+  );
   const query = useQuery<Taxonomy[], Error>({
     queryKey: [QueryKeys.TAXONOMIES],
     queryFn: getTaxonomies,
+    select,
   });
 
   if (options?.scope) {
@@ -83,11 +94,18 @@ export function useTaxonomies(options?: { scope?: TaxonomyScope }) {
   return query;
 }
 
-export function useTaxonomy(id: string | null) {
+export function useTaxonomy(id: string | null, options?: { localize?: boolean }) {
+  const { t } = useTranslation();
+  const localize = options?.localize !== false;
+  const select = useCallback(
+    (data: TaxonomyWithCategories | null) => (data && localize ? localizeTaxonomy(data, t) : data),
+    [localize, t],
+  );
   return useQuery<TaxonomyWithCategories | null, Error>({
     queryKey: QueryKeys.taxonomy(id ?? ""),
     queryFn: () => (id ? getTaxonomy(id) : Promise.resolve(null)),
     enabled: !!id,
+    select,
   });
 }
 
@@ -159,9 +177,20 @@ export function useCreateCategory() {
 
 export function useUpdateCategory() {
   const queryClient = useQueryClient();
+  const { t } = useTranslation();
 
   return useMutation({
-    mutationFn: (category: TaxonomyCategory) => updateCategory(category),
+    mutationFn: (category: TaxonomyCategory) => {
+      const cached = queryClient.getQueryData<TaxonomyWithCategories>(
+        QueryKeys.taxonomy(category.taxonomyId),
+      );
+      const raw = cached?.categories.find((row) => row.id === category.id);
+      const name =
+        raw && category.name === getCategoryLabel(raw, !!cached?.taxonomy.isSystem, t)
+          ? raw.name
+          : category.name;
+      return updateCategory({ ...category, name });
+    },
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: QueryKeys.taxonomy(variables.taxonomyId) });
       invalidateActivityTaxonomyCaches(queryClient, variables.taxonomyId);

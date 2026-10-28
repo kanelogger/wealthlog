@@ -32,7 +32,7 @@ export function useMcpServer() {
     onError: (error) => {
       logger.error(`Error updating Agent Access: ${String(error)}`);
       toast({
-        title: "Failed to update Agent Access",
+        title: "更新 Agent 访问设置失败",
         description: error instanceof Error ? error.message : "An unknown error occurred",
         variant: "destructive",
       });
@@ -45,7 +45,7 @@ export function useMcpServer() {
     onError: (error) => {
       logger.error(`Error updating MCP auto-start: ${String(error)}`);
       toast({
-        title: "Failed to update auto-start",
+        title: "更新自动启动设置失败",
         description: error instanceof Error ? error.message : "An unknown error occurred",
         variant: "destructive",
       });
@@ -58,7 +58,7 @@ export function useMcpServer() {
     onError: (error) => {
       logger.error(`Error starting MCP server: ${String(error)}`);
       toast({
-        title: "Failed to start server",
+        title: "启动服务失败",
         description: error instanceof Error ? error.message : "An unknown error occurred",
         variant: "destructive",
       });
@@ -71,7 +71,7 @@ export function useMcpServer() {
     onError: (error) => {
       logger.error(`Error stopping MCP server: ${String(error)}`);
       toast({
-        title: "Failed to stop server",
+        title: "停止服务失败",
         description: error instanceof Error ? error.message : "An unknown error occurred",
         variant: "destructive",
       });
@@ -84,7 +84,7 @@ export function useMcpServer() {
     onError: (error) => {
       logger.error(`Error updating MCP audit logging: ${String(error)}`);
       toast({
-        title: "Failed to update audit logging",
+        title: "更新审计日志设置失败",
         description: error instanceof Error ? error.message : "An unknown error occurred",
         variant: "destructive",
       });

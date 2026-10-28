@@ -8,7 +8,7 @@ export type Palette = {
 
 export const FOREST_THEME: Palette = {
   key: "forest",
-  label: "Forest",
+  label: "森林",
   hsl: "hsl(155 32% 26%)",
   deep: "#2A573F",
   mid: "#71A290",

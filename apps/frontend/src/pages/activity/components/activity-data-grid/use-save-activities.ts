@@ -63,7 +63,7 @@ export function useSaveActivities({
         .join(", ");
 
       toast({
-        title: "Validation failed",
+        title: "校验失败",
         description: errorMessages + (validation.errors.length > 3 ? "..." : ""),
         variant: "destructive",
       });
@@ -113,7 +113,7 @@ export function useSaveActivities({
         if (!hasSuccesses) {
           // Complete failure - no items were saved
           toast({
-            title: "Failed to save activities",
+            title: "保存活动失败",
             description: errorMessages + suffix,
             variant: "destructive",
           });
@@ -122,7 +122,7 @@ export function useSaveActivities({
 
         // Partial success - some items saved, some failed
         toast({
-          title: "Some activities failed to save",
+          title: "部分活动保存失败",
           description: errorMessages + suffix,
           variant: "destructive",
         });
@@ -168,8 +168,8 @@ export function useSaveActivities({
 
       if (!hasErrors) {
         toast({
-          title: "Activities saved",
-          description: "Your pending changes are now saved.",
+          title: "活动已保存",
+          description: "待保存的更改已保存。",
           variant: "success",
         });
       }

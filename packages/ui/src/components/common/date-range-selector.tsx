@@ -155,7 +155,7 @@ export function DateRangeSelector({ value, onChange, hiddenRanges = [], asOf = n
       <AnimatedToggleGroup
         items={visibleRanges.map((range) => ({
           value: range.label,
-          label: range.label,
+          label: t("ui:dateRange.shortLabels." + range.label, range.label),
           title: t("ui:dateRange.presets." + range.label, range.name),
         }))}
         value={selectedLabel}

@@ -305,13 +305,13 @@ export function useActivityMutations(
       linkTransferActivities(activityAId, activityBId),
     onSuccess: () => {
       queryClient.invalidateQueries();
-      toast.success("Transfers linked", {
-        description: "The two activities are now paired as an internal transfer.",
+      toast.success("转账已关联", {
+        description: "这两笔活动已配对为内部转账。",
       });
     },
     onError: (error: string) => {
       logger.error(`Error linking transfers: ${String(error)}`);
-      toast.error("Failed to link transfers", {
+      toast.error("关联转账失败", {
         description: String(error),
       });
     },
@@ -322,13 +322,13 @@ export function useActivityMutations(
       unlinkTransferActivities(activityAId, activityBId),
     onSuccess: () => {
       queryClient.invalidateQueries();
-      toast.success("Transfers unlinked", {
-        description: "The two activities are external transfers again.",
+      toast.success("已取消转账关联", {
+        description: "这两笔活动已恢复为外部转账。",
       });
     },
     onError: (error: string) => {
       logger.error(`Error unlinking transfers: ${String(error)}`);
-      toast.error("Failed to unlink transfers", {
+      toast.error("取消转账关联失败", {
         description: String(error),
       });
     },
@@ -467,7 +467,7 @@ export function useActivityMutations(
       // Show errors from partial failures
       if (result.errors?.length > 0) {
         const messages = result.errors.map((e) => e.message).join("; ");
-        toast.error("Some activities failed to save", { description: messages });
+        toast.error("部分活动保存失败", { description: messages });
         logger.error(`Bulk save partial failure: ${JSON.stringify(result.errors)}`);
       }
 
@@ -478,7 +478,7 @@ export function useActivityMutations(
     },
     onError: (error: string) => {
       logger.error(`Error saving activities: ${String(error)}`);
-      toast.error("Failed to save activities", {
+      toast.error("保存活动失败", {
         description: String(error),
       });
     },
@@ -494,7 +494,7 @@ export function useActivityMutations(
     },
     onError: (error: string) => {
       logger.error(`Error saving internal transfer pair: ${String(error)}`);
-      toast.error("Failed to save transfer", {
+      toast.error("保存转账失败", {
         description: String(error),
       });
     },

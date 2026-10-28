@@ -20,7 +20,7 @@ export interface ProviderTemplate {
 export const LATEST_TEMPLATES: ProviderTemplate[] = [
   {
     name: "Vanguard",
-    description: "Workplace fund prices (fund code)",
+    description: "职场基金价格（基金代码）",
     format: "json",
     url: "https://workplace.vanguard.com/investments/product-details/fund/api/price-distribution/fundPrice/{SYMBOL}?startDate={DATE:%Y-01-01}&endDate={TODAY}",
     pricePath: "$.body.fundPrice.content[-1:].price",
@@ -31,7 +31,7 @@ export const LATEST_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "CoinGecko",
-    description: "Free crypto (use coin ID: bitcoin, ethereum...)",
+    description: "免费加密资产行情（使用币种 ID，如 bitcoin、ethereum）",
     format: "json",
     url: "https://api.coingecko.com/api/v3/simple/price?ids={SYMBOL}&vs_currencies={currency}",
     pricePath: "$.{SYMBOL}.{currency}",
@@ -39,7 +39,7 @@ export const LATEST_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "ExchangeRate API",
-    description: "Free currency rates",
+    description: "免费汇率数据",
     format: "json",
     url: "https://open.er-api.com/v6/latest/{SYMBOL}",
     pricePath: "$.rates.EUR",
@@ -47,7 +47,7 @@ export const LATEST_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "FT.com",
-    description: "LSE ETFs & equities",
+    description: "伦敦证券交易所 ETF 与股票",
     format: "html",
     url: "https://markets.ft.com/data/etfs/tearsheet/summary?s={SYMBOL}:LSE:GBX",
     pricePath: ".mod-tearsheet-overview__quote .mod-ui-data-list__value",
@@ -55,7 +55,7 @@ export const LATEST_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "Euronext",
-    description: "EU funds & equities (ISIN-MIC)",
+    description: "欧洲基金与股票（ISIN-MIC）",
     format: "html",
     url: "https://live.euronext.com/en/ajax/getDetailedQuote/{SYMBOL}",
     pricePath: "#header-instrument-price",
@@ -63,7 +63,7 @@ export const LATEST_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "Twelve Data",
-    description: "Stocks, crypto, FX (set API key in headers)",
+    description: "股票、加密资产与外汇（在请求头中设置 API 密钥）",
     format: "json",
     url: "https://api.twelvedata.com/price?symbol={SYMBOL}",
     pricePath: "$.price",
@@ -72,7 +72,7 @@ export const LATEST_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "Borsa Italiana",
-    description: "Italian bonds & stocks",
+    description: "意大利债券与股票",
     format: "html",
     url: "https://www.borsaitaliana.it/borsa/obbligazioni/mot/btp/scheda/{SYMBOL}.html?lang=en",
     pricePath: ".summary-value strong",
@@ -83,7 +83,7 @@ export const LATEST_TEMPLATES: ProviderTemplate[] = [
 export const HISTORICAL_TEMPLATES: ProviderTemplate[] = [
   {
     name: "Vanguard",
-    description: "Workplace fund price history (fund code)",
+    description: "职场基金历史价格（基金代码）",
     format: "json",
     url: "https://workplace.vanguard.com/investments/product-details/fund/api/price-distribution/fundPrice/{SYMBOL}?startDate={FROM}&endDate={TO}",
     pricePath: "$.body.fundPrice.content[*].price",
@@ -94,7 +94,7 @@ export const HISTORICAL_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "Twelve Data (JSON)",
-    description: "Stocks, crypto, FX (set API key in headers)",
+    description: "股票、加密资产与外汇（在请求头中设置 API 密钥）",
     format: "json",
     url: "https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=1day&start_date={FROM}&end_date={TO}&format=JSON",
     pricePath: "$.values[*].close",
@@ -108,7 +108,7 @@ export const HISTORICAL_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "Twelve Data (CSV)",
-    description: "Stocks, crypto, FX (set API key in headers)",
+    description: "股票、加密资产与外汇（在请求头中设置 API 密钥）",
     format: "csv",
     url: "https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval=1day&start_date={FROM}&end_date={TO}&format=CSV",
     pricePath: "close",
@@ -122,7 +122,7 @@ export const HISTORICAL_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "FT.com",
-    description: "LSE ETFs & equities (HTML table)",
+    description: "伦敦证券交易所 ETF 与股票（HTML 表格）",
     format: "html_table",
     url: "https://markets.ft.com/data/etfs/tearsheet/historical?s={SYMBOL}:LSE:GBX",
     pricePath: "0:4",
@@ -135,7 +135,7 @@ export const HISTORICAL_TEMPLATES: ProviderTemplate[] = [
   },
   {
     name: "CoinGecko",
-    description: "Daily crypto history (use coin ID: bitcoin, ethereum...)",
+    description: "加密资产每日历史行情（使用币种 ID，如 bitcoin、ethereum）",
     format: "json",
     url: "https://api.coingecko.com/api/v3/coins/{SYMBOL}/market_chart?vs_currency={currency}&days=365&interval=daily",
     pricePath: "$.prices[*][1]",

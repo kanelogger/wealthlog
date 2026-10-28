@@ -8,6 +8,7 @@ import {
 import { useTaxonomies, useTaxonomy, useExportTaxonomy } from "@/hooks/use-taxonomies";
 import { SettingsHeader } from "../settings-header";
 import { CategoryForm } from "./components/category-form";
+import { getCategoryLabel, getTaxonomyLabel } from "@/lib/taxonomy-labels";
 import { MigrationBanner } from "./migration-banner";
 import { toast } from "sonner";
 import { useSearchParams } from "react-router-dom";
@@ -19,6 +20,7 @@ export default function TaxonomiesPage() {
   // Settings → Classifications is asset-only. Spending categories live at /settings/spending/categories.
   const { data: taxonomies = [], isLoading: isLoadingTaxonomies } = useTaxonomies({
     scope: "asset",
+    localize: false,
   });
   const [selectedTaxonomyId, setSelectedTaxonomyId] = useState<string | null>(null);
   const [selectedCategoryId, setSelectedCategoryId] = useState<string | null>(null);
@@ -32,14 +34,21 @@ export default function TaxonomiesPage() {
   // Custom Groups is editable even though it's a system taxonomy
   const isEditableTaxonomy = !activeTaxonomy?.isSystem || activeTaxonomyId === "custom_groups";
 
-  const { data: taxonomyWithCategories, isLoading: isLoadingCategories } =
-    useTaxonomy(activeTaxonomyId);
+  const { data: taxonomyWithCategories, isLoading: isLoadingCategories } = useTaxonomy(
+    activeTaxonomyId,
+    { localize: false },
+  );
 
   // Build tree from categories
   const categoryTree = useMemo(() => {
     if (!taxonomyWithCategories?.categories) return [];
-    return buildCategoryTree(taxonomyWithCategories.categories);
-  }, [taxonomyWithCategories?.categories]);
+    return buildCategoryTree(
+      taxonomyWithCategories.categories.map((category) => ({
+        ...category,
+        name: getCategoryLabel(category, !!activeTaxonomy?.isSystem, t),
+      })),
+    );
+  }, [taxonomyWithCategories?.categories, activeTaxonomy?.isSystem, t]);
 
   // Find selected category
   const selectedCategory = useMemo(() => {
@@ -142,7 +151,7 @@ export default function TaxonomiesPage() {
                     className="h-2.5 w-2.5 shrink-0 rounded-full"
                     style={{ backgroundColor: taxonomy.color }}
                   />
-                  <span>{taxonomy.name.replace(" (GICS)", "")}</span>
+                  <span>{getTaxonomyLabel(taxonomy, t)}</span>
                 </TabsTrigger>
               ))}
             </TabsList>
@@ -161,7 +170,9 @@ export default function TaxonomiesPage() {
                 style={{ backgroundColor: activeTaxonomy?.color }}
               />
               <div>
-                <h3 className="font-semibold">{activeTaxonomy?.name}</h3>
+                <h3 className="font-semibold">
+                  {activeTaxonomy && getTaxonomyLabel(activeTaxonomy, t)}
+                </h3>
                 <p className="text-muted-foreground text-xs">
                   {t("settings:tax_categories_count", {
                     count: taxonomyWithCategories.categories.length,
@@ -219,6 +230,7 @@ export default function TaxonomiesPage() {
               ) : selectedCategory ? (
                 <CategoryForm
                   category={selectedCategory}
+                  categoryLabel={getCategoryLabel(selectedCategory, !!activeTaxonomy?.isSystem, t)}
                   taxonomyId={activeTaxonomyId}
                   isSystem={!isEditableTaxonomy}
                   onClose={() => setSelectedCategoryId(null)}

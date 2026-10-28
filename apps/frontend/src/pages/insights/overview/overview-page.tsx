@@ -111,6 +111,7 @@ export function OverviewPage({
     isLoading: driftLoading,
   } = useAllocationTargetDrift(effectiveTargetId, accountFilter, {
     includeHoldings: workspaceView === "details",
+    taxonomyId: effectiveTarget?.taxonomyId,
   });
 
   const isLoading = holdingsLoading || allocationsLoading || currentValuationLoading;

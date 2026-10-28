@@ -319,18 +319,18 @@ function exportCsv(
     .map(csvCell)
     .join(",");
 
-  const rows = plan.trades.map((t) =>
+  const rows = plan.trades.map((trade) =>
     [
-      t.action,
-      t.symbol ?? "",
-      t.name ?? "",
-      t.categoryName,
-      t.accountId ?? "",
-      t.holdingId ?? "",
-      t.estimatedAmount.toFixed(fractionDigits),
-      t.quantity != null ? t.quantity.toFixed(t.quantity % 1 === 0 ? 0 : 4) : "",
-      t.estimatedPrice != null ? String(t.estimatedPrice) : "",
-      t.reason,
+      t(trade.action === "sell" ? "allocation:trades.sell" : "allocation:trades.buy"),
+      trade.symbol ?? "",
+      trade.name ?? "",
+      trade.categoryName,
+      trade.accountId ?? "",
+      trade.holdingId ?? "",
+      trade.estimatedAmount.toFixed(fractionDigits),
+      trade.quantity != null ? trade.quantity.toFixed(trade.quantity % 1 === 0 ? 0 : 4) : "",
+      trade.estimatedPrice != null ? String(trade.estimatedPrice) : "",
+      trade.reason,
     ]
       .map(csvCell)
       .join(","),
@@ -376,7 +376,7 @@ function copyToText(
     t("allocation:copyText.proposedTrades"),
     ...plan.trades.map(
       (trade) =>
-        `${trade.action.toUpperCase()}  ${trade.symbol ?? trade.categoryName}  ${formatting.formatAmount(trade.estimatedAmount, currency)}` +
+        `${t(trade.action === "sell" ? "allocation:trades.sell" : "allocation:trades.buy")}  ${trade.symbol ?? trade.categoryName}  ${formatting.formatAmount(trade.estimatedAmount, currency)}` +
         (trade.accountId
           ? `  ${t("allocation:copyText.account", { account: trade.accountId })}`
           : "") +
@@ -1399,6 +1399,7 @@ export function RebalanceTab({
 
   const planQuery = useRebalancePlan({
     targetId: profile?.id ?? "",
+    taxonomyId: profile?.taxonomyId,
     cash,
     filter: accountScope,
     scenarioMode,

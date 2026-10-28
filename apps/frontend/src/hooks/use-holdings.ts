@@ -1,3 +1,6 @@
+import { useCallback } from "react";
+import { useTranslation } from "react-i18next";
+import { localizeHolding } from "@/lib/taxonomy-labels";
 import { useQuery } from "@tanstack/react-query";
 import { AccountScope, Holding } from "@/lib/types";
 import { getHoldingsList } from "@/adapters";
@@ -14,6 +17,11 @@ interface UseHoldingsWithClosedProbeOptions {
 }
 
 export function useHoldings(accountFilter: AccountScope, options: UseHoldingsOptions = {}) {
+  const { t } = useTranslation();
+  const select = useCallback(
+    (data: Holding[]) => data.map((holding) => localizeHolding(holding, t)),
+    [t],
+  );
   const includeClosed = options.includeClosed ?? false;
   const hasValidScope = (() => {
     switch (accountFilter.type) {
@@ -41,6 +49,7 @@ export function useHoldings(accountFilter: AccountScope, options: UseHoldingsOpt
     queryKey: [QueryKeys.HOLDINGS, accountFilter, { includeClosed }],
     queryFn: () => getHoldingsList(accountFilter, { includeClosed }),
     enabled: isEnabled,
+    select,
   });
 
   return { holdings, dataUpdatedAt, isLoading, isError, error };
