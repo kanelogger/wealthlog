@@ -4,6 +4,13 @@ import { mapActivityTypeToPicker } from "../utils/activity-form-utils";
 import { ACTIVITY_FORM_CONFIG, hasActivityForm } from "./activity-form-config";
 
 describe("cash transfer defaults", () => {
+  it("leaves both accounts unselected for a new transfer", () => {
+    const defaults = ACTIVITY_FORM_CONFIG.TRANSFER.getDefaults(undefined, [
+      { value: "cash", label: "Cash", currency: "CNY" },
+    ]);
+    expect(defaults).toMatchObject({ accountId: "", fromAccountId: "", toAccountId: "" });
+  });
+
   it.each([ActivityType.TRANSFER_OUT, ActivityType.TRANSFER_IN])(
     "derives the execution rate from actual amounts when editing %s",
     (activityType) => {

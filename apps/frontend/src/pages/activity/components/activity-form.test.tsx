@@ -99,6 +99,28 @@ const accounts: AccountSelectOption[] = [
 ];
 
 describe("ActivityForm account filtering", () => {
+  it("keeps holdings-tracked securities accounts available for transfers", () => {
+    const brokerage: AccountSelectOption = {
+      value: "brokerage",
+      label: "Securities account",
+      currency: "CNY",
+      accountType: "SECURITIES",
+      restrictionLevel: "limited",
+    };
+    render(
+      <ActivityForm
+        open
+        accounts={accounts}
+        transferAccounts={[...accounts, brokerage]}
+        activity={{ activityType: ActivityType.TRANSFER_OUT }}
+      />,
+    );
+
+    expect(screen.getByTestId("rendered-account-ids").textContent).toBe(
+      "eligible-account,brokerage",
+    );
+  });
+
   it("keeps the activity's current restricted account available while editing", () => {
     render(
       <ActivityForm

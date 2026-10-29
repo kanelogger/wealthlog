@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@/test/render";
+import { fireEvent, render, screen, waitFor } from "@/test/render";
 import { ActivityStatus, ActivityType } from "@/lib/constants";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TransactionRowVM } from "../lib/transactions-helpers";
@@ -160,7 +160,11 @@ vi.mock("../hooks/use-spending-settings", () => ({
   useSpendingSettings: () => ({ accountIds: [USD_ACCOUNT, EUR_ACCOUNT] }),
 }));
 
-vi.mock("./cash-activity-form", () => ({ CashActivityForm: () => null }));
+vi.mock("./cash-activity-form", () => ({
+  CashActivityForm: ({ onTransferClick }: { onTransferClick: (accountId: string) => void }) => (
+    <button onClick={() => onTransferClick(USD_ACCOUNT)}>new transfer</button>
+  ),
+}));
 vi.mock("@/pages/activity/components/mobile-forms/mobile-activity-form", () => ({
   MobileActivityForm: () => null,
 }));
@@ -218,6 +222,17 @@ describe("SpendingTransactionsTab transfer edit", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it("opens a new transfer without inheriting the cash form's account", async () => {
+    render(<SpendingTransactionsTab />);
+
+    fireEvent.click(screen.getByRole("button", { name: "new transfer" }));
+
+    const activity = JSON.parse(
+      (await screen.findByTestId("activity-form")).textContent ?? "{}",
+    ) as Record<string, unknown>;
+    expect(activity).toEqual({ activityType: ActivityType.TRANSFER_OUT });
   });
 
   it.each(["Original notes\nSecond line", "", undefined])(

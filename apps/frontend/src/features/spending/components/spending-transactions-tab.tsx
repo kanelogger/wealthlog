@@ -63,7 +63,6 @@ import type { QuickCategorizeScope } from "./quick-categorize-popover";
 import {
   CASH_ACTIVITY_TYPES,
   getEffectiveCashActivityType,
-  isCreditCardAccountType,
   isSpendingAccountType,
 } from "../lib/constants";
 import { cashActivityFlowMetadata } from "../lib/cash-activity-form-utils";
@@ -409,19 +408,10 @@ export const SpendingTransactionsTab = forwardRef<SpendingTransactionsTabHandle>
       [accounts],
     );
 
-    const handleTransferClick = useCallback(
-      (accountId: string) => {
-        const account = accounts.find((a: Account) => a.id === accountId);
-        setTransferFormActivity({
-          activityType: isCreditCardAccountType(account?.accountType)
-            ? ActivityType.TRANSFER_IN
-            : ActivityType.TRANSFER_OUT,
-          accountId,
-        });
-        setShowTransferForm(true);
-      },
-      [accounts],
-    );
+    const handleTransferClick = useCallback(() => {
+      setTransferFormActivity({ activityType: ActivityType.TRANSFER_OUT });
+      setShowTransferForm(true);
+    }, []);
 
     const handleTransferFormClose = useCallback(() => {
       setShowTransferForm(false);

@@ -25,10 +25,9 @@ import { hasActivityForm, type PickerActivityType } from "../config/activity-for
 export type { AccountSelectOption };
 
 function transferAllowsAccount(account: AccountSelectOption): boolean {
-  return (
-    restrictionAllowsType(account.restrictionLevel, "TRANSFER") ||
-    isLiabilityAccountType(account.accountType)
-  );
+  // Holdings tracking limits trade entry, but the account can still be a
+  // transfer counterparty. TransferForm excludes cards in securities mode.
+  return account.restrictionLevel !== "blocked" || isLiabilityAccountType(account.accountType);
 }
 
 interface ActivityFormProps {
