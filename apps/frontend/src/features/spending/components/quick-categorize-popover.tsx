@@ -112,7 +112,7 @@ export function QuickCategorizePopover({
   };
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={setOpen} modal>
       <PopoverTrigger asChild>{trigger}</PopoverTrigger>
       <PopoverContent className="w-70 p-0" align={align}>
         <Command>
