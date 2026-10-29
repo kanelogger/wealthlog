@@ -20,7 +20,7 @@ const modKey = isAppleDevice() ? "⌘" : "Ctrl";
 
 export function AppSidebar({ navigation }: AppSidebarProps) {
   const { t } = useTranslation();
-  const [collapsed, setCollapsed] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
   const { logout, requiresAuth } = useAuth();
 
   return (
