@@ -596,7 +596,6 @@ async fn build_context(
     let business_service = Arc::new(wealthfolio_business::BusinessService::new(
         activity_service.clone(),
         account_service.clone(),
-        spending_settings_service.clone(),
         (*business_store).clone(),
         profile_id.to_string(),
     ));

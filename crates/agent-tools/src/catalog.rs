@@ -334,6 +334,7 @@ mod tests {
                 "find_transfer_matches",
                 "query_ordinary_activities",
                 "get_ordinary_activity",
+                "get_bookkeeping_context",
             ]
         );
         for tool in catalog.iter() {
@@ -342,6 +343,22 @@ mod tests {
                 "blocked tool {} exposed",
                 tool.name()
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn bookkeeping_context_checks_all_read_scopes_before_services() {
+        let catalog = AgentToolCatalog::mcp_catalog();
+        for scopes in [
+            vec!["accounts:read", "activities:read"],
+            vec!["accounts:read", "classification:read"],
+            vec!["activities:read", "classification:read"],
+        ] {
+            let error = catalog.execute(
+                Arc::new(PanicEnv::default()), &AgentScopeSet::from_strs(scopes),
+                "get_bookkeeping_context", serde_json::json!({}),
+            ).await.unwrap_err();
+            assert!(matches!(error, AgentToolError::ScopeDenied { .. }));
         }
     }
 

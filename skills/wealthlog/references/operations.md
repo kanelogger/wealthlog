@@ -2,6 +2,8 @@
 
 ## 普通收支
 
+`ordinary context` / `get_bookkeeping_context` 为新消息提供分类上下文，即使账本没有流水或支出统计关闭也可读取。返回 `accounts`、`taxonomies`（含真实分类 ID 和路径）、`rules`、`recentCategorizedActivities`、`historyLimit` 和 `historyTruncated`。只读，需要账户、流水、分类读取权限。支出统计设置控制报表覆盖范围，不限制普通记账；未纳入统计的账户流水仍可新增、查询、读回和修改。
+
 查询返回：
 
 ```json
@@ -17,7 +19,7 @@
 
 | 字段 | 规则 |
 |---|---|
-| `accountId` | 真实账户 ID；必须是启用中的支出账户 |
+| `accountId` | 真实账户 ID；必须是启用、未归档的现金／信用卡账户；不要求加入支出统计 |
 | `activityType` | `DEPOSIT` 或 `WITHDRAWAL` |
 | `activityDate` | `YYYY-MM-DD` 或 RFC 3339；只给日期时不要编造时间 |
 | `currency` | ISO 币种 |

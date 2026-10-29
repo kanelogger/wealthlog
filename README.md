@@ -32,6 +32,12 @@ cargo check --locked -p wealthfolio-app -p wealthfolio-server
 开发应用标识为 `local.kanelogger.wealthlog.dev`。真实账本应保存在应用数据目录，
 验证时使用隔离合成数据；可参照 `.env.example` 设置 `WF_DATA_DIR`。
 
+## Agent 消息记账
+
+向加载了 `wealthlog` Skill 的 Agent 发送消费信息，例如“记账：10 月 28 日 GOOGLE 消费 29.19 USD，记在中国银行（0407）”。Agent 读取真实账户、分类规则与近期历史，选择分类后通过普通收支接口一次入账及归类；账户或分类不明确时会说明待确认项。
+
+CLI 的 `ordinary context`（MCP：`get_bookkeeping_context`）提供分类依据，需账户、流水、分类读取权限；正式记账需 `ordinary:write`。启用的现金和信用卡账户均可记账，支出统计中的账户选择只影响报表。来源短信保留原币，不自动编造结算汇率。
+
 ## 许可与来源
 
 完整许可证见 [LICENSE](LICENSE)；界面“设置 → 关于与许可证”可离线阅读。

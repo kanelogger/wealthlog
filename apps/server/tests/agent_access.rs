@@ -2551,7 +2551,7 @@ async fn ordinary_query_filters_before_counting_and_clamps_page_size() {
     .await;
     assert_eq!(clamped["pageSize"], 200, "{clamped}");
 
-    // The query refuses accounts that are not opted in.
+    // An account with no entries has no ordinary results, even when eligible.
     let other = api_post(
         &server,
         &cookie,
@@ -3379,4 +3379,185 @@ async fn ordinary_idempotency_key_semantics_and_duplicate_errors() {
         "{detail}"
     );
     assert_eq!(detail["status"], "POSTED", "{detail}");
+}
+
+/// Message bookkeeping works before report enrollment. Context exposes only
+/// activity categories and supplies the IDs needed for one atomic classified write.
+#[tokio::test]
+async fn message_bookkeeping_context_and_classified_write_without_report_enrollment() {
+    let server = spawn_server(true, true).await;
+    let cookie = login(&server).await;
+    disable_market_data_providers(&server, &cookie).await;
+    let scope = session_scope(&server, &cookie).await;
+    let account = api_post(
+        &server,
+        &cookie,
+        "accounts",
+        serde_json::json!({
+            "name": "Bank (0407)", "accountType": "CASH", "currency": "CNY",
+            "isDefault": false, "isActive": true, "trackingMode": "TRANSACTIONS"
+        }),
+    )
+    .await;
+    api_put(
+        &server,
+        &cookie,
+        "spending/settings",
+        serde_json::json!({
+            "enabled": false, "accountIds": []
+        }),
+    )
+    .await;
+    let category = api_post(
+        &server,
+        &cookie,
+        "taxonomies/categories",
+        serde_json::json!({
+            "taxonomyId": "spending_categories", "name": "Digital services",
+            "key": "message_digital", "color": "#123456", "sortOrder": 0
+        }),
+    )
+    .await;
+    let (_, token) = create_pat(&server, &cookie, serde_json::json!({
+        "name": "message-reader", "scopes": ["accounts:read", "activities:read", "classification:read"]
+    })).await;
+    let pat = token["token"].as_str().unwrap();
+    let session = mcp_initialize(&server, pat).await;
+    let context = mcp_call_tool(
+        &server,
+        pat,
+        &session,
+        "get_bookkeeping_context",
+        serde_json::json!({}),
+    )
+    .await;
+    assert!(
+        context["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["id"] == account["id"]),
+        "{context}"
+    );
+    assert!(
+        context["taxonomies"].as_array().unwrap().iter().any(|t| {
+            t["taxonomyId"] == "spending_categories"
+                && t["categories"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c["categoryId"] == category["id"])
+        }),
+        "{context}"
+    );
+    assert!(
+        context["recentCategorizedActivities"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "{context}"
+    );
+    let input = serde_json::json!({
+        "accountId": account["id"], "activityType": "WITHDRAWAL", "activityDate": "2026-10-28",
+        "currency": "USD", "amount": "29.19", "notes": "GOOGLE digital service",
+        "taxonomyId": "spending_categories", "categoryId": category["id"], "requestKey": "message-google"
+    });
+    let created = business_post(
+        &server,
+        &cookie,
+        &scope,
+        "/ordinary-activities",
+        input.clone(),
+    )
+    .await;
+    assert_eq!(created["version"], 1, "{created}");
+    let replay = business_post(&server, &cookie, &scope, "/ordinary-activities", input).await;
+    assert_eq!(replay["replayed"], true, "{replay}");
+    let id = created["activity"]["id"].as_str().unwrap();
+    let detail = business_get(
+        &server,
+        &cookie,
+        &scope,
+        &format!("/ordinary-activities/{id}"),
+    )
+    .await;
+    assert_eq!(detail["currency"], "USD", "{detail}");
+    assert_eq!(detail["amount"], "29.19", "{detail}");
+    assert_eq!(detail["categoryId"], category["id"], "{detail}");
+    assert!(detail["fxRate"].is_null(), "{detail}");
+    let context = mcp_call_tool(
+        &server,
+        pat,
+        &session,
+        "get_bookkeeping_context",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(
+        context["recentCategorizedActivities"][0]["id"], id,
+        "{context}"
+    );
+    let query = business_post(
+        &server,
+        &cookie,
+        &scope,
+        "/ordinary-activities/query",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(query["totalCount"], 1, "{query}");
+    // Enabled reporting with the account explicitly excluded also allows bookkeeping.
+    api_put(
+        &server,
+        &cookie,
+        "spending/settings",
+        serde_json::json!({"enabled": true, "accountIds": []}),
+    )
+    .await;
+    let updated = business_put(&server, &cookie, &scope, "/ordinary-activities", serde_json::json!({
+        "activityId": id, "expectedVersion": 1, "accountId": account["id"],
+        "activityType": "WITHDRAWAL", "activityDate": "2026-10-28", "currency": "USD", "amount": "29.19",
+        "notes": "GOOGLE corrected note", "requestKey": "message-google-note"
+    })).await;
+    assert_eq!(updated.0, 200, "{updated:?}");
+    let settings = category_api_get(&server, &cookie, "spending/settings").await;
+    assert_eq!(settings["accountIds"], serde_json::json!([]), "{settings}");
+}
+
+#[tokio::test]
+async fn ordinary_bookkeeping_accepts_credit_cards_and_rejects_ineligible_accounts() {
+    let server = spawn_server(true, true).await;
+    let cookie = login(&server).await;
+    disable_market_data_providers(&server, &cookie).await;
+    let scope = session_scope(&server, &cookie).await;
+    for (name, account_type, active, expected) in [
+        ("Card", "CREDIT_CARD", true, 200),
+        ("Inactive cash", "CASH", false, 400),
+        ("Broker", "SECURITIES", true, 400),
+    ] {
+        let account = api_post(
+            &server,
+            &cookie,
+            "accounts",
+            serde_json::json!({
+                "name": name, "accountType": account_type, "currency": "USD",
+                "isDefault": false, "isActive": active, "trackingMode": "TRANSACTIONS"
+            }),
+        )
+        .await;
+        let (status, result) = business_post_status(&server, &cookie, &scope, "/ordinary-activities", serde_json::json!({
+            "accountId": account["id"], "activityType": "WITHDRAWAL", "activityDate": "2026-10-28",
+            "currency": "USD", "amount": "10", "requestKey": format!("bookkeeping-{account_type}-{active}")
+        })).await;
+        assert_eq!(status, expected, "{result}");
+    }
+    let query = business_post(
+        &server,
+        &cookie,
+        &scope,
+        "/ordinary-activities/query",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(query["totalCount"], 1, "{query}");
 }

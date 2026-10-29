@@ -1,7 +1,7 @@
 //! Ordinary income/expense use cases.
 //!
-//! The scope and branch rules are the ones in
-//! `docs/business-interface-plan.md` §2. The core [`ActivityServiceTrait`]
+//! Active cash and credit-card accounts support ordinary bookkeeping independently
+//! of spending-report preferences. The core [`ActivityServiceTrait`]
 //! remains the only accounting engine: this layer validates the ordinary
 //! income/expense envelope, sequences the write, and records the request,
 //! version and audit facts the plan requires.
@@ -17,7 +17,6 @@ use wealthfolio_core::activities::{
     Activity, ActivityServiceTrait, ActivityStatus, NewActivity, ACTIVITY_TYPE_DEPOSIT,
     ACTIVITY_TYPE_WITHDRAWAL,
 };
-use wealthfolio_spending::settings::SpendingSettingsService;
 
 use crate::audit::{BusinessAuditEntry, BusinessChannel};
 use crate::requests::{RequestOutcome, RequestRecord};
@@ -435,7 +434,6 @@ impl From<anyhow::Error> for OrdinaryActivityError {
 pub struct BusinessService {
     activity_service: Arc<dyn ActivityServiceTrait>,
     account_service: Arc<dyn AccountServiceTrait>,
-    spending_settings: Arc<SpendingSettingsService>,
     store: BusinessStore,
     ledger_id: String,
 }
@@ -459,14 +457,12 @@ impl BusinessService {
     pub fn new(
         activity_service: Arc<dyn ActivityServiceTrait>,
         account_service: Arc<dyn AccountServiceTrait>,
-        spending_settings: Arc<SpendingSettingsService>,
         store: BusinessStore,
         ledger_id: impl Into<String>,
     ) -> Self {
         Self {
             activity_service,
             account_service,
-            spending_settings,
             store,
             ledger_id: ledger_id.into(),
         }
@@ -516,7 +512,7 @@ impl BusinessService {
             return Ok(replayed);
         }
         // New work only: a completed request replays above even if the account
-        // has since been archived or dropped from spending.
+        // has since been archived or deactivated.
         self.ensure_account_eligible(&input.account_id).await?;
 
         let mut new_activity = NewActivity {
@@ -827,9 +823,7 @@ impl BusinessService {
                 reason: "only POSTED activities are read here".to_string(),
             });
         }
-        // Read and write share the same account eligibility: an archived
-        // account, disabled spending module or account removed from the
-        // tracked set is out of scope for both.
+        // Read and write share account eligibility, independently of reporting preferences.
         self.ensure_account_eligible(&activity.account_id).await?;
         let (taxonomy_id, category_id) = match assignment {
             Some((taxonomy_id, category_id)) => (Some(taxonomy_id), Some(category_id)),
@@ -856,7 +850,7 @@ impl BusinessService {
 
     /// Scoped query for ordinary income/expense.
     ///
-    /// The old activity search is unchanged; this one filters to spending
+    /// The old activity search is unchanged; this one filters to active cash/credit-card
     /// accounts, POSTED status, DEPOSIT/WITHDRAWAL and no asset/transfer/subtype,
     /// then counts and pages over exactly that set.
     pub async fn query_ordinary(
@@ -870,25 +864,19 @@ impl BusinessService {
             .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         let page = query.page.unwrap_or(0).max(0);
-        let settings = self
-            .spending_settings
-            .get()
-            .await
-            .map_err(spending_settings_error)?;
-        if !settings.enabled {
-            return Ok(OrdinaryActivityPage {
-                rows: Vec::new(),
-                total_count: 0,
-                page,
-                page_size,
-            });
-        }
-        let requested = query
-            .account_ids
-            .unwrap_or_else(|| settings.account_ids.clone());
-        let account_ids: Vec<String> = requested
+        let eligible = self.account_service.get_active_non_archived_accounts()?;
+        let account_ids: Vec<String> = eligible
             .into_iter()
-            .filter(|id| settings.account_ids.iter().any(|opted| opted == id))
+            .filter(|account| {
+                wealthfolio_core::accounts::account_supports_purpose(
+                    &account.account_type,
+                    AccountPurpose::Spending,
+                ) && query
+                    .account_ids
+                    .as_ref()
+                    .is_none_or(|requested| requested.contains(&account.id))
+            })
+            .map(|account| account.id)
             .collect();
         if account_ids.is_empty() {
             return Ok(OrdinaryActivityPage {
@@ -1039,6 +1027,12 @@ impl BusinessService {
                 reason: format!("account {account_id} was not found"),
             }
         })?;
+        if !account.is_active {
+            return Err(OrdinaryActivityError::OutOfScope {
+                activity_id: String::new(),
+                reason: "account is inactive".to_string(),
+            });
+        }
         if account.is_archived {
             return Err(OrdinaryActivityError::OutOfScope {
                 activity_id: String::new(),
@@ -1055,23 +1049,6 @@ impl BusinessService {
                     "account type {} is not a spending account",
                     account.account_type
                 ),
-            });
-        }
-        let settings = self
-            .spending_settings
-            .get()
-            .await
-            .map_err(spending_settings_error)?;
-        if !settings.enabled {
-            return Err(OrdinaryActivityError::OutOfScope {
-                activity_id: String::new(),
-                reason: "spending module is disabled".to_string(),
-            });
-        }
-        if !settings.account_ids.iter().any(|id| id == account_id) {
-            return Err(OrdinaryActivityError::OutOfScope {
-                activity_id: String::new(),
-                reason: "account is not included in spending".to_string(),
             });
         }
         Ok(())
@@ -1109,11 +1086,6 @@ impl BusinessService {
         }
         Ok(())
     }
-}
-
-/// Convert a spending-settings failure into the business error surface.
-fn spending_settings_error(error: anyhow::Error) -> OrdinaryActivityError {
-    OrdinaryActivityError::InvalidInput(error.to_string())
 }
 
 fn activity_status_str(status: &ActivityStatus) -> &'static str {

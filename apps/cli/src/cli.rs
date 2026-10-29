@@ -72,6 +72,8 @@ pub enum AccountsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum OrdinaryCommand {
+    /// Read eligible accounts, live categories, rules and recent classified entries.
+    Context,
     /// List ordinary activities.
     List {
         #[arg(long, default_value_t = 0)]
@@ -261,6 +263,12 @@ async fn execute(
             Ok((None, None, data))
         }
         Command::Ordinary { command } => match command {
+            OrdinaryCommand::Context => {
+                let (_, data) = session
+                    .call("get_bookkeeping_context", serde_json::json!({}))
+                    .await?;
+                Ok((None, None, data))
+            }
             OrdinaryCommand::List {
                 page,
                 page_size,

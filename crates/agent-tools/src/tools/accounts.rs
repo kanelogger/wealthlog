@@ -52,7 +52,7 @@ impl AgentTool for GetAccounts {
     }
 
     fn description(&self) -> &'static str {
-        "Get the list of active investment accounts. Returns account id, name, type, and currency for each account."
+        "Get active, non-archived accounts, including cash, credit cards and investments. Returns account id, name, type, and currency for each account."
     }
 
     fn input_schema(&self) -> serde_json::Value {

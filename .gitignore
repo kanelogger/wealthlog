@@ -1,5 +1,6 @@
 .DS_Store
 .agents/state/
+.wealthlog-agent-state/
 .agents/cache/
 .env
 .env.*

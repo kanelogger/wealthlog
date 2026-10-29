@@ -103,8 +103,8 @@ pub use transfer_links::{
 
 // Ordinary income/expense reads and (desktop-only) writes.
 pub use ordinary::{
-    CreateOrdinaryActivityTool, GetOrdinaryActivity, QueryOrdinaryActivities,
-    UpdateOrdinaryActivityTool,
+    CreateOrdinaryActivityTool, GetBookkeepingContext, GetOrdinaryActivity,
+    QueryOrdinaryActivities, UpdateOrdinaryActivityTool,
 };
 
 /// Ordinary income/expense tools in catalog order. The host policy decides
@@ -115,6 +115,7 @@ pub fn ordinary_tools() -> Vec<Arc<dyn AgentTool>> {
         Arc::new(GetOrdinaryActivity),
         Arc::new(CreateOrdinaryActivityTool),
         Arc::new(UpdateOrdinaryActivityTool),
+        Arc::new(GetBookkeepingContext),
     ]
 }
 
