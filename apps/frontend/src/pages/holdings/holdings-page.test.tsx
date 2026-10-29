@@ -127,6 +127,10 @@ describe("HoldingsPage account scope", () => {
     renderPage();
 
     expect(selectorScope()).toEqual({ type: "account", accountId: "acc-1" });
+    expect(mocks.useHoldingsWithClosedProbe).toHaveBeenCalledWith(
+      { type: "account", accountId: "acc-1" },
+      expect.objectContaining({ excludeCash: true }),
+    );
     // The account is derived from the shared scope, so its edit affordance shows.
     expect(toolbarUpdateButton()).toBeInTheDocument();
   });

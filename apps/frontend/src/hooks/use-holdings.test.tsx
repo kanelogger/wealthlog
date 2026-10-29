@@ -51,6 +51,24 @@ describe("useHoldingsWithClosedProbe", () => {
     expect(result.current.hasHiddenClosedPositions).toBe(false);
   });
 
+  it("probes closed investments when only cash balances remain open", async () => {
+    const cash = { id: "cash-usd", holdingType: "cash", quantity: -29.19 } as Holding;
+    const closed = { id: "closed-stock", holdingType: "security", isClosed: true } as Holding;
+    mocks.getHoldingsList.mockImplementation((_scope, options: { includeClosed?: boolean }) =>
+      Promise.resolve(options.includeClosed ? [cash, closed] : [cash]),
+    );
+    const { result } = renderHook(
+      () =>
+        useHoldingsWithClosedProbe(
+          { type: "all" },
+          { includeClosed: false, probeClosedWhenEmpty: true, excludeCash: true },
+        ),
+      { wrapper: createWrapper() },
+    );
+    await waitFor(() => expect(result.current.hasHiddenClosedPositions).toBe(true));
+    expect(result.current.holdings).toEqual([]);
+  });
+
   it("probes closed positions after an empty open query", async () => {
     const closedHolding = { id: "closed", isClosed: true } as Holding;
     mocks.getHoldingsList.mockImplementation((_filter, options: { includeClosed?: boolean }) =>
@@ -79,6 +97,26 @@ describe("useHoldingsWithClosedProbe", () => {
 describe("useHoldings", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("keeps cash in account balances while excluding it from the investment view", async () => {
+    const stock = { id: "stock", holdingType: "security" } as Holding;
+    const cny = { id: "cash-cny", holdingType: "cash", quantity: 70728.41 } as Holding;
+    const usd = { id: "cash-usd", holdingType: "cash", quantity: -29.19 } as Holding;
+    const rows = [stock, cny, usd];
+    mocks.getHoldingsList.mockResolvedValue(rows);
+    const { result } = renderHook(
+      () => ({
+        investments: useHoldings({ type: "all" }, { excludeCash: true }),
+        balances: useHoldings({ type: "all" }),
+      }),
+      { wrapper: createWrapper() },
+    );
+    await waitFor(() => expect(result.current.balances.holdings).toHaveLength(3));
+    expect(result.current.investments.holdings).toEqual([stock]);
+    expect(result.current.balances.holdings).toEqual(rows);
+    expect(rows).toHaveLength(3);
+    expect(mocks.getHoldingsList).toHaveBeenCalledTimes(1);
   });
 
   it("does not retain open-only positions while closed positions load", async () => {

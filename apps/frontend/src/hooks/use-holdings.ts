@@ -2,25 +2,32 @@ import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { localizeHolding } from "@/lib/taxonomy-labels";
 import { useQuery } from "@tanstack/react-query";
-import { AccountScope, Holding } from "@/lib/types";
+import { AccountScope, Holding, HoldingType } from "@/lib/types";
 import { getHoldingsList } from "@/adapters";
 import { QueryKeys } from "@/lib/query-keys";
 
 interface UseHoldingsOptions {
   includeClosed?: boolean;
   enabled?: boolean;
+  /** Investment positions exclude activity-derived cash balances. */
+  excludeCash?: boolean;
 }
 
 interface UseHoldingsWithClosedProbeOptions {
   includeClosed: boolean;
   probeClosedWhenEmpty: boolean;
+  excludeCash?: boolean;
 }
 
 export function useHoldings(accountFilter: AccountScope, options: UseHoldingsOptions = {}) {
   const { t } = useTranslation();
+  const excludeCash = options.excludeCash ?? false;
   const select = useCallback(
-    (data: Holding[]) => data.map((holding) => localizeHolding(holding, t)),
-    [t],
+    (data: Holding[]) =>
+      data
+        .filter((holding) => !excludeCash || holding.holdingType !== HoldingType.CASH)
+        .map((holding) => localizeHolding(holding, t)),
+    [excludeCash, t],
   );
   const includeClosed = options.includeClosed ?? false;
   const hasValidScope = (() => {
@@ -59,7 +66,10 @@ export function useHoldingsWithClosedProbe(
   accountFilter: AccountScope,
   options: UseHoldingsWithClosedProbeOptions,
 ) {
-  const primaryQuery = useHoldings(accountFilter, { includeClosed: options.includeClosed });
+  const primaryQuery = useHoldings(accountFilter, {
+    includeClosed: options.includeClosed,
+    excludeCash: options.excludeCash,
+  });
   const shouldProbeClosedPositions =
     options.probeClosedWhenEmpty &&
     !options.includeClosed &&
@@ -68,6 +78,7 @@ export function useHoldingsWithClosedProbe(
   const closedProbeQuery = useHoldings(accountFilter, {
     includeClosed: true,
     enabled: shouldProbeClosedPositions,
+    excludeCash: options.excludeCash,
   });
 
   return {

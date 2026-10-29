@@ -24,13 +24,7 @@ import {
   HOLDING_CATEGORY_FILTERS,
   apiKindToAlternativeAssetKind,
 } from "@/lib/constants";
-import {
-  AccountScope,
-  Holding,
-  HoldingType,
-  AlternativeAssetHolding,
-  AlternativeAssetKind,
-} from "@/lib/types";
+import { AccountScope, Holding, AlternativeAssetHolding, AlternativeAssetKind } from "@/lib/types";
 import { canAddHoldings } from "@/lib/activity-restrictions";
 import { useIsMobileViewport } from "@/hooks/use-platform";
 import { HoldingsTable } from "./components/holdings-table";
@@ -121,6 +115,7 @@ export const HoldingsPage = () => {
     {
       includeClosed,
       probeClosedWhenEmpty: showClosedPositions,
+      excludeCash: true,
     },
   );
   const { data: portfolios = [] } = usePortfolios();
@@ -390,10 +385,7 @@ export const HoldingsPage = () => {
     if (investmentsFilter?.assetKinds) {
       const allowedKinds = investmentsFilter.assetKinds as readonly string[];
       scopedHoldings = allHoldings.filter((holding) => {
-        return (
-          holding.holdingType?.toLowerCase() === HoldingType.CASH ||
-          (holding.assetKind && allowedKinds.includes(holding.assetKind))
-        );
+        return holding.assetKind && allowedKinds.includes(holding.assetKind);
       });
     }
 
