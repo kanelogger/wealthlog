@@ -137,3 +137,4 @@ apps/tauri/db/
 # Project task records are tracked.
 **/*.local.md
 wealthfolio.db
+.impeccable
