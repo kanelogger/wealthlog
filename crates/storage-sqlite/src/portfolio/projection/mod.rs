@@ -618,6 +618,26 @@ mod tests {
         marker(db, scope).and_then(|(day, _)| day)
     }
 
+    #[tokio::test]
+    async fn cash_transfer_upgrade_invalidates_existing_manual_account_history() {
+        let db = setup();
+        let mut conn = get_connection(&db.pool).unwrap();
+        diesel::sql_query("UPDATE accounts SET tracking_mode = 'HOLDINGS' WHERE id = 'acc1'")
+            .execute(&mut conn)
+            .unwrap();
+        diesel::sql_query("DELETE FROM projection_state")
+            .execute(&mut conn)
+            .unwrap();
+        let upgrade =
+            include_str!("../../../migrations/2026-10-29-000001_holdings_cash_transfers/up.sql");
+        diesel::sql_query(upgrade).execute(&mut conn).unwrap();
+        assert_eq!(dirty(&db, "acc1"), Some("0001-01-01".into()));
+        let (_, version) = marker(&db, "acc1").unwrap();
+        diesel::sql_query(upgrade).execute(&mut conn).unwrap();
+        assert_eq!(marker(&db, "acc1").unwrap().1, version + 1);
+        assert_eq!(dirty(&db, "@all"), None);
+    }
+
     fn window(start: u32, end: Option<u32>, days: &[u32]) -> WindowRows {
         WindowRows {
             account_id: "acc1".to_string(),

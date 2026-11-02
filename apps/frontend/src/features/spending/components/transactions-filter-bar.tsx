@@ -39,7 +39,7 @@ function CurrencyNetPill({ total }: { total: CurrencyNet }) {
   const { isBalanceHidden } = useBalancePrivacy();
   const isNegative = total.amount < 0;
   return (
-    <span className="bg-muted/45 inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5">
+    <span className="bg-muted/45 inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-0.5">
       <span
         className={cn("h-2 w-1 rounded-sm", isNegative ? "bg-destructive/70" : "bg-success/70")}
         aria-hidden="true"
@@ -319,11 +319,12 @@ export function TransactionsFilterBar({
   }
 
   return (
-    <div className="-mx-1 flex flex-wrap items-center gap-2 px-1 pb-1">
+    <div className="cash-ledger-filters border-border flex flex-wrap items-center gap-2 border-b pb-3 pt-1">
       <FacetedSearchInput
         value={searchInput}
         onChange={onSearchInputChange}
-        className="w-[160px] lg:w-[240px]"
+        placeholder={t("common:search_placeholder")}
+        className="[&_input]:border-input [&_input]:bg-card w-[180px] lg:w-[260px] [&_input]:h-9 [&_input]:border [&_input]:shadow-none"
       />
       {filterControls}
       {filtersActive && (
@@ -336,7 +337,7 @@ export function TransactionsFilterBar({
           {t("spending:filters.clearAll")}
         </Button>
       )}
-      <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-3 gap-y-1">
+      <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-x-4 gap-y-1">
         {selectedNet.byCurrency.length > 0 && (
           <NetReadout label={t("spending:filters.selectedNet")} net={selectedNet} />
         )}

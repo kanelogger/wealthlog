@@ -18,7 +18,7 @@ const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 #[command(
     name = "wealthlog",
     version,
-    about = "Local Wealthlog CLI (ordinary income/expense, accounts and pending entries)",
+    about = "Local Wealthlog CLI (bookkeeping, transfers, manual holdings and cash)",
     long_about = "Calls the running Wealthlog desktop service over its private Unix socket. \
                   Writes require --ledger and a frozen requestKey in the input JSON. The CLI \
                   prints one JSON object on stdout and logs nothing else there; tokens are never \
@@ -56,6 +56,16 @@ pub enum Command {
     Pending {
         #[command(subcommand)]
         command: PendingCommand,
+    },
+    /// Per-account holdings and cash state, manual snapshots and trades.
+    Holdings {
+        #[command(subcommand)]
+        command: HoldingsCommand,
+    },
+    /// Internal cash-transfer bookkeeping.
+    Transfers {
+        #[command(subcommand)]
+        command: TransfersCommand,
     },
     /// Local service discovery.
     Service {
@@ -109,6 +119,34 @@ pub enum PendingCommand {
         include_resolved: bool,
     },
     /// Store a pending entry for review in the app.
+    Create {
+        #[arg(long, value_name = "FILE|-")]
+        input: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HoldingsCommand {
+    /// Today's exact holdings, cash by currency and stateVersion.
+    Get {
+        #[arg(long)]
+        account_id: String,
+    },
+    /// Patch specified positions/currencies in today's manual snapshot.
+    Patch {
+        #[arg(long, value_name = "FILE|-")]
+        input: String,
+    },
+    /// Record an executed manual-account BUY/SELL, without placing an order.
+    Trade {
+        #[arg(long, value_name = "FILE|-")]
+        input: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TransfersCommand {
+    /// Atomically record both legs of an already-completed cash transfer.
     Create {
         #[arg(long, value_name = "FILE|-")]
         input: String,
@@ -216,7 +254,10 @@ pub async fn run(cli: Cli) -> Result<Outcome, CliError> {
             command: OrdinaryCommand::Create { .. } | OrdinaryCommand::Update { .. }
         } | Command::Pending {
             command: PendingCommand::Create { .. }
-        }
+        } | Command::Transfers { .. }
+            | Command::Holdings {
+                command: HoldingsCommand::Patch { .. } | HoldingsCommand::Trade { .. }
+            }
     );
     let ledger = if needs_write_ledger {
         required_ledger(&cli)?
@@ -249,6 +290,20 @@ pub async fn run(cli: Cli) -> Result<Outcome, CliError> {
         request_id,
         data,
     })
+}
+
+async fn execute_portfolio_write(
+    session: &Session,
+    tool: &str,
+    input: &str,
+) -> Result<(Option<String>, Option<String>, Value), CliError> {
+    let value = read_input(input)?;
+    let key = require_request_key(&value)?;
+    let (_, data) = session
+        .call(tool, value)
+        .await
+        .map_err(|e| e.with_request_key(Some(key.clone())))?;
+    Ok((Some(key), request_id_of_data(&data), data))
 }
 
 async fn execute(
@@ -330,6 +385,28 @@ async fn execute(
                 Ok((Some(request_key), request_id_of_data(&data), data))
             }
         },
+        Command::Holdings {
+            command: HoldingsCommand::Get { account_id },
+        } => {
+            let (_, data) = session
+                .call(
+                    "get_investment_account_state",
+                    serde_json::json!({"accountId":account_id}),
+                )
+                .await?;
+            Ok((None, None, data))
+        }
+        Command::Holdings { command } => {
+            let (tool, input) = match command {
+                HoldingsCommand::Patch { input } => ("patch_holdings_snapshot", input),
+                HoldingsCommand::Trade { input } => ("record_manual_trade", input),
+                HoldingsCommand::Get { .. } => unreachable!(),
+            };
+            execute_portfolio_write(session, tool, input).await
+        }
+        Command::Transfers {
+            command: TransfersCommand::Create { input },
+        } => execute_portfolio_write(session, "create_internal_cash_transfer", input).await,
         Command::Pending { command } => match command {
             PendingCommand::List { include_resolved } => {
                 let (_, data) = session

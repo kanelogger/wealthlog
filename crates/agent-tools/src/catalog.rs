@@ -17,8 +17,13 @@ use crate::tool::{AgentTool, AgentToolAccess, AgentToolError, AgentToolResult};
 pub const MCP_HIDDEN_TOOLS: &[&str] = &["prepare_activity_updates"];
 
 /// The only formal writes a desktop-hosted MCP/CLI surface may execute.
-pub const DESKTOP_FORMAL_WRITE_TOOLS: &[&str] =
-    &["create_ordinary_activity", "update_ordinary_activity"];
+pub const DESKTOP_FORMAL_WRITE_TOOLS: &[&str] = &[
+    "create_ordinary_activity",
+    "update_ordinary_activity",
+    "create_internal_cash_transfer",
+    "patch_holdings_snapshot",
+    "record_manual_trade",
+];
 
 /// Which host is serving the catalog. The host policy is code, not a token
 /// scope: a token cannot widen it.
@@ -47,12 +52,14 @@ pub fn mcp_write_blocked(tool: &dyn AgentTool) -> bool {
     mcp_write_blocked_for(tool, McpHost::Server)
 }
 
-/// Host-aware block: desktop exposes exactly the ordinary create/update
-/// writes; every other `Write` tool and hidden preview stays blocked.
+/// Host-aware policy: desktop exposes explicitly listed bookkeeping writes.
+/// Other writes and unsupported server-only reads remain unavailable.
 pub fn mcp_write_blocked_for(tool: &dyn AgentTool, host: McpHost) -> bool {
     let blocked_write = matches!(tool.access_level(), AgentToolAccess::Write)
         && !host.permits_formal_write(tool.name());
-    blocked_write || MCP_HIDDEN_TOOLS.contains(&tool.name())
+    blocked_write
+        || MCP_HIDDEN_TOOLS.contains(&tool.name())
+        || (host == McpHost::Server && tool.name() == "get_investment_account_state")
 }
 
 /// An ordered collection of agent tools.
@@ -90,6 +97,7 @@ impl AgentToolCatalog {
         tools.extend(crate::tools::transfer_link_tools());
         tools.extend(crate::tools::activity_update_tools());
         tools.extend(crate::tools::ordinary_tools());
+        tools.extend(crate::tools::investments::investment_tools());
         tools.retain(|tool| !mcp_write_blocked_for(tool.as_ref(), host));
         Self::new(tools)
     }
@@ -363,11 +371,19 @@ mod tests {
     }
 
     #[test]
-    fn desktop_catalog_exposes_only_ordinary_formal_writes() {
+    fn desktop_catalog_exposes_explicit_portfolio_writes_and_keeps_server_blocked() {
         let desktop = AgentToolCatalog::mcp_catalog_for(McpHost::Desktop);
         let names: Vec<&str> = desktop.iter().map(|tool| tool.name()).collect();
         assert!(names.contains(&"create_ordinary_activity"));
         assert!(names.contains(&"update_ordinary_activity"));
+        for name in [
+            "get_investment_account_state",
+            "create_internal_cash_transfer",
+            "record_manual_trade",
+            "patch_holdings_snapshot",
+        ] {
+            assert!(names.contains(&name));
+        }
         assert!(!names.contains(&"commit_activity_updates"));
         assert!(!names.contains(&"link_transfer_activities"));
         assert!(!names.contains(&"prepare_activity_updates"));
@@ -377,6 +393,14 @@ mod tests {
         assert!(!server_names.contains(&"create_ordinary_activity"));
         assert!(!server_names.contains(&"update_ordinary_activity"));
         assert!(server_names.contains(&"query_ordinary_activities"));
+        for name in [
+            "get_investment_account_state",
+            "create_internal_cash_transfer",
+            "record_manual_trade",
+            "patch_holdings_snapshot",
+        ] {
+            assert!(!server_names.contains(&name));
+        }
     }
 
     #[test]

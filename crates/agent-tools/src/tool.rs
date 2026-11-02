@@ -158,6 +158,18 @@ impl From<wealthfolio_business::OrdinaryActivityError> for AgentToolError {
     }
 }
 
+impl From<wealthfolio_business::investments::InvestmentError> for AgentToolError {
+    fn from(error: wealthfolio_business::investments::InvestmentError) -> Self {
+        Self::Business {
+            code: error.code().into(),
+            message: error.to_string(),
+            retryable: error.retryable(),
+            request_id: None,
+            data: serde_json::Value::Null,
+        }
+    }
+}
+
 /// An agent-callable tool. Object-safe: implementations are stateless unit
 /// structs; the environment arrives per call so one catalog instance can
 /// serve every session and runtime.

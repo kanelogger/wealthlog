@@ -318,7 +318,7 @@
     "title": "未找到页面",
     "description": "抱歉,我们找不到您要查找的页面。它可能已被移动、删除或从未存在。",
     "goBack": "返回",
-    "backToDashboard": "返回仪表盘"
+    "backToDashboard": "返回活动"
   },
   "navStyle": {
     "sidebar": "侧边栏",

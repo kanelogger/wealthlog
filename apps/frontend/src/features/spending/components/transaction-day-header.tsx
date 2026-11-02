@@ -75,7 +75,7 @@ function TransactionDayHeaderImpl({
     <TableRow
       ref={ref as Ref<HTMLTableRowElement>}
       data-index={dataIndex}
-      className="bg-muted/40 hover:bg-muted/40"
+      className="border-border/70 bg-muted/25 hover:bg-muted/25"
     >
       <TableCell className="relative px-3 py-1.5">
         <Checkbox
@@ -90,7 +90,7 @@ function TransactionDayHeaderImpl({
       </TableCell>
       <TableCell colSpan={3} className="px-3 py-1.5">
         <div className="flex items-baseline gap-2">
-          <span className="text-xs font-medium">{label}</span>
+          <span className="text-muted-foreground text-xs font-medium">{label}</span>
           {/* "1 transaction" restates the single row below it, so the count
               only appears once it is telling the reader something. */}
           {!isPartial && group.rows.length > 1 && (

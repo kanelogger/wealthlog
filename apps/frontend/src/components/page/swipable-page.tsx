@@ -47,7 +47,7 @@ function NavigationPills({
   const layoutId = React.useId();
 
   return (
-    <nav className="bg-muted/60 inline-flex items-center rounded-full p-1">
+    <nav className="studio-view-tabs bg-muted/50 border-border inline-flex items-center gap-1 rounded-md border p-1">
       {views.map((view) => {
         const isActive = currentView === view.value;
         const IconComponent = view.icon;
@@ -58,16 +58,16 @@ function NavigationPills({
             type="button"
             onClick={() => onViewChange(view.value)}
             className={cn(
-              "relative flex cursor-pointer items-center gap-2 rounded-full px-3 py-1.5 text-sm font-medium transition-colors duration-200",
+              "relative flex cursor-pointer items-center gap-2 rounded-[4px] px-3 py-1.5 text-sm font-medium transition-colors duration-200",
               "focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-2",
-              isActive ? "text-foreground" : "text-muted-foreground hover:text-foreground/80",
+              isActive ? "text-primary" : "text-muted-foreground hover:text-foreground/80",
             )}
             aria-current={isActive ? "page" : undefined}
           >
             {isActive && (
               <motion.div
                 layoutId={`nav-pill-${layoutId}`}
-                className="bg-background absolute inset-0 rounded-full shadow-sm"
+                className="bg-card shadow-xs absolute inset-0 rounded-[4px]"
                 initial={false}
                 transition={{
                   type: "spring",
@@ -295,11 +295,15 @@ export function SwipablePage({
           </div>
         ) : (
           /* Desktop: Navigation at top center + content below */
-          <div className="hidden h-full flex-col md:flex">
+          <div className="studio-page hidden h-full flex-col md:flex">
             {/* Header with Navigation and Actions */}
-            <div className="flex shrink-0 items-center justify-between gap-4 px-2 pb-3 pt-4 lg:px-4">
+            <div className="studio-page-toolbar bg-background border-border flex shrink-0 items-center justify-between gap-4 border-b px-4 py-4 lg:px-7 lg:py-5">
               <div className="titlebar-nudge flex items-center gap-3">
-                {title && <h1 className="text-muted-foreground text-sm font-medium">{title}</h1>}
+                {title && (
+                  <h1 className="text-foreground text-[1.625rem] font-semibold tracking-[-.025em]">
+                    {title}
+                  </h1>
+                )}
                 <NavigationPills
                   views={views}
                   currentView={currentView}
@@ -313,8 +317,8 @@ export function SwipablePage({
             {/* Content - relative for absolute positioned actions within */}
             <div
               className={cn(
-                "relative grow overflow-y-auto pt-8 md:pt-2",
-                withPadding && "px-2 pb-2 lg:px-4 lg:pb-4",
+                "studio-page-body relative grow overflow-y-auto pt-8 md:pt-4",
+                withPadding && "px-2 pb-2 lg:px-7 lg:pb-5",
                 desktopContentClassName,
               )}
             >

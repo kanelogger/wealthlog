@@ -19,6 +19,8 @@ pub enum AgentScope {
     ActivitiesDraft,
     ActivitiesWrite,
     OrdinaryWrite,
+    TransfersWrite,
+    HoldingsWrite,
     ClassificationSuggest,
     ClassificationWrite,
 }
@@ -36,6 +38,8 @@ impl AgentScope {
         AgentScope::ActivitiesDraft,
         AgentScope::ActivitiesWrite,
         AgentScope::OrdinaryWrite,
+        AgentScope::TransfersWrite,
+        AgentScope::HoldingsWrite,
         AgentScope::ClassificationSuggest,
         AgentScope::ClassificationWrite,
     ];
@@ -64,6 +68,8 @@ impl AgentScope {
             AgentScope::ActivitiesDraft => "activities:draft",
             AgentScope::ActivitiesWrite => "activities:write",
             AgentScope::OrdinaryWrite => "ordinary:write",
+            AgentScope::TransfersWrite => "transfers:write",
+            AgentScope::HoldingsWrite => "holdings:write",
             AgentScope::ClassificationSuggest => "classification:suggest",
             AgentScope::ClassificationWrite => "classification:write",
         }
@@ -174,6 +180,21 @@ impl AgentScopeSet {
         {
             return Some("ordinary:write requires activities:read and accounts:read".to_string());
         }
+        if self.contains(AgentScope::TransfersWrite)
+            && (!self.contains(AgentScope::AccountsRead)
+                || !self.contains(AgentScope::ActivitiesRead))
+        {
+            return Some("transfers:write requires accounts:read and activities:read".into());
+        }
+        if self.contains(AgentScope::HoldingsWrite)
+            && (!self.contains(AgentScope::AccountsRead)
+                || !self.contains(AgentScope::HoldingsRead)
+                || !self.contains(AgentScope::ActivitiesRead))
+        {
+            return Some(
+                "holdings:write requires accounts:read, holdings:read and activities:read".into(),
+            );
+        }
         if self.contains(AgentScope::ClassificationWrite)
             && !self.contains(AgentScope::ClassificationSuggest)
         {
@@ -195,6 +216,19 @@ impl FromIterator<AgentScope> for AgentScopeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portfolio_write_scopes_are_explicit_and_require_reads() {
+        for scope in [AgentScope::TransfersWrite, AgentScope::HoldingsWrite] {
+            assert!(!AgentScopeSet::read_only().contains(scope));
+            let mut scopes = AgentScopeSet::read_only();
+            scopes.insert(scope);
+            assert_eq!(scopes.dependency_error(), None);
+            let mut incomplete = AgentScopeSet::new();
+            incomplete.insert(scope);
+            assert!(incomplete.dependency_error().is_some());
+        }
+    }
 
     #[test]
     fn round_trips_canonical_strings() {

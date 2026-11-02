@@ -20,6 +20,8 @@ use crate::errors::{Error, Result};
 use crate::events::{DomainEvent, DomainEventSink, NoOpDomainEventSink};
 use crate::lots::{AssetLotSource, AssetLotView};
 use crate::portfolio::coordinator::raw_activity;
+use crate::portfolio::economic_events::ActivityEconomicsResolver;
+use crate::utils::time_utils::activity_date_in_tz;
 use crate::utils::time_utils::{parse_user_timezone_or_default, user_today};
 use wealthfolio_portfolio_engine as engine;
 
@@ -88,6 +90,9 @@ pub trait SnapshotServiceTrait: Send + Sync {
         account_id: &str,
         snapshot: AccountStateSnapshot,
     ) -> Result<()>;
+
+    /// Raise the normal recalculation event after an external atomic commit.
+    fn notify_manual_snapshot_committed(&self, _snapshot: &AccountStateSnapshot) {}
 
     /// Delete snapshot(s) on the given dates.
     /// Keep UI/API callers behind the snapshot service boundary even though
@@ -292,6 +297,46 @@ impl SnapshotService {
                         "Split factor for {} in snapshot {} is out of range; quantities read as stored",
                         position.asset_id, snapshot.id
                     ),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Cash snapshots are end-of-day baselines. Later posted cash transfers
+    /// change available cash without changing manually observed securities.
+    fn carry_cash_transfers(
+        &self,
+        snapshots: &mut HashMap<String, AccountStateSnapshot>,
+        day: NaiveDate,
+    ) -> Result<()> {
+        let ids: Vec<_> = snapshots.keys().cloned().collect();
+        let modes = self.tracking_modes(&ids)?;
+        let timezone = parse_user_timezone_or_default(
+            &self.timezone.read().unwrap_or_else(|p| p.into_inner()),
+        );
+        for snapshot in snapshots.values_mut() {
+            if modes.get(&snapshot.account_id) != Some(&TrackingMode::Holdings) {
+                continue;
+            }
+            for activity in self
+                .activity_repository
+                .get_activities_by_account_id(&snapshot.account_id)?
+            {
+                let date = activity_date_in_tz(activity.activity_date, timezone);
+                if !activity.is_posted()
+                    || date <= snapshot.snapshot_date
+                    || date > day
+                    || !matches!(activity.effective_type(), "TRANSFER_IN" | "TRANSFER_OUT")
+                    || ActivityEconomicsResolver::is_security_transfer(&activity)
+                {
+                    continue;
+                }
+                if let Some(amount) =
+                    ActivityEconomicsResolver::resolve_cash(&activity, Decimal::ONE)
+                        .signed_cash_effect
+                {
+                    *snapshot.cash_balances.entry(activity.currency).or_default() += amount;
                 }
             }
         }
@@ -602,6 +647,7 @@ impl SnapshotServiceTrait for SnapshotService {
             return Ok(None);
         }
         self.carry_splits(&mut snapshots, today)?;
+        self.carry_cash_transfers(&mut snapshots, today)?;
         Ok(snapshots.remove(account_id))
     }
 
@@ -630,6 +676,7 @@ impl SnapshotServiceTrait for SnapshotService {
             }
         }
         self.carry_splits(&mut snapshots, day)?;
+        self.carry_cash_transfers(&mut snapshots, day)?;
         Ok(snapshots)
     }
 
@@ -739,6 +786,13 @@ impl SnapshotServiceTrait for SnapshotService {
         self.emit_holdings_changed(vec![account_id.to_string()], asset_ids);
 
         Ok(())
+    }
+
+    fn notify_manual_snapshot_committed(&self, snapshot: &AccountStateSnapshot) {
+        self.emit_holdings_changed(
+            vec![snapshot.account_id.clone()],
+            snapshot.positions.keys().cloned().collect(),
+        );
     }
 
     async fn delete_snapshot_for_account(

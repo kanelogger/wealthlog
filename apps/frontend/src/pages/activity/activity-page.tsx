@@ -675,7 +675,7 @@ const ActivityPage = () => {
   );
 
   const investmentContent = (
-    <div className="flex min-h-0 flex-1 flex-col space-y-4 overflow-hidden">
+    <div className="activity-investments flex min-h-0 flex-1 flex-col space-y-3 overflow-hidden">
       {statusFilter !== "pending" && (
         <NeedsReviewBanner
           accountIds={effectiveInvestmentAccountIds}
@@ -870,9 +870,11 @@ const ActivityPage = () => {
   // When spending is disabled, keep the classic Activity page header — no pills.
   if (!isSpendingEnabled) {
     return (
-      <Page>
-        <PageHeader actions={investmentActions} />
-        <PageContent className="pb-2 md:pb-4 lg:pb-5">{investmentContent}</PageContent>
+      <Page className="activity-workspace">
+        <PageHeader className="border-border bg-background border-b" actions={investmentActions} />
+        <PageContent className="pb-2 md:px-6 md:pb-4 lg:px-8 lg:pb-5">
+          {investmentContent}
+        </PageContent>
         {sharedModals}
       </Page>
     );
@@ -899,9 +901,11 @@ const ActivityPage = () => {
     <>
       <SwipablePage
         views={views}
+        className="activity-workspace"
+        title={t("common:activities")}
         defaultView="investments"
         persistKey="activity-page-tab"
-        desktopContentClassName="overflow-y-visible"
+        desktopContentClassName="activity-workspace-content overflow-y-visible"
       />
       {sharedModals}
     </>

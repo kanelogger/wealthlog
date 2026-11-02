@@ -26,33 +26,28 @@ export function AppSidebar({ navigation }: AppSidebarProps) {
   return (
     <div
       className={cn({
-        "light:bg-secondary/50 hidden h-full border-r pt-12 transition-[width] duration-300 ease-in-out md:flex md:flex-shrink-0 md:overflow-hidden": true,
+        "studio-sidebar-shell hidden h-full border-r pt-12 transition-[width] duration-200 ease-out md:flex md:flex-shrink-0 md:overflow-hidden": true,
         "md:w-sidebar": !collapsed,
         "md:w-sidebar-collapsed": collapsed,
       })}
       data-tauri-drag-region="true"
     >
-      <div className="z-20 w-full rounded-xl md:flex">
+      <div className="z-20 w-full md:flex">
         <div className="flex w-full flex-col">
           <div className="flex min-h-0 w-full flex-1 flex-col">
             <div data-tauri-drag-region="true" className="min-h-0 flex-1 overflow-y-auto">
               <nav
                 data-tauri-drag-region="true"
                 aria-label={t("common:layout.sidebar")}
-                className="flex shrink-0 flex-col p-2"
+                className="flex shrink-0 flex-col gap-1 p-3"
               >
                 <div
                   data-tauri-drag-region="true"
-                  className="draggable flex items-center justify-center pb-6"
+                  className="draggable flex items-center justify-center pb-7"
                 >
-                  <Link to="/" className="group/logo block shrink-0 [perspective:400px]">
+                  <Link to="/" aria-label="Wealthlog" className="block shrink-0">
                     <img
-                      className={cn(
-                        "h-10 w-10 bg-transparent transition-transform duration-1000 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none",
-                        collapsed
-                          ? "motion-safe:[transform:rotateY(180deg)] motion-safe:group-hover/logo:[transform:rotateY(360deg)]"
-                          : "motion-safe:[transform:rotateY(0deg)] motion-safe:group-hover/logo:[transform:rotateY(180deg)]",
-                      )}
+                      className="h-9 w-9 bg-transparent object-contain"
                       aria-hidden="true"
                       src="/logo.png"
                     />
@@ -60,7 +55,7 @@ export function AppSidebar({ navigation }: AppSidebarProps) {
 
                   <span
                     className={cn(
-                      "text-md text-foreground/90 ml-2 font-serif text-xl font-bold transition-opacity delay-100 duration-300 ease-in-out",
+                      "text-foreground ml-2 font-sans text-lg font-semibold tracking-tight transition-opacity duration-150",
                       {
                         "sr-only opacity-0": collapsed,
                         "block opacity-100": !collapsed,
@@ -89,10 +84,10 @@ export function AppSidebar({ navigation }: AppSidebarProps) {
                     document.dispatchEvent(event);
                   }}
                   className={cn(
-                    "text-foreground [&_svg]:size-5! mb-4 h-12 transition-all duration-300",
+                    "text-foreground [&_svg]:size-4! mb-4 h-10 transition-colors duration-150",
                     collapsed
                       ? "justify-center rounded-md"
-                      : "bg-muted/50 hover:bg-muted/80 justify-start rounded-full px-4 shadow-none",
+                      : "bg-muted/60 hover:bg-muted justify-start rounded-md px-3 shadow-none",
                   )}
                   title={t("common:layout.search_shortcut", { shortcut: `${modKey}+K` })}
                 >
@@ -121,7 +116,7 @@ export function AppSidebar({ navigation }: AppSidebarProps) {
               </nav>
             </div>
 
-            <div className="flex shrink-0 flex-col p-2">
+            <div className="flex shrink-0 flex-col gap-1 p-3">
               {navigation?.secondary?.map((item) => (
                 <NavItem key={item.title} item={item} collapsed={collapsed} />
               ))}
@@ -202,7 +197,10 @@ function NavItem({ item, collapsed, className, ...props }: NavItemProps) {
       variant={isActive ? "secondary" : "ghost"}
       asChild
       className={cn(
-        "text-foreground [&_svg]:size-5! mb-1 h-12 rounded-md transition-all duration-300",
+        "studio-sidebar-link [&_svg]:size-[18px]! mb-1 h-11 rounded-md transition-colors duration-150",
+        isActive
+          ? "bg-sidebar-primary text-sidebar-primary-foreground hover:bg-sidebar-primary/90 hover:text-sidebar-primary-foreground"
+          : "text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
         collapsed ? "justify-center" : "justify-start",
         className,
       )}

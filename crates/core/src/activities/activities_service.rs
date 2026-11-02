@@ -4061,6 +4061,23 @@ impl ActivityServiceTrait for ActivityService {
         .await
     }
 
+    async fn prepare_internal_cash_transfer(
+        &self,
+        request: InternalTransferPairRequest,
+    ) -> Result<Vec<NewActivity>> {
+        if request.transfer_out_id.is_some() || request.transfer_in_id.is_some() {
+            return Err(Self::invalid_activity_data(
+                "creation does not accept existing leg ids",
+            ));
+        }
+        let values = self.validate_internal_pair_request(&request)?;
+        let mut prepared = Vec::new();
+        for activity in Self::build_internal_pair_create_request(&request, &values) {
+            prepared.push(self.prepare_new_activity(activity).await?);
+        }
+        Ok(prepared)
+    }
+
     async fn save_internal_transfer_pair(
         &self,
         request: InternalTransferPairRequest,

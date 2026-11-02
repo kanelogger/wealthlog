@@ -821,7 +821,7 @@ fn clear_splits_tx(tx: &mut DbWriteTx<'_>, activity_id: &str) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn upsert_completed_request_tx(
+pub(crate) fn upsert_completed_request_tx(
     tx: &mut DbWriteTx<'_>,
     ledger_id: &str,
     subject: &str,

@@ -587,12 +587,17 @@ export function CashActivityForm({
         className={cn(
           isMobile
             ? "rounded-t-4xl mx-1 flex h-[90vh] flex-col p-0"
-            : "flex w-full flex-col overflow-hidden sm:max-w-md",
+            : "cash-entry-sheet bg-card flex w-full flex-col overflow-hidden border-l sm:max-w-md",
         )}
       >
-        <SheetHeader className={cn(isMobile && "border-b px-6 py-4 text-center")}>
+        <SheetHeader
+          className={cn(
+            "md:border-border md:border-b md:pb-5",
+            isMobile && "border-b px-6 py-4 text-center",
+          )}
+        >
           <div className={cn(isMobile && "flex flex-col items-center space-y-2")}>
-            <SheetTitle>
+            <SheetTitle className="md:text-xl md:font-semibold md:tracking-tight">
               {isEditing ? t("spending:cashForm.editTitle") : t("spending:cashForm.addTitle")}
             </SheetTitle>
             {isMobileCreate && (
@@ -627,7 +632,7 @@ export function CashActivityForm({
             className={cn(
               isMobile
                 ? "flex min-h-0 flex-1 flex-col"
-                : "mt-6 min-h-0 flex-1 overflow-y-auto px-1 pb-1",
+                : "mt-5 min-h-0 flex-1 overflow-y-auto px-1 pb-1",
             )}
           >
             <div className={cn(isMobile && "flex-1 overflow-y-auto")}>
@@ -1038,7 +1043,7 @@ export function CashActivityForm({
                 </div>
               </SheetFooter>
             ) : (
-              <SheetFooter className="gap-2 pt-4">
+              <SheetFooter className="border-border mt-6 gap-2 border-t pt-5">
                 <Button
                   type="button"
                   variant="outline"

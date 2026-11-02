@@ -841,7 +841,9 @@ fn p_recon_complete_days_rederive_from_keyframes_and_surfaces() {
                                 (asset, p.quantity * split, alternative)
                             })
                             .collect(),
-                        snapshot.cash.iter().map(|(c, a)| (c, *a)).collect(),
+                        observed_cash(&pipeline, snapshot, day.date)
+                            .into_iter()
+                            .collect(),
                     )
                 };
                 if positions
@@ -894,6 +896,33 @@ fn p_recon_complete_days_rederive_from_keyframes_and_surfaces() {
     );
 }
 
+/// Independent cash reconstruction from canonical recorded transfers. A new
+/// observation includes all movements on its own date and resets the baseline.
+fn observed_cash<'a>(
+    pipeline: &'a Pipeline,
+    snapshot: &'a ObservedSnapshot,
+    day: NaiveDate,
+) -> BTreeMap<&'a Currency, Decimal> {
+    let mut cash: BTreeMap<_, _> = snapshot.cash.iter().map(|(c, a)| (c, *a)).collect();
+    for a in pipeline.facts().activities().iter().filter(|a| {
+        a.account == snapshot.account
+            && a.kind.is_transfer()
+            && !a.is_security_transfer
+            && a.date > snapshot.date
+            && a.date <= day
+    }) {
+        if let Some(amount) = a.amount {
+            let signed = if a.kind == ActivityKind::TransferIn {
+                amount.abs()
+            } else {
+                -amount.abs()
+            };
+            *cash.entry(&a.currency).or_default() += signed;
+        }
+    }
+    cash
+}
+
 /// A holdings snapshot valued on `day` from the public surfaces, by P-RECON's
 /// rule, in `currency`: its units carried across the recorded splits since
 /// (rules R1.5); `None` when a price or rate is missing, or a position is
@@ -933,23 +962,18 @@ fn value_snapshot(
             * multiplier
             * fx.rate(major, currency, day)?;
     }
-    for (bucket, amount) in &snapshot.cash {
+    for (bucket, amount) in observed_cash(pipeline, snapshot, day) {
         let (major, unit) = policy.normalize_currency(bucket.as_str());
-        total += *amount * unit * fx.rate(major, currency, day)?;
+        total += amount * unit * fx.rate(major, currency, day)?;
     }
     Some(total)
 }
 
-/// P-HOLD (rules R1.2): a holdings account's flows come only from its
-/// snapshots, which hold what it records. It has a flow only on a snapshot
-/// day after its first, and on every such day the net flow is the new
-/// snapshot's value less the previous snapshot's holdings at that day's
-/// prices, zero included: a deposit or transfer it records adds no flow of
-/// its own (EDGE-MIX-04, EDGE-MIX-05). Re-derived where the account currency
-/// is the base's, both snapshots are priced, and no split was adjusted for
-/// (EDGE-SPLIT-04).
+/// P-HOLD: observed securities stay manual. Cash transfer flows occur on
+/// their recorded dates; later snapshots reconcile against the cash carried
+/// forward, so a recorded transfer is never counted twice.
 #[test]
-fn p_hold_holdings_flows_come_from_snapshots() {
+fn p_hold_holdings_flows_reconcile_snapshots_and_live_cash_transfers() {
     let mut checked = 0usize;
     for scenario in corpus() {
         let pipeline = Pipeline::from_scenario(&scenario);
@@ -978,8 +1002,20 @@ fn p_hold_holdings_flows_come_from_snapshots() {
             for (index, row) in series.days.iter().enumerate() {
                 let id = format!("{}: P-HOLD {account} on {}", scenario.id, row.date);
                 let snapshot_day = snapshots.iter().any(|s| s.date == row.date);
+                let transfers: Vec<_> = pipeline
+                    .facts()
+                    .activities()
+                    .iter()
+                    .filter(|a| {
+                        a.account == *account
+                            && a.date == row.date
+                            && a.kind.is_transfer()
+                            && !a.is_security_transfer
+                    })
+                    .collect();
                 assert!(
-                    row.flow == DailyFlow::default() || (index > 0 && snapshot_day),
+                    row.flow == DailyFlow::default()
+                        || (index > 0 && (snapshot_day || !transfers.is_empty())),
                     "{id}: a flow without a snapshot ({:?})",
                     row.flow
                 );
@@ -1006,7 +1042,21 @@ fn p_hold_holdings_flows_come_from_snapshots() {
                     continue;
                 };
                 let net = row.flow.inflow_base - row.flow.outflow_base;
-                let moved = row.total_value_base - before;
+                let gross_today: Decimal = transfers
+                    .iter()
+                    .filter_map(|a| {
+                        let amount = a.amount?;
+                        let signed_gross = if a.kind == ActivityKind::TransferIn {
+                            amount.abs() + a.fee + a.tax
+                        } else {
+                            -amount.abs() + a.fee + a.tax
+                        };
+                        pipeline
+                            .fx()
+                            .convert(signed_gross, a.currency.as_str(), &base, row.date)
+                    })
+                    .sum();
+                let moved = row.total_value_base - before + gross_today;
                 assert!(
                     (net - moved).abs() <= DUST,
                     "{id}: net flow {net}, the snapshot moved {moved}"
@@ -1114,15 +1164,28 @@ fn p_agg_scope_aggregation_is_exact() {
         // outgoing takes away), by account and day: an outgoing leg whole,
         // an incoming one for what its sender gave (rules R2.1): priced at a
         // quote, in the share of units it gave; at cost, the cost it removed.
-        // A transfer with a holdings account is not a pair here: its side
-        // shows up in that account's snapshots.
+        // Live cash legs also cancel for holdings accounts; securities
+        // continue to enter through observed snapshots.
         let mut legs: BTreeMap<(&AccountId, NaiveDate), Decimal> = BTreeMap::new();
         for pair in effects.pairs.iter().filter(|pair| {
             pair.in_account != pair.out_account
                 && scope.contains(&pair.in_account)
                 && scope.contains(&pair.out_account)
-                && !holdings(&pair.in_account)
-                && !holdings(&pair.out_account)
+                && if pair.security {
+                    !holdings(&pair.in_account) && !holdings(&pair.out_account)
+                } else {
+                    [
+                        (&pair.in_account, &pair.transfer_in),
+                        (&pair.out_account, &pair.transfer_out),
+                    ]
+                    .iter()
+                    .all(|(account, source)| {
+                        !holdings(account)
+                            || by_source
+                                .get(source)
+                                .is_some_and(|event| event.flow.is_some())
+                    })
+                }
         }) {
             let leg = |source: &ActivityId| {
                 by_source

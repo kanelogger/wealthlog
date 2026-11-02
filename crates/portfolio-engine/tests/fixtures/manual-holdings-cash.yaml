@@ -1,0 +1,31 @@
+id: REG-HOLDINGS-CASH
+title: Manual securities with live cash transfers
+policy: { base_currency: CNY, timezone: Asia/Shanghai, as_of: 2026-11-02 }
+accounts:
+  - { id: bank, currency: CNY }
+  - { id: broker, currency: CNY, tracking_mode: HOLDINGS }
+assets:
+  - { id: stock, quote_ccy: CNY }
+activities:
+  - { id: deposit, account: bank, type: DEPOSIT, date: 2026-10-27, amount: 100000 }
+  - { id: out, account: bank, type: TRANSFER_OUT, date: 2026-10-29, amount: 5000, source_group_id: g1 }
+  - { id: tin, account: broker, type: TRANSFER_IN, date: 2026-10-29, amount: 5000, source_group_id: g1 }
+  - { id: pending, account: broker, type: TRANSFER_IN, date: 2026-10-29, amount: 700, status: PENDING }
+  - { id: tout, account: broker, type: TRANSFER_OUT, date: 2026-10-30, amount: 1000, source_group_id: g2 }
+  - { id: back, account: bank, type: TRANSFER_IN, date: 2026-10-30, amount: 1000, source_group_id: g2 }
+  - { id: after, account: broker, type: TRANSFER_IN, date: 2026-11-01, amount: 500, metadata: { flow: { is_external: true } } }
+  - { id: usd, account: broker, type: TRANSFER_IN, date: 2026-11-01, currency: USD, amount: 100, metadata: { flow: { is_external: true } } }
+  - { id: future, account: broker, type: TRANSFER_IN, date: 2026-11-03, amount: 900, metadata: { flow: { is_external: true } } }
+quotes:
+  - { asset: stock, day: 2026-10-27, close: 10 }
+fx_rates:
+  - { from: USD, to: CNY, day: 2026-10-27, rate: 7 }
+observed_snapshots:
+  - account: broker
+    date: 2026-10-27
+    positions: [{ asset: stock, quantity: 100, average_cost: 10 }]
+    cash: { CNY: 62002.17 }
+  - account: broker
+    date: 2026-10-31
+    positions: [{ asset: stock, quantity: 100, average_cost: 10 }]
+    cash: { CNY: 65000 }

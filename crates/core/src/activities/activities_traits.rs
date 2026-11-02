@@ -430,6 +430,17 @@ pub trait ActivityServiceTrait: Send + Sync {
         &self,
         request: UnlinkedTransfersRequest,
     ) -> Result<UnlinkedTransfers>;
+    /// Prepare a new internal cash pair without persisting either leg.
+    async fn prepare_internal_cash_transfer(
+        &self,
+        _request: InternalTransferPairRequest,
+    ) -> Result<Vec<NewActivity>> {
+        Err(crate::errors::Error::Validation(
+            crate::errors::ValidationError::InvalidInput(
+                "cash transfer preparation unavailable".into(),
+            ),
+        ))
+    }
     async fn save_internal_transfer_pair(
         &self,
         request: InternalTransferPairRequest,

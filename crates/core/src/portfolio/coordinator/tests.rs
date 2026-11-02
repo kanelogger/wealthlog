@@ -2936,3 +2936,96 @@ async fn valuation_totals_leave_the_async_worker_free() {
 
     assert!(gate.released_in_time(), "the read held the async worker");
 }
+
+/// Holdings cash reads and persisted valuation rows use the same baseline.
+#[tokio::test]
+async fn manual_holdings_cash_follows_transfers_and_resets_at_new_snapshots() {
+    let yaml = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../portfolio-engine/tests/fixtures/manual-holdings-cash.yaml"),
+    )
+    .unwrap();
+    let scenario: Scenario = serde_yaml::from_str(&yaml).unwrap();
+    let h = harness(scenario.facts()).await;
+    h.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    let snapshots = SnapshotService::new(
+        h.timezone.clone(),
+        h.account_repo.clone(),
+        h.snapshot_repo.clone(),
+        h.activity_repo.clone(),
+    );
+    for (date, expected) in [
+        ("2026-10-29", dec!(67002.17)),
+        ("2026-10-30", dec!(66002.17)),
+        ("2026-10-31", dec!(65000)),
+        ("2026-11-02", dec!(65500)),
+    ] {
+        let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+        let read = snapshots
+            .get_latest_snapshots_as_of(&["broker".into()], day)
+            .unwrap()
+            .remove("broker")
+            .unwrap();
+        assert_eq!(read.cash_balances["CNY"], expected, "{date}");
+        assert_eq!(read.positions["stock"].quantity, dec!(100));
+    }
+    let latest = snapshots
+        .get_latest_holdings_snapshot("broker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.cash_balances["CNY"], dec!(65500));
+    assert_eq!(latest.cash_balances["USD"], dec!(100));
+    // Reads never mutate the stored baseline or compound on repeated reads.
+    assert_eq!(
+        snapshots
+            .get_latest_holdings_snapshot("broker")
+            .unwrap()
+            .unwrap()
+            .cash_balances,
+        latest.cash_balances
+    );
+    let rows = h.rows("broker");
+    assert_eq!(
+        rows.iter()
+            .find(|d| d.valuation_date.to_string() == "2026-10-29")
+            .unwrap()
+            .cash_balance,
+        dec!(67002.17)
+    );
+    assert_eq!(rows.last().unwrap().cash_balance, dec!(66200));
+    let (history, _) = scope_reads(&h, &["bank".into(), "broker".into()]).await;
+    let history = history.unwrap();
+    let before = history
+        .iter()
+        .find(|d| d.valuation_date.to_string() == "2026-10-28")
+        .unwrap();
+    let after = history
+        .iter()
+        .find(|d| d.valuation_date.to_string() == "2026-10-29")
+        .unwrap();
+    assert_eq!(before.total_value, after.total_value);
+    assert_eq!(after.external_inflow_base, dec!(0));
+    assert_eq!(after.external_outflow_base, dec!(0));
+    let mut transfer = h
+        .activity_repo
+        .all()
+        .into_iter()
+        .find(|a| a.id == "tin")
+        .unwrap();
+    h.activity_repo
+        .apply(Vec::new(), Vec::new(), &["tin".into()]);
+    let transfer_day = chrono::NaiveDate::from_ymd_opt(2026, 10, 29).unwrap();
+    let cash_on_transfer_day = || {
+        snapshots
+            .get_latest_snapshots_as_of(&["broker".into()], transfer_day)
+            .unwrap()["broker"]
+            .cash_balances["CNY"]
+    };
+    assert_eq!(cash_on_transfer_day(), dec!(62002.17));
+    transfer.amount = Some(dec!(3000));
+    h.activity_repo.apply(vec![transfer], Vec::new(), &[]);
+    assert_eq!(cash_on_transfer_day(), dec!(65002.17));
+}

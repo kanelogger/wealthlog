@@ -13,8 +13,10 @@ const required = [
   "VERSION",
   "references/connection.md",
   "references/operations.md",
+  "references/portfolio.md",
   "scripts/wealthlog_date.py",
   "scripts/wealthlog_snapshot.py",
+  "scripts/wealthlog_portfolio.py",
 ];
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 

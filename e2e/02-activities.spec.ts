@@ -521,7 +521,9 @@ test.describe("Activity Creation Tests", () => {
     const targetRow = row.first();
     await expect(targetRow).toBeVisible({ timeout: 10000 });
     const dialog = page.getByRole("dialog", { name: "更新活动" });
-    await targetRow.getByRole("button", { name: t("activity:open_menu"), exact: true }).press("Enter");
+    await targetRow
+      .getByRole("button", { name: t("activity:open_menu"), exact: true })
+      .press("Enter");
     const editItem = page.getByRole("menuitem", { name: t("common:edit"), exact: true });
     await expect(editItem).toBeVisible();
     await page.keyboard.press("ArrowDown");
@@ -581,9 +583,9 @@ test.describe("Activity Creation Tests", () => {
 
     await completeOnboardingIfNeeded(page);
 
-    // Navigate to dashboard to confirm app is ready
-    await gotoAppPath(page, "/dashboard");
-    await expect(page.getByTestId("portfolio-balance-value")).toBeVisible({ timeout: 30000 });
+    // Navigate to activities to confirm app is ready
+    await gotoAppPath(page, "/activities");
+    await expect(page).toHaveURL(/\/activities/);
   });
 
   test("2. Create test accounts", async () => {

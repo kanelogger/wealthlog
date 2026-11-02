@@ -22,6 +22,11 @@ use crate::model::*;
 use crate::project::{in_position_currency, lot_records, position_book_cost, QUANTITY_THRESHOLD};
 use crate::resolve::{FxResolver, ResolvedSurfaces};
 
+/// Cash transfers change manual-account cash; security transfers do not.
+fn cash_transfer(event: &EconomicEvent) -> bool {
+    event.kind.is_transfer() && !matches!(event.action, Action::SecurityTransfer { .. })
+}
+
 /// A quote or FX rate carried at least this many days is reported once per
 /// account and asset or pair.
 const CARRIED_INFO_DAYS: i64 = 7;
@@ -184,13 +189,37 @@ fn value_series(
             days.push(valuer.value_day(&keyframes[active], day));
         }
 
-        // Flows: a holdings account's come only from its snapshots, which
-        // already hold what it records (a deposit recorded between two
-        // snapshots would count twice); any other's from its activity map,
-        // then fallbacks.
+        // Holdings keep observed securities, but cash transfers after the
+        // opening observation are live. Other activity types remain manual.
         if account.tracking == TrackingMode::Holdings {
-            if let Some(first) = days.first_mut() {
-                first.flow = DailyFlow::default();
+            let sources: BTreeSet<_> = resolved
+                .ledger
+                .events
+                .iter()
+                .filter(|event| cash_transfer(event) && event.account == *account_id)
+                .map(|event| &event.source)
+                .collect();
+            let mut flows = BTreeMap::new();
+            for event in effects
+                .events
+                .iter()
+                .filter(|event| event.account == *account_id && sources.contains(&event.source))
+            {
+                if let Some(flow) = event.flow {
+                    add_flow(
+                        &mut flows,
+                        event.date,
+                        flow.amount,
+                        flow.outflow,
+                        flow.source,
+                    );
+                }
+            }
+            stamp_flows(&mut days, &flows);
+            if seed.is_none() {
+                if let Some(first) = days.first_mut() {
+                    first.flow = DailyFlow::default();
+                }
             }
         } else {
             let flows = scope_flows(
@@ -826,7 +855,20 @@ impl<'a> Valuer<'a> {
 
         // Cash.
         let mut cash = Decimal::ZERO;
-        for (currency, amount) in &keyframe.cash {
+        let mut cash_balances = keyframe.cash.clone();
+        if keyframe.observed {
+            for event in self.resolved.ledger.events.iter().filter(|event| {
+                event.account == self.account
+                    && cash_transfer(event)
+                    && event.date > keyframe.date
+                    && event.date <= day
+            }) {
+                if let Some(effect) = &event.cash {
+                    *cash_balances.entry(event.currency.clone()).or_default() += effect.amount;
+                }
+            }
+        }
+        for (currency, amount) in &cash_balances {
             let (major, factor) = policy.normalize_currency(currency.as_str());
             let rate = if major == account_currency {
                 Some(Decimal::ONE)
@@ -1298,11 +1340,9 @@ impl<'a> Valuer<'a> {
             if prev_at_curr.value_status != ValueStatus::Complete
                 || days[index].value_status != ValueStatus::Complete
             {
-                days[index].flow = DailyFlow {
-                    inflow_base: Decimal::ZERO,
-                    outflow_base: Decimal::ZERO,
-                    source: FlowSource::UnpricedHoldingsTransition,
-                };
+                // Keep known cash legs even when securities prevent pricing
+                // the remaining snapshot reconciliation.
+                days[index].flow.source = FlowSource::UnpricedHoldingsTransition;
                 continue;
             }
             let flow = days[index].total_value_base - prev_at_curr.total_value_base;
@@ -1310,11 +1350,12 @@ impl<'a> Valuer<'a> {
                 continue;
             }
             let (inflow, outflow) = split_flow(flow);
-            days[index].flow = DailyFlow {
-                inflow_base: inflow,
-                outflow_base: outflow,
-                source: FlowSource::QuoteDerivedMarketValue,
-            };
+            days[index].flow.inflow_base += inflow;
+            days[index].flow.outflow_base += outflow;
+            days[index].flow.source = days[index]
+                .flow
+                .source
+                .combine(FlowSource::QuoteDerivedMarketValue);
         }
     }
 }
@@ -1521,6 +1562,18 @@ fn priced_events(
         let flow = match &event.flow.boundary {
             Boundary::None => None,
             _ if !in_range => None,
+            _ if cash_transfer(event)
+                && facts
+                    .accounts
+                    .get(&event.account)
+                    .is_some_and(|a| a.tracking == TrackingMode::Holdings)
+                && !facts
+                    .observed_snapshots
+                    .iter()
+                    .any(|s| s.account == event.account && s.date < event.date) =>
+            {
+                None
+            }
             boundary => {
                 let priced_as = if *boundary == Boundary::Unknown {
                     ScopeBoundary::Unknown
@@ -1733,9 +1786,8 @@ fn internal_adjustments<'a>(
         .iter()
         .map(|event| (event.source.as_str(), event))
         .collect();
-    // A holdings account's flows come from its snapshots, not its legs: a
-    // transfer with one is not netted as a pair, its side shows up in that
-    // account's next snapshot (the same day, or in transit until then).
+    // Cash legs after a holdings account's opening snapshot are live and
+    // cancel at portfolio scope. Security legs still belong to snapshots.
     let holdings = |id: &AccountId| {
         effects
             .account(id)
@@ -1746,8 +1798,21 @@ fn internal_adjustments<'a>(
         pair.in_account != pair.out_account
             && scope.contains(&pair.in_account)
             && scope.contains(&pair.out_account)
-            && !holdings(&pair.in_account)
-            && !holdings(&pair.out_account)
+            && if pair.security {
+                !holdings(&pair.in_account) && !holdings(&pair.out_account)
+            } else {
+                [
+                    (&pair.in_account, &pair.transfer_in),
+                    (&pair.out_account, &pair.transfer_out),
+                ]
+                .iter()
+                .all(|(account, source)| {
+                    !holdings(account)
+                        || by_source
+                            .get(source.as_str())
+                            .is_some_and(|event| event.flow.is_some())
+                })
+            }
     }) {
         // Both legs, wherever the window cuts: the share depends on the pair,
         // and only the legs inside the window are netted.

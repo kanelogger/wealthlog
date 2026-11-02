@@ -37,7 +37,7 @@ const SUN_PATH_CAPACITY: usize = 108;
 
 const INSTRUCTIONS: &str = "Read access to the user's Wealthlog portfolio: accounts, \
 holdings, valuations, performance, activities, income, health, and classifications, plus \
-non-persisting draft and suggestion tools. Ordinary income/expense create and update are \
+non-persisting draft and suggestion tools. Cash transfer recording requires transfers:write; manual securities trades and snapshot patches require holdings:write. They record local ledger facts, never bank payments or brokerage orders. Read get_investment_account_state first for stateVersion. Ordinary income/expense create and update are \
 available when the token holds ordinary:write; they write posted activities directly under \
 request replay. Other formal writes are unavailable. Tool visibility depends on the scopes \
 granted to the access token in use. The service stays available while the main window is \

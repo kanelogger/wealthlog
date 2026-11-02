@@ -63,9 +63,9 @@ import { BulkHoldingsModal } from "@/pages/activity/components/forms/bulk-holdin
 import { MobileActivityForm } from "@/pages/activity/components/mobile-forms/mobile-activity-form";
 import { useActivityActionDialogs } from "@/pages/activity/hooks/use-activity-action-dialogs";
 import { useActivitySearch } from "@/pages/activity/hooks/use-activity-search";
-import { PortfolioUpdateTrigger } from "@/pages/dashboard/portfolio-update-trigger";
+import { PortfolioUpdateTrigger } from "@/components/portfolio/portfolio-update-trigger";
 import { HoldingsEditMode } from "@/pages/holdings/components/holdings-edit-mode";
-import { useCalculatePerformanceHistory } from "@/pages/performance/hooks/use-performance-data";
+import { useCalculatePerformanceHistory } from "@/hooks/use-performance-data";
 import { useQuery } from "@tanstack/react-query";
 import type { SortingState } from "@tanstack/react-table";
 import { Icons, type Icon } from "@wealthfolio/ui";
@@ -683,7 +683,7 @@ const AccountPage = () => {
   );
 
   const accountDetailsContent = (
-    <div className="space-y-4">
+    <div className="studio-account-details border-border space-y-5 border-t pt-5">
       {(accountDetailTabs.length > 1 || activeAccountDetailTab === "activities") && (
         <div className="flex items-center justify-between gap-2 sm:gap-3">
           {accountDetailTabs.length > 1 ? (
@@ -736,7 +736,7 @@ const AccountPage = () => {
   );
 
   return (
-    <Page>
+    <Page className="studio-account-page">
       <PageHeader
         onBack={() => navigate(-1)}
         actions={
@@ -814,7 +814,7 @@ const AccountPage = () => {
         <div className="flex items-center gap-2" data-tauri-drag-region="true">
           {/* Tracking mode avatar */}
           {account && (
-            <div className="bg-primary/10 dark:bg-primary/20 flex size-9 shrink-0 items-center justify-center rounded-full">
+            <div className="border-border bg-secondary/60 flex size-9 shrink-0 items-center justify-center rounded-lg border">
               {account.trackingMode === "HOLDINGS" ? (
                 <Icons.Holdings className="text-primary h-5 w-5" />
               ) : (
@@ -844,7 +844,7 @@ const AccountPage = () => {
                             </span>
                           </>
                         ) : null}
-                        <span className="truncate text-base font-semibold leading-tight md:text-lg">
+                        <span className="truncate text-base font-semibold leading-tight md:text-xl">
                           {account?.name ?? t("account:account")}
                         </span>
                         <Icons.ChevronDown className="text-muted-foreground size-5 shrink-0" />
@@ -967,12 +967,12 @@ const AccountPage = () => {
           </div>
         </div>
       </PageHeader>
-      <PageContent>
+      <PageContent className="md:px-6 lg:px-8">
         {hasHoldings && !isHoldingsLoading ? (
           <>
-            <div className="grid grid-cols-1 gap-4 pt-0 md:grid-cols-3">
-              <Card className="col-span-1 md:col-span-2">
-                <CardHeader className="flex flex-row items-center justify-between space-y-0">
+            <div className="studio-account-overview grid grid-cols-1 gap-5 pt-0 md:grid-cols-3 xl:grid-cols-[minmax(0,1fr)_304px]">
+              <Card className="border-border col-span-1 min-w-0 rounded-lg shadow-none md:col-span-2 xl:col-span-1">
+                <CardHeader className="flex flex-row items-start justify-between gap-4 space-y-0 pb-2">
                   <CardTitle className="text-md">
                     <PortfolioUpdateTrigger
                       lastCalculatedAt={displayedSourceDataAsOf}
@@ -980,7 +980,7 @@ const AccountPage = () => {
                     >
                       <div className="flex items-start gap-2">
                         <div>
-                          <p className="pt-3 text-xl font-bold">
+                          <p className="pt-1 text-3xl font-medium tabular-nums leading-tight tracking-tight xl:text-4xl">
                             {isCurrentValuationLoading ? (
                               <Skeleton className="h-8 w-36" />
                             ) : isCurrentValuationUnavailable ? (
@@ -995,14 +995,14 @@ const AccountPage = () => {
                             )}
                           </p>
                           {!hasPerformanceError && (
-                            <div className="flex items-center gap-2 text-sm">
+                            <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                               {gainLossAmountToDisplay == null ? (
-                                <span className="text-muted-foreground text-sm font-light">
+                                <span className="text-muted-foreground text-sm">
                                   {t("account:not_available")}
                                 </span>
                               ) : (
                                 <GainAmount
-                                  className="text-sm font-light"
+                                  className="text-sm font-medium"
                                   value={gainLossAmountToDisplay}
                                   currency={gainLossCurrencyToDisplay}
                                   displayCurrency={showGainLossCurrency}
@@ -1025,7 +1025,7 @@ const AccountPage = () => {
                       </div>
                     </PortfolioUpdateTrigger>
                   </CardTitle>
-                  <div className="-mt-3 flex items-center gap-1 self-start">
+                  <div className="flex shrink-0 items-center gap-1 self-start">
                     <PrivacyToggle />
                     <TooltipProvider>
                       <Tooltip>
@@ -1056,7 +1056,7 @@ const AccountPage = () => {
                 <CardContent className="p-0">
                   <div className="w-full p-0">
                     <div className="flex w-full flex-col">
-                      <div className="h-120 w-full">
+                      <div className="h-96 w-full xl:h-[26rem]">
                         <HistoryChart
                           data={chartData}
                           isLoading={false}
@@ -1086,12 +1086,12 @@ const AccountPage = () => {
                 </CardContent>
               </Card>
 
-              <div className="flex min-h-0 flex-col gap-4">
+              <div className="flex min-h-0 min-w-0 flex-col gap-5">
                 <AccountMetrics
                   valuation={metricsValuation}
                   performance={accountPerformance}
                   cashCurrencySplit={liveCurrentValuation?.summary.cashCurrencySplit}
-                  className="min-h-0 grow"
+                  className="border-border min-h-0 grow rounded-lg shadow-none"
                   compact={false}
                   isLoading={isLoading}
                   isPerformanceLoading={isPerformanceHistoryLoading}
@@ -1140,8 +1140,11 @@ const AccountPage = () => {
       {/* Holdings Edit Mode Sheet for manual HOLDINGS-mode accounts */}
       {account && canEditHoldingsDirectly && (
         <Sheet open={isEditingHoldings} onOpenChange={setIsEditingHoldings}>
-          <SheetContent side="right" className="flex h-full w-full flex-col p-0 sm:max-w-2xl">
-            <SheetHeader className="border-b px-6 py-4">
+          <SheetContent
+            side="right"
+            className="bg-card flex h-full w-full flex-col p-0 sm:max-w-2xl"
+          >
+            <SheetHeader className="bg-muted/40 border-b px-6 py-5">
               <SheetTitle>{t("account:update_holdings_title")}</SheetTitle>
               <SheetDescription>
                 {t("account:update_holdings_desc", { name: account.name })}

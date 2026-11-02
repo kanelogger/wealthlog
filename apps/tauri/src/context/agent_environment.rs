@@ -48,6 +48,7 @@ pub struct TauriAgentEnvironment {
 
     business: Arc<wealthfolio_business::BusinessService>,
     pending: Arc<wealthfolio_business::PendingService>,
+    investments: Option<Arc<wealthfolio_business::investments::InvestmentService>>,
 }
 
 impl TauriAgentEnvironment {
@@ -104,7 +105,16 @@ impl TauriAgentEnvironment {
 
             business,
             pending,
+            investments: None,
         }
+    }
+
+    pub fn with_investments(
+        mut self,
+        service: Arc<wealthfolio_business::investments::InvestmentService>,
+    ) -> Self {
+        self.investments = Some(service);
+        self
     }
 }
 
@@ -182,6 +192,12 @@ impl AgentEnvironment for TauriAgentEnvironment {
 
     fn business_service(&self) -> Option<Arc<wealthfolio_business::BusinessService>> {
         Some(self.business.clone())
+    }
+
+    fn investment_service(
+        &self,
+    ) -> Option<Arc<wealthfolio_business::investments::InvestmentService>> {
+        self.investments.clone()
     }
 
     fn pending_service(&self) -> Option<Arc<wealthfolio_business::PendingService>> {

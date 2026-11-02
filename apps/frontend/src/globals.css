@@ -1,5 +1,6 @@
 @import "tailwindcss";
 @import "tw-animate-css";
+@import "./styles/studio-shell.css";
 @plugin "@tailwindcss/typography";
 @source "../../../packages/ui/src";
 /* Fonts - using variable fonts where available for best performance */
@@ -58,8 +59,12 @@
 
 @theme {
   /* Font families */
-  --font-sans: "Inter Variable", "Inter", ui-sans-serif, system-ui, sans-serif;
-  --font-serif: "Merriweather", ui-serif, Georgia, Cambria, "Times New Roman", Times, serif;
+  --font-sans:
+    "Inter Variable", "Inter", -apple-system, BlinkMacSystemFont, "PingFang SC", ui-sans-serif,
+    system-ui, sans-serif;
+  --font-serif:
+    "Merriweather", "Songti SC", "Noto Serif SC", ui-serif, Georgia, Cambria, "Times New Roman",
+    Times, serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 
   /* Disable default colors to prevent their use; feel free to re-enable as needed. */
@@ -359,9 +364,9 @@
   --color-purple-950: #1a1623;
 
   /* Custom sizes */
-  --spacing-sidebar: 220px;
+  --spacing-sidebar: 196px;
   --spacing-sidebar-collapsed: 70px;
-  --grid-template-columns-sidebar: 200px auto;
+  --grid-template-columns-sidebar: 196px auto;
   --grid-template-columns-sidebar-collapsed: 70px auto;
 }
 
@@ -369,7 +374,7 @@
   /* Connect login brand: sage, with its existing dark-mode counterpart. */
   --connect-brand: #6b7256;
   /* Base radius - desktop default */
-  --radius: 0.625rem;
+  --radius: 0.4375rem;
 
   /* Input heights - desktop default */
   --input-height: 2.75rem; /* h-11 */
@@ -404,55 +409,55 @@
   --flexoki-ye: 45 99% 34%;
   --flexoki-bl: 214 67% 39%;
 
-  /* Shadcn tokens as full HSL colors */
-  --background: hsl(var(--flexoki-bg));
-  --foreground: hsl(var(--flexoki-tx));
-  --card: hsl(var(--flexoki-bg-2));
-  --card-foreground: hsl(var(--flexoki-tx));
-  --popover: hsl(var(--flexoki-bg-2));
-  --popover-foreground: hsl(var(--flexoki-tx));
-  --primary: hsl(var(--flexoki-tx));
-  --primary-foreground: hsl(var(--flexoki-bg));
-  --secondary: hsl(var(--flexoki-ui-2));
-  --secondary-foreground: hsl(var(--flexoki-tx-2));
-  --muted: hsl(var(--flexoki-ui));
-  --muted-foreground: hsl(var(--flexoki-tx-2));
-  --accent: hsl(var(--flexoki-ui));
-  --accent-foreground: hsl(var(--flexoki-tx-2));
-  --destructive: hsl(var(--flexoki-re));
-  --destructive-foreground: hsl(var(--flexoki-bg));
-  --success: hsl(var(--flexoki-gr));
-  --success-foreground: hsl(var(--flexoki-bg));
-  --warning: hsl(var(--flexoki-ye));
-  --warning-foreground: hsl(var(--flexoki-bg));
-  --info: hsl(var(--flexoki-bl));
-  --info-foreground: hsl(var(--flexoki-bg));
-  --border: hsl(var(--flexoki-ui));
-  --input: hsl(var(--flexoki-ui));
-  --input-bg: hsl(var(--flexoki-bg));
-  --ring: hsl(var(--flexoki-ui-3));
+  /* Studio B semantic palette; settings continue to choose the active theme. */
+  --background: #fcfaf7;
+  --foreground: #292624;
+  --card: #fcfaf7;
+  --card-foreground: #292624;
+  --popover: #fffdf9;
+  --popover-foreground: #292624;
+  --primary: #7b2637;
+  --primary-foreground: #ffffff;
+  --secondary: #f0ebe5;
+  --secondary-foreground: #62594f;
+  --muted: #f0ebe5;
+  --muted-foreground: #6b625d;
+  --accent: #f2e5e6;
+  --accent-foreground: #6e2636;
+  --destructive: #a44b37;
+  --destructive-foreground: #ffffff;
+  --success: #287354;
+  --success-foreground: #ffffff;
+  --warning: #8c6518;
+  --warning-foreground: #ffffff;
+  --info: #396786;
+  --info-foreground: #ffffff;
+  --border: #e2dbd2;
+  --input: #cfc3b8;
+  --input-bg: #fcfaf7;
+  --ring: #9a4b5a;
 
-  /* Charts (allocation palette: forest / sage / sand / clay / plum + stone) */
-  --chart-1: #355c4c;
-  --chart-2: #7e9f8c;
-  --chart-3: #cbba8c;
-  --chart-4: #c08a5f;
-  --chart-5: #9a7e92;
-  --chart-6: hsl(49 7% 70%);
-  --chart-7: hsl(55 10% 79%);
-  --chart-8: hsl(50 14% 83%);
-  --chart-9: hsl(51 21% 88%);
+  /* Allocation colours; positive/negative values keep separate semantic colours. */
+  --chart-1: #7b2637;
+  --chart-2: #b58c95;
+  --chart-3: #c7b697;
+  --chart-4: #b18467;
+  --chart-5: #778c80;
+  --chart-6: #8c8796;
+  --chart-7: #a39485;
+  --chart-8: #c4b8a9;
+  --chart-9: #ded4c7;
   --chart-stone: #b1aa9a;
 
-  /* Sidebar (full hsl colors) */
-  --sidebar: hsl(var(--flexoki-bg));
-  --sidebar-foreground: hsl(var(--flexoki-tx));
-  --sidebar-primary: hsl(var(--flexoki-tx));
-  --sidebar-primary-foreground: hsl(var(--flexoki-bg));
-  --sidebar-accent: hsl(var(--flexoki-ui));
-  --sidebar-accent-foreground: hsl(var(--flexoki-tx-2));
-  --sidebar-border: hsl(var(--flexoki-ui));
-  --sidebar-ring: hsl(var(--flexoki-ui-3));
+  /* Persistent charcoal navigation in the light theme. */
+  --sidebar: #262321;
+  --sidebar-foreground: #f3ece4;
+  --sidebar-primary: #f2e5e6;
+  --sidebar-primary-foreground: #6e2636;
+  --sidebar-accent: #3c3430;
+  --sidebar-accent-foreground: #fff8ef;
+  --sidebar-border: #453b35;
+  --sidebar-ring: #c9a4aa;
 
   --liquid-glass-bg: rgba(255, 255, 255, 0.05);
   --liquid-glass-border: rgba(255, 255, 255, 0.1);
@@ -470,9 +475,9 @@
   --mobile-nav-total-offset: calc(var(--mobile-nav-ui-height) + var(--mobile-nav-bottom-offset));
 
   /* Sonner toast overrides - solid backgrounds for better readability */
-  --toast-bg: hsl(var(--flexoki-bg-2));
-  --toast-fg: hsl(var(--flexoki-tx));
-  --toast-border: hsl(var(--flexoki-ui-2));
+  --toast-bg: var(--popover);
+  --toast-fg: var(--foreground);
+  --toast-border: var(--border);
   --toast-success-bg: var(--color-green-50);
   --toast-success-fg: var(--color-green-700);
   --toast-success-border: var(--color-green-200);
@@ -506,7 +511,7 @@
   /* Dark chart palette — same semantic hues as light (forest / sage / sand /
      clay / plum + stone), tuned for the dark surface: forest is lifted for
      contrast, the stones are pulled down so they stay calm instead of glaring. */
-  --chart-1: hsl(156 28% 44%);
+  --chart-1: #d397a5;
   --chart-2: #7e9f8c;
   --chart-3: #cbba8c;
   --chart-4: #c08a5f;
@@ -518,9 +523,9 @@
   --chart-stone: hsl(49 8% 60%);
 
   /* Sonner toast overrides for dark mode - solid backgrounds for better readability */
-  --toast-bg: hsl(var(--flexoki-bg-2));
-  --toast-fg: hsl(var(--flexoki-tx));
-  --toast-border: hsl(var(--flexoki-ui-2));
+  --toast-bg: var(--popover);
+  --toast-fg: var(--foreground);
+  --toast-border: var(--border);
   --toast-success-bg: var(--color-green-950);
   --toast-success-fg: var(--color-green-100);
   --toast-success-border: var(--color-green-800);
@@ -534,7 +539,40 @@
   --toast-info-fg: var(--color-blue-200);
   --toast-info-border: var(--color-blue-800);
 
-  --input: hsl(var(--flexoki-ui-2));
+  --input: #65564b;
+  --background: #211f1e;
+  --foreground: #efe9e3;
+  --card: #282422;
+  --card-foreground: #efe9e3;
+  --popover: #302a27;
+  --popover-foreground: #efe9e3;
+  --primary: #d397a5;
+  --primary-foreground: #2c1720;
+  --secondary: #37302c;
+  --secondary-foreground: #e3d7ce;
+  --muted: #332d29;
+  --muted-foreground: #beb0a6;
+  --accent: #49313a;
+  --accent-foreground: #f3d4dc;
+  --destructive: #e69a87;
+  --destructive-foreground: #2e1711;
+  --success: #78b793;
+  --success-foreground: #14241a;
+  --warning: #d7b574;
+  --warning-foreground: #2d2312;
+  --info: #8db7d0;
+  --info-foreground: #172a37;
+  --border: #493f38;
+  --input-bg: #282422;
+  --ring: #d397a5;
+  --sidebar: #191716;
+  --sidebar-foreground: #eee4dc;
+  --sidebar-primary: #49313a;
+  --sidebar-primary-foreground: #f3d4dc;
+  --sidebar-accent: #302925;
+  --sidebar-accent-foreground: #f3ece4;
+  --sidebar-border: #3f352e;
+  --sidebar-ring: #d397a5;
 }
 
 @layer base {

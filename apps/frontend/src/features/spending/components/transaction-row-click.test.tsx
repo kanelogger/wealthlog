@@ -154,6 +154,8 @@ describe("TransactionRow click to edit", () => {
     await userEvent.click(cells[0]);
     await userEvent.click(cells[cells.length - 1]);
     await userEvent.click(screen.getByRole("button", { name: /Restaurants/ }));
+    // Dismiss the modal category popover before testing the next independent control.
+    await userEvent.keyboard("{Escape}");
     await userEvent.click(screen.getByRole("button", { name: /Lisbon trip/ }));
 
     expect(onToggleSelect).toHaveBeenCalledTimes(1);

@@ -46,3 +46,25 @@ fn help_and_version_keep_their_normal_output() {
     assert_eq!(version.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&version.stdout).starts_with("wealthlog "));
 }
+
+#[test]
+fn portfolio_commands_are_discoverable_and_require_explicit_input() {
+    for args in [vec!["holdings", "--help"], vec!["transfers", "--help"]] {
+        let out = wealthlog().args(args).output().unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Commands:"));
+    }
+    for args in [
+        vec!["holdings", "trade"],
+        vec!["holdings", "patch"],
+        vec!["transfers", "create"],
+    ] {
+        let out = wealthlog().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--input"));
+    }
+}

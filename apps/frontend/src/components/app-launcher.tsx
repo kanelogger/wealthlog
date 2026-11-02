@@ -582,13 +582,20 @@ export function AppLauncher() {
   });
 
   // Filter recent items based on search (only show when searching or when no search)
-  const filteredRecent = recentItems.filter((item) => {
+  const availableRecent = recentItems.filter(
+    (item) =>
+      item.type !== "action" ||
+      !/^\/(dashboard|insights|net-worth|performance|income|allocation-targets|spending\/(insights|budget))(?:[/?#]|$)/.test(
+        item.id,
+      ),
+  );
+  const filteredRecent = availableRecent.filter((item) => {
     if (!searchLower) return true;
     return item.label.toLowerCase().includes(searchLower);
   });
 
   // Show recent items only when there's no search, or when searching and they match
-  const showRecent = !searchLower ? recentItems.length > 0 : filteredRecent.length > 0;
+  const showRecent = filteredRecent.length > 0;
 
   const hasResults =
     filteredActions.length > 0 ||
@@ -618,7 +625,7 @@ export function AppLauncher() {
         {!hasResults && <CommandEmpty>{t("common:component.no_matches_found")}</CommandEmpty>}
         {showRecent && (
           <CommandGroup heading={t("common:component.recent")}>
-            {(searchLower ? filteredRecent : recentItems).map((item) => {
+            {filteredRecent.map((item) => {
               const getRecentIcon = () => {
                 switch (item.type) {
                   case "holding":

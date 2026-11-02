@@ -72,7 +72,7 @@ describe("QuickCategorizePopover inside a sheet", () => {
       expect(wheel.defaultPrevented).toBe(false);
     });
 
-    await user.click(screen.getByRole("option", { name: "Category 29", exact: true }));
+    await user.click(screen.getByRole("option", { name: "Category 29" }));
     expect(onSelect).toHaveBeenCalledWith("spending_categories", "category-29");
     expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     expect(screen.getByRole("dialog", { name: "Transaction" })).toBeInTheDocument();

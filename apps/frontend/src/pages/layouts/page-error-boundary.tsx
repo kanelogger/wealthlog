@@ -10,12 +10,12 @@ import { useLocation, useNavigate } from "react-router-dom";
 export function PageErrorBoundary({ children }: { children: ReactNode }) {
   const { key, pathname, search } = useLocation();
   const navigate = useNavigate();
-  const onDashboard = (pathname === "/" || pathname === "/dashboard") && !search;
+  const onHome = (pathname === "/" || pathname === "/activities") && !search;
   return (
     <ErrorBoundary
       variant="page"
       resetKey={key}
-      onGoHome={onDashboard ? undefined : () => navigate("/")}
+      onGoHome={onHome ? undefined : () => navigate("/activities")}
     >
       {children}
     </ErrorBoundary>

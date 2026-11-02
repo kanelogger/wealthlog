@@ -22,18 +22,11 @@ function buildStaticNavigation(t: TFunction): NavigationProps {
   return {
     primary: [
       {
-        icon: <Icons.Dashboard className="size-6" />,
-        title: t("common:dashboard"),
-        href: "/dashboard",
-        keywords: ["home", "overview", "summary"],
-        label: t("common:nav.label_dashboard"),
-      },
-      {
-        icon: <Icons.Insight className="size-6" />,
-        title: t("common:insights"),
-        href: "/insights",
-        keywords: ["insights", "Analytics"],
-        label: t("common:nav.label_insights"),
+        icon: <Icons.Activity className="size-6" />,
+        title: t("common:activities"),
+        href: "/activities",
+        keywords: ["transactions", "trades", "history"],
+        label: t("common:nav.label_activities"),
       },
       {
         icon: <Icons.Holdings className="size-6" />,
@@ -41,13 +34,6 @@ function buildStaticNavigation(t: TFunction): NavigationProps {
         href: "/holdings",
         keywords: ["Holdings", "portfolio", "assets", "positions", "stocks"],
         label: t("common:nav.label_holdings"),
-      },
-      {
-        icon: <Icons.Activity className="size-6" />,
-        title: t("common:activities"),
-        href: "/activities",
-        keywords: ["transactions", "trades", "history"],
-        label: t("common:nav.label_activities"),
       },
     ],
     secondary: [
@@ -84,13 +70,6 @@ export function isPathActive(pathname: string, href: string): boolean {
 
   if (normalizedHref === "/") {
     return normalizedPath === "/";
-  }
-
-  // Dashboard and Net Worth are grouped together
-  if (normalizedHref === "/dashboard") {
-    return (
-      normalizedPath === "/" || normalizedPath === "/dashboard" || normalizedPath === "/net-worth"
-    );
   }
 
   return normalizedPath === normalizedHref || normalizedPath.startsWith(`${normalizedHref}/`);

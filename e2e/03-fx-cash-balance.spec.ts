@@ -236,8 +236,8 @@ test.describe("FX Cash Balance - Cross-currency Buy", () => {
   test("5. Verify cash balance on account page", async () => {
     test.setTimeout(120000);
 
-    // Navigate to dashboard first to trigger any sync/recalculation
-    await gotoAppPath(page, "/dashboard");
+    // Navigate to activities before opening accounts
+    await gotoAppPath(page, "/activities");
     await page.waitForTimeout(3000);
 
     // Navigate to accounts list

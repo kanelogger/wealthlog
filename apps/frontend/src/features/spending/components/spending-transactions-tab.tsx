@@ -1113,7 +1113,7 @@ export const SpendingTransactionsTab = forwardRef<SpendingTransactionsTabHandle>
     }, [editingActivity]);
 
     return (
-      <div className="space-y-4">
+      <div className="cash-ledger space-y-3">
         <TransactionsFilterBar
           searchInput={searchInput}
           onSearchInputChange={setSearchInput}
@@ -1220,11 +1220,14 @@ export const SpendingTransactionsTab = forwardRef<SpendingTransactionsTabHandle>
             {loadMoreTrigger && <div className="flex justify-center pt-1">{loadMoreTrigger}</div>}
           </div>
         ) : (
-          <div className="rounded-md border" style={{ overflowAnchor: "none" }}>
+          <div
+            className="cash-ledger-table bg-card border-border/80 rounded-lg border"
+            style={{ overflowAnchor: "none" }}
+          >
             <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-10 px-3">
+              <TableHeader className="bg-muted/35">
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="h-10 w-10 px-3">
                     <Checkbox
                       checked={
                         allVisibleSelected ? true : someVisibleSelected ? "indeterminate" : false
@@ -1237,15 +1240,19 @@ export const SpendingTransactionsTab = forwardRef<SpendingTransactionsTabHandle>
                       }
                     />
                   </TableHead>
-                  <TableHead className="hidden w-20 px-3 md:table-cell">
+                  <TableHead className="hidden h-10 w-20 px-3 text-xs md:table-cell">
                     {t("spending:txTab.time")}
                   </TableHead>
-                  <TableHead className="px-3">{t("spending:txTab.nameNotes")}</TableHead>
-                  <TableHead className="hidden w-44 px-3 sm:table-cell">
+                  <TableHead className="h-10 px-3 text-xs">
+                    {t("spending:txTab.nameNotes")}
+                  </TableHead>
+                  <TableHead className="hidden h-10 w-44 px-3 text-xs sm:table-cell">
                     {t("spending:filters.category")}
                   </TableHead>
-                  <TableHead className="w-28 px-3 text-right">{t("common:amount")}</TableHead>
-                  <TableHead className="w-10 px-3" />
+                  <TableHead className="h-10 w-28 px-3 text-right text-xs">
+                    {t("common:amount")}
+                  </TableHead>
+                  <TableHead className="h-10 w-10 px-3" />
                 </TableRow>
               </TableHeader>
               {/* The ref goes on the body, not the table: the virtualizer's
@@ -1254,7 +1261,7 @@ export const SpendingTransactionsTab = forwardRef<SpendingTransactionsTabHandle>
             </Table>
 
             {loadMoreTrigger && (
-              <div className="border-border flex items-center justify-center border-t p-3">
+              <div className="border-border bg-muted/15 flex items-center justify-center border-t p-3">
                 {loadMoreTrigger}
               </div>
             )}

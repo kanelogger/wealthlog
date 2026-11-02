@@ -68,15 +68,15 @@ test.describe("Holdings and Performance Pages", () => {
   test("1. Setup: login", async () => {
     test.setTimeout(180000);
     await loginIfNeeded(page);
-    await page.goto(`${BASE_URL}/dashboard`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByTestId("portfolio-balance-value")).toBeVisible({ timeout: 30000 });
+    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
+    await expect(page).toHaveURL(/\/activities/);
   });
 
   test("2. Trade tax is included in holdings and lot calculations", async () => {
     test.setTimeout(120000);
 
     await loginIfNeeded(page);
-    await page.goto(`${BASE_URL}/dashboard`, { waitUntil: "domcontentloaded" });
+    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
 
     const account = await createApiAccount(page, `E2E Trade Tax Account ${Date.now()}`);
     const buyActivity = await createApiTradeActivity(page, {
@@ -182,37 +182,6 @@ test.describe("Holdings and Performance Pages", () => {
       const holdingsTable = page.locator("table").first();
       await expect(holdingsTable).toBeVisible({ timeout: 10000 });
     }
-  });
-
-  test("5. Performance page smoke test: loads without errors", async () => {
-    test.setTimeout(60000);
-
-    await page.goto(`${BASE_URL}/performance`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(3000);
-
-    // Page should not show an error boundary message
-    await expect(page.getByText(/出现问题|something went wrong/i)).not.toBeVisible();
-  });
-
-  test("6. Dashboard: total value > 0 and account tiles visible", async () => {
-    test.setTimeout(60000);
-
-    await page.goto(`${BASE_URL}/dashboard`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(2000);
-
-    const balanceElement = page.getByTestId("portfolio-balance-value");
-    await expect(balanceElement).toBeVisible({ timeout: 15000 });
-
-    // Balance should be a non-zero value
-    const balanceText = (await balanceElement.textContent()) || "";
-    const numericBalance = parseFloat(balanceText.replace(/[^0-9.]/g, "") || "0");
-    expect(numericBalance).toBeGreaterThan(0);
-
-    // At least one account tile or account name should be visible
-    const accountTile = page
-      .getByText(/CAD Account|USD Account|EUR Account|GBP Account|E2E Trade Tax Account/i)
-      .first();
-    await expect(accountTile).toBeVisible({ timeout: 10000 });
   });
 });
 

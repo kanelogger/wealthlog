@@ -208,7 +208,7 @@ export const HoldingsTableMobile = ({
                 ? parsedOption.underlying
                 : symbol;
             const subtitle = isCash
-              ? t("holdings:cash_balance")
+              ? t("dashboard:available_cash")
               : parsedOption
                 ? formatOptionSubtitle(parsedOption, formatting)
                 : (holding.instrument?.name ?? null);

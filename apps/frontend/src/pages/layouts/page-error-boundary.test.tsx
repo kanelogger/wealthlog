@@ -22,8 +22,8 @@ const app = (path: string) =>
       </nav>
       <PageErrorBoundary>
         <Routes>
-          <Route path="/" element={<Page name="仪表盘" />} />
-          <Route path="/dashboard" element={<Broken />} />
+          <Route path="/" element={<Page name="活动" />} />
+          <Route path="/activities" element={<Page name="活动" />} />
           <Route path="/health" element={<Broken />} />
           <Route path="/holdings" element={<Page name="持仓" />} />
         </Routes>
@@ -42,9 +42,9 @@ describe("a page that fails to render", () => {
     app("/health");
     expect(screen.getByRole("alert")).toHaveTextContent("出现问题");
     expect(screen.getByText(/Sidebar/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "前往仪表盘" }));
+    fireEvent.click(screen.getByRole("button", { name: "前往活动" }));
     // The next route starts afresh.
-    expect(screen.getByText("仪表盘 page")).toBeInTheDocument();
+    expect(screen.getByText("活动 page")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).toBeNull();
   });
 
@@ -58,13 +58,13 @@ describe("a page that fails to render", () => {
 
   it("offers the plain dashboard from a dashboard view that fails", () => {
     app("/?tab=broken");
-    fireEvent.click(screen.getByRole("button", { name: "前往仪表盘" }));
-    expect(screen.getByText("仪表盘 page")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "前往活动" }));
+    expect(screen.getByText("活动 page")).toBeInTheDocument();
   });
 
   it("offers no way to the dashboard from the dashboard itself", () => {
-    app("/dashboard");
+    app("/activities?tab=broken");
     expect(screen.getByRole("alert")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "前往仪表盘" })).toBeNull();
+    expect(screen.getByRole("button", { name: "前往活动" })).toBeInTheDocument();
   });
 });

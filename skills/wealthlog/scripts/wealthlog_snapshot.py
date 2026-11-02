@@ -356,7 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument(
         "--operation",
         required=True,
-        choices=("ordinary_create", "ordinary_update", "pending_create"),
+        choices=("ordinary_create", "ordinary_update", "pending_create", "transfer_create", "manual_trade_record", "holdings_snapshot_patch"),
     )
     create_parser.add_argument("--credential-file", required=True)
     create_parser.add_argument("--received-at", required=True)
@@ -369,7 +369,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--credential-file", help="credential actually selected for this run")
     verify_parser.add_argument("--app-id")
     verify_parser.add_argument("--ledger")
-    verify_parser.add_argument("--operation", choices=("ordinary_create", "ordinary_update", "pending_create"))
+    verify_parser.add_argument("--operation", choices=("ordinary_create", "ordinary_update", "pending_create", "transfer_create", "manual_trade_record", "holdings_snapshot_patch"))
 
     mark_parser = sub.add_parser("mark")
     mark_parser.add_argument("--request-dir", required=True)

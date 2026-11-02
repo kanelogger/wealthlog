@@ -111,10 +111,13 @@ fn validate_requested_scopes(requested: &[String]) -> Result<Vec<String>, ApiErr
         // This host has no formal ordinary write tools, so it must not mint a
         // credential that claims one. Existing tokens carrying the scope are
         // shown as unavailable in the UI.
-        if parsed == AgentScope::OrdinaryWrite {
-            return Err(ApiError::BadRequest(
-                "ordinary:write is not available on this host".into(),
-            ));
+        if matches!(
+            parsed,
+            AgentScope::OrdinaryWrite | AgentScope::TransfersWrite | AgentScope::HoldingsWrite
+        ) {
+            return Err(ApiError::BadRequest(format!(
+                "{parsed} is not available on this host"
+            )));
         }
         set.insert(parsed);
     }
@@ -309,4 +312,21 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/agent-access/tokens/{id}", delete(delete_token))
         .route("/agent-access/audit", get(list_audit))
         .route("/agent-access/audit/purge", post(purge_audit))
+}
+
+#[cfg(test)]
+mod portfolio_scope_tests {
+    use super::*;
+    #[test]
+    fn server_does_not_mint_desktop_portfolio_write_permissions() {
+        for scope in ["transfers:write", "holdings:write"] {
+            assert!(validate_requested_scopes(&[
+                "accounts:read".into(),
+                "activities:read".into(),
+                "holdings:read".into(),
+                scope.into()
+            ])
+            .is_err());
+        }
+    }
 }

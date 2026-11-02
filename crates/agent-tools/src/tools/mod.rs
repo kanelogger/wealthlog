@@ -16,6 +16,7 @@ pub mod create_categorization_rule;
 pub mod health;
 pub mod holdings;
 pub mod income;
+pub mod investments;
 pub mod net_worth;
 pub mod ordinary;
 pub mod pending_activities;

@@ -16,7 +16,7 @@ import type {
 import { AccountType } from "@/lib/types";
 import { ActivityForm } from "@/pages/activity/components/activity-form";
 import { useActivitySearch } from "@/pages/activity/hooks/use-activity-search";
-import { useCalculatePerformanceHistory } from "@/pages/performance/hooks/use-performance-data";
+import { useCalculatePerformanceHistory } from "@/hooks/use-performance-data";
 import { useQuery } from "@tanstack/react-query";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -125,7 +125,7 @@ vi.mock("@/pages/activity/hooks/use-activity-search", () => ({
   })),
 }));
 
-vi.mock("@/pages/dashboard/portfolio-update-trigger", () => ({
+vi.mock("@/components/portfolio/portfolio-update-trigger", () => ({
   PortfolioUpdateTrigger: ({
     children,
     lastCalculatedAt,
@@ -147,7 +147,7 @@ vi.mock("@/pages/holdings/components/holdings-edit-mode", () => ({
   HoldingsEditMode: () => <div>holdings-edit-mode</div>,
 }));
 
-vi.mock("@/pages/performance/hooks/use-performance-data", () => ({
+vi.mock("@/hooks/use-performance-data", () => ({
   useCalculatePerformanceHistory: vi.fn(),
 }));
 

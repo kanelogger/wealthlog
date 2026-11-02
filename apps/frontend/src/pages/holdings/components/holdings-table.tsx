@@ -189,7 +189,7 @@ export const HoldingsTable = ({
 
   if (isLoading) {
     return (
-      <div className="space-y-4 pt-6">
+      <div className="space-y-3 pt-4">
         <Skeleton className="h-12 w-full" />
         <Skeleton className="h-12 w-full" />
         <Skeleton className="h-12 w-full" />
@@ -225,7 +225,7 @@ export const HoldingsTable = ({
   ];
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="studio-holdings-table [&_tbody_tr]:border-border/70 [&_tbody_tr:hover]:bg-accent/40 [&_th]:text-muted-foreground flex h-full min-w-0 flex-col [&_td]:py-3 [&_td]:tabular-nums [&_th]:h-11 [&_th]:text-xs [&_th]:font-medium">
       <DataTable
         data={holdings}
         columns={columns}
@@ -267,7 +267,7 @@ export const HoldingsTable = ({
           ) : undefined
         }
         toolbarActions={
-          <div className="mr-2 flex items-center gap-2">
+          <div className="flex items-center gap-2">
             {hasMultipleCurrencies && (
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -275,7 +275,7 @@ export const HoldingsTable = ({
                     variant="outline"
                     size="icon"
                     onClick={() => setShowConvertedValues(!showConvertedValues)}
-                    className="h-8 w-8 rounded-lg"
+                    className="h-8 w-8 rounded-md shadow-none"
                   >
                     {showConvertedValues ? (
                       <Icons.Globe className="h-4 w-4" />
@@ -374,7 +374,7 @@ const getColumns = (
             </div>
             <span className="text-muted-foreground line-clamp-1 text-xs">
               {optionSubtitle ??
-                (isCash ? t("holdings:cash_balance") : holding.instrument?.name) ??
+                (isCash ? t("dashboard:available_cash") : holding.instrument?.name) ??
                 null}
             </span>
           </div>

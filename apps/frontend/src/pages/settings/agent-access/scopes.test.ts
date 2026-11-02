@@ -23,10 +23,27 @@ describe("agent-access scopes", () => {
     ]);
   });
 
+  it("grants portfolio writes explicitly on desktop with matching read prerequisites", () => {
+    for (const scope of ["holdings:write", "transfers:write"]) {
+      expect(unavailableScopesForHost(true)).not.toContain(scope);
+      expect(unavailableScopesForHost(false)).toContain(scope);
+      expect(scopeAvailableOnHost(scope, false)).toBe(false);
+    }
+    expect(applyScopeDependencies(["holdings:write"])).toEqual([
+      "accounts:read",
+      "holdings:read",
+      "activities:read",
+      "holdings:write",
+    ]);
+    expect(applyScopeDependencies(["transfers:write"])).toEqual([
+      "accounts:read",
+      "activities:read",
+      "transfers:write",
+    ]);
+  });
+
   it("keeps existing dependency rules", () => {
     expect(applyScopeDependencies(["activities:write"])).toContain("activities:draft");
-    expect(applyScopeDependencies(["classification:write"])).toContain(
-      "classification:suggest",
-    );
+    expect(applyScopeDependencies(["classification:write"])).toContain("classification:suggest");
   });
 });

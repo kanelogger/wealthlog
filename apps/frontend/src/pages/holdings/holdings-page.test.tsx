@@ -1,5 +1,5 @@
 import { useAccountScopeStore } from "@/lib/account-scope-store";
-import type { AccountScope } from "@/lib/types";
+import type { AccountScope, Holding } from "@/lib/types";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
@@ -71,7 +71,11 @@ vi.mock("@/pages/asset/alternative-assets", () => ({
   AssetDetailsSheet: () => null,
   UpdateValuationModal: () => null,
 }));
-vi.mock("./components/holdings-table", () => ({ HoldingsTable: () => null }));
+vi.mock("./components/holdings-table", () => ({
+  HoldingsTable: ({ holdings }: { holdings: Holding[] }) => (
+    <div data-testid="holdings-table">{holdings.map((h) => `${h.id}:${h.quantity}`).join(",")}</div>
+  ),
+}));
 vi.mock("./components/holdings-table-mobile", () => ({ HoldingsTableMobile: () => null }));
 vi.mock("./components/alternative-holdings-table", () => ({
   AlternativeHoldingsTable: () => null,
@@ -129,10 +133,36 @@ describe("HoldingsPage account scope", () => {
     expect(selectorScope()).toEqual({ type: "account", accountId: "acc-1" });
     expect(mocks.useHoldingsWithClosedProbe).toHaveBeenCalledWith(
       { type: "account", accountId: "acc-1" },
-      expect.objectContaining({ excludeCash: true }),
+      expect.objectContaining({ excludeCash: false }),
     );
     // The account is derived from the shared scope, so its edit affordance shows.
     expect(toolbarUpdateButton()).toBeInTheDocument();
+  });
+
+  it("shows securities-account cash even without an investment asset kind", () => {
+    mocks.useHoldingsWithClosedProbe.mockReturnValue({
+      holdings: [
+        { id: "cash-cny", holdingType: "cash", quantity: 67002.17, assetKind: null },
+        { id: "stock", holdingType: "security", quantity: 100, assetKind: "INVESTMENT" },
+        { id: "property", holdingType: "alternative", quantity: 1, assetKind: "PROPERTY" },
+      ],
+      isLoading: false,
+      hasHiddenClosedPositions: false,
+    });
+    renderPage();
+    expect(screen.getByTestId("holdings-table")).toHaveTextContent("cash-cny:67002.17");
+    expect(screen.getByTestId("holdings-table")).toHaveTextContent("stock:100");
+    expect(screen.getByTestId("holdings-table")).not.toHaveTextContent("property");
+  });
+
+  it("keeps a cash-only securities account out of the empty holdings state", () => {
+    mocks.useHoldingsWithClosedProbe.mockReturnValue({
+      holdings: [{ id: "cash-cny", holdingType: "cash", quantity: 5000 }],
+      isLoading: false,
+      hasHiddenClosedPositions: false,
+    });
+    renderPage();
+    expect(screen.getByTestId("holdings-table")).toHaveTextContent("cash-cny:5000");
   });
 
   it("publishes a scope change to the shared store", async () => {

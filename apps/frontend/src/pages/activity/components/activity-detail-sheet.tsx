@@ -61,12 +61,12 @@ interface DetailRowProps {
 
 function DetailRow({ label, value, icon }: DetailRowProps) {
   return (
-    <div className="flex items-start justify-between gap-4 py-2">
+    <div className="border-border/60 flex items-start justify-between gap-4 border-b py-3 last:border-b-0">
       <div className="text-muted-foreground flex items-center gap-2 text-sm">
         {icon}
         <span>{label}</span>
       </div>
-      <div className="text-right text-sm font-medium">{value}</div>
+      <div className="min-w-0 text-right text-sm font-medium tabular-nums">{value}</div>
     </div>
   );
 }
@@ -84,7 +84,7 @@ function DetailSection({ title, icon, children }: DetailSectionProps) {
         {icon}
         <h4 className="text-sm font-semibold">{title}</h4>
       </div>
-      <div className="bg-muted/30 rounded-lg border p-3">{children}</div>
+      <div className="border-border border-t">{children}</div>
     </div>
   );
 }
@@ -157,10 +157,13 @@ export function ActivityDetailSheet({ activity, open, onOpenChange }: ActivityDe
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="w-full overflow-y-auto sm:max-w-lg">
-        <SheetHeader className="pb-4">
+      <SheetContent
+        side="right"
+        className="activity-detail-sheet bg-card w-full overflow-y-auto sm:max-w-lg"
+      >
+        <SheetHeader className="border-border border-b pb-5">
           <SheetTitle className="flex items-center gap-3">
-            <div className="bg-primary/10 flex h-10 w-10 items-center justify-center rounded-full">
+            <div className="bg-accent text-primary flex h-10 w-10 items-center justify-center rounded-lg">
               <Icons.Receipt className="text-primary h-5 w-5" />
             </div>
             <div className="flex flex-col items-start">
@@ -174,12 +177,12 @@ export function ActivityDetailSheet({ activity, open, onOpenChange }: ActivityDe
           </SheetTitle>
         </SheetHeader>
 
-        <div className="space-y-6 pb-6 md:pb-8">
+        <div className="space-y-6 pb-6 pt-5 md:pb-8">
           {/* Header Summary */}
-          <div className="from-primary/5 to-primary/10 rounded-xl border bg-gradient-to-br p-4">
+          <div className="bg-muted/35 rounded-lg p-4">
             <div className="flex items-start justify-between">
               <div>
-                <div className="text-muted-foreground mb-1 text-xs uppercase tracking-wide">
+                <div className="text-muted-foreground mb-1 text-xs">
                   {localizeActivityTypeName(t, activity.activityType)}
                 </div>
                 {parsedOption ? (

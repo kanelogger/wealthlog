@@ -117,12 +117,15 @@ function TransactionRowImpl({
       ref={ref}
       data-index={dataIndex}
       data-state={isSelected ? "selected" : undefined}
-      className={cn("group/row cursor-pointer", row.needsReview && "bg-amber-500/5")}
+      className={cn(
+        "group/row border-border/70 hover:bg-accent/40 data-[state=selected]:bg-accent cursor-pointer",
+        row.needsReview && "bg-amber-500/5",
+      )}
       onClick={(e) => isRowBodyClick(e) && onEdit(row)}
     >
       <TableCell className="relative w-10 px-3 py-2" data-row-click-ignore>
         {row.needsReview && (
-          <span className="absolute inset-y-0 left-0 w-[3px] bg-amber-500" aria-hidden="true" />
+          <span className="absolute inset-y-0 left-0 w-px bg-amber-500" aria-hidden="true" />
         )}
         <Checkbox
           checked={isSelected}
@@ -151,7 +154,7 @@ function TransactionRowImpl({
             </span>
           )}
           {a.notes != null ? (
-            <TruncatedText text={a.notes} className="text-sm" />
+            <TruncatedText text={a.notes} className="text-sm font-medium" />
           ) : (
             <span className="text-muted-foreground text-sm italic">—</span>
           )}
@@ -175,8 +178,8 @@ function TransactionRowImpl({
                     : t("spending:transactions.tagEvent")
                 }
                 className={cn(
-                  "hover:bg-muted/60 inline-flex shrink-0 items-center gap-1.5 rounded-full transition-colors",
-                  event ? "bg-muted/60 max-w-[10rem] px-2 py-0.5" : cn("px-1", HOVER_SLOT),
+                  "hover:bg-accent/60 inline-flex shrink-0 items-center gap-1.5 rounded-md transition-colors",
+                  event ? "bg-muted/50 max-w-[10rem] px-2 py-0.5" : cn("px-1", HOVER_SLOT),
                 )}
               >
                 {event ? (
@@ -204,7 +207,7 @@ function TransactionRowImpl({
         ) : row.splitCount > 0 ? (
           <button
             type="button"
-            className="hover:bg-muted/60 -mx-1 inline-flex max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left transition-colors"
+            className="hover:bg-accent/60 -mx-1 inline-flex max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left transition-colors"
             onClick={() => onEditSplits(row)}
           >
             <Icons.SplitHorizontal className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
@@ -226,7 +229,7 @@ function TransactionRowImpl({
                     ? t("spending:transactions.changeCategory", { name: row.category.name })
                     : t("spending:transactions.assignCategory")
                 }
-                className="hover:bg-muted/60 -mx-1 inline-flex max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left transition-colors"
+                className="hover:bg-accent/60 -mx-1 inline-flex max-w-full items-center gap-1.5 rounded-md px-1.5 py-0.5 text-left transition-colors"
               >
                 {row.category ? (
                   <>

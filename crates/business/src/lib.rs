@@ -17,6 +17,7 @@
 //! crate only sequences it with the extra records the plan requires.
 
 pub mod audit;
+pub mod investments;
 pub mod pending;
 pub mod requests;
 pub mod service;

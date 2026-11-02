@@ -85,6 +85,13 @@ pub trait AgentEnvironment: Send + Sync {
         None
     }
 
+    /// Portfolio bookkeeping is available on the desktop host only.
+    fn investment_service(
+        &self,
+    ) -> Option<Arc<wealthfolio_business::investments::InvestmentService>> {
+        None
+    }
+
     /// Pending entries (待确认收支). `None` on hosts without the store.
     fn pending_service(&self) -> Option<Arc<wealthfolio_business::PendingService>> {
         None

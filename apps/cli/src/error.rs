@@ -100,9 +100,11 @@ impl CliError {
 /// Map a structured tool/business error to an exit code.
 pub fn exit_for_code(code: &str) -> u8 {
     match code {
-        "duplicate_activity" | "request_conflict" | "version_conflict" | "request_in_progress" => {
-            EXIT_CONFLICT
-        }
+        "duplicate_activity"
+        | "request_conflict"
+        | "version_conflict"
+        | "state_conflict"
+        | "request_in_progress" => EXIT_CONFLICT,
         "profile_locked" => EXIT_LOCKED,
         "service_unavailable" | "result_unknown" => EXIT_UNAVAILABLE,
         "unauthorized"
@@ -112,6 +114,7 @@ pub fn exit_for_code(code: &str) -> u8 {
         | "write_blocked" => EXIT_AUTH,
         "invalid_input"
         | "invalid_amount"
+        | "investment_out_of_scope"
         | "activity_out_of_scope"
         | "activity_not_found"
         | "tool_not_found"

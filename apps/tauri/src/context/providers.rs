@@ -607,28 +607,43 @@ async fn build_context(
         spending_settings_service.clone(),
     ));
 
-    // Expose local business services to external Agent tools.
-    let agent_environment = Arc::new(TauriAgentEnvironment::new(
-        base_currency.clone(),
-        account_service.clone(),
+    let investment_service = Arc::new(wealthfolio_business::investments::InvestmentService::new(
+        (*business_store).clone(),
+        profile_id.to_string(),
         activity_service.clone(),
-        holdings_service.clone(),
-        valuation_service.clone(),
-        settings_service.clone(),
-        quote_service.clone(),
+        account_service.clone(),
+        snapshot_service.clone(),
         asset_service.clone(),
-        allocation_service.clone(),
-        performance_service.clone(),
-        income_service.clone(),
-        health_service.clone(),
-        taxonomy_service.clone(),
-        portfolio_service.clone(),
-        net_worth_service.clone(),
-        cash_activity_service.clone(),
-        categorization_rules_service.clone(),
-        business_service.clone(),
-        pending_service.clone(),
+        fx_service.clone(),
+        base_currency.clone(),
+        timezone.clone(),
     ));
+
+    // Expose local business services to external Agent tools.
+    let agent_environment = Arc::new(
+        TauriAgentEnvironment::new(
+            base_currency.clone(),
+            account_service.clone(),
+            activity_service.clone(),
+            holdings_service.clone(),
+            valuation_service.clone(),
+            settings_service.clone(),
+            quote_service.clone(),
+            asset_service.clone(),
+            allocation_service.clone(),
+            performance_service.clone(),
+            income_service.clone(),
+            health_service.clone(),
+            taxonomy_service.clone(),
+            portfolio_service.clone(),
+            net_worth_service.clone(),
+            cash_activity_service.clone(),
+            categorization_rules_service.clone(),
+            business_service.clone(),
+            pending_service.clone(),
+        )
+        .with_investments(investment_service),
+    );
     let agent_environment: Arc<dyn wealthfolio_agent_tools::AgentEnvironment> =
         agent_environment.clone();
 
@@ -731,3 +746,7 @@ mod initialization_tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "portfolio_agent_tests.rs"]
+mod portfolio_agent_tests;

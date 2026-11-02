@@ -46,7 +46,9 @@ PAT 由 Wealthlog GUI 的 Agent Access 页面创建，秘密只显示一次。�
 - 查询：`accounts:read`、`activities:read`。
 - 草稿：`activities:draft`。
 - 普通收支正式写入：`ordinary:write`，并依赖 `activities:read`、`accounts:read`。
-- `activities:write` 是另一类草稿提交权限，不能替代 `ordinary:write`。
+- 内部现金转账：`transfers:write`，依赖 `accounts:read`、`activities:read`。
+- 手动证券成交记录及持仓/现金快照：`holdings:write`，依赖 `accounts:read`、`holdings:read`、`activities:read`。
+- `activities:write` 是另一类草稿提交权限，不能替代上述权限。
 
 实际权限以服务端返回为准；不要通过额外的写入探测权限。
 

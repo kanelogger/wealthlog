@@ -60,11 +60,11 @@ test("real A → B → A reloads, different appearance, cross-tab route reset, a
   await observer.goto("/settings/accounts");
   await ready(observer, "Profile A");
   await switchProfile(page, "Profile A", "Profile B");
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/activities$/);
   await expect(page.locator("html")).toHaveClass(/dark/);
   await expect(page.locator("body")).toHaveClass(/font-serif/);
   await ready(observer, "Profile B");
-  await expect(observer).toHaveURL(/\/$/);
+  await expect(observer).toHaveURL(/\/activities$/);
   await observer.close();
   await switchProfile(page, "Profile B", "Profile A");
   await expect(page.locator("html")).toHaveClass(/light/);
@@ -159,7 +159,7 @@ test("incorrect password stays on the chooser and can be retried", async ({ page
   await ready(page, profile.name);
 });
 
-test("profile settings keeps the avatar gallery usable on desktop and mobile", async ({
+test("profile settings keeps name and password controls usable on desktop and mobile", async ({
   page,
   context,
 }) => {
@@ -171,30 +171,39 @@ test("profile settings keeps the avatar gallery usable on desktop and mobile", a
   await ready(page, profile.name);
   await page.getByRole("button", { name: `${profile.name} 的个人资料菜单` }).click();
   await page.getByRole("menuitem", { name: "个人资料设置" }).click();
-  const gallery = page.getByRole("group", { name: "全部头像" });
-  await expect(gallery.getByRole("button")).toHaveCount(40);
-  await expect
-    .poll(() => gallery.evaluate((element) => element.scrollHeight <= element.clientHeight))
-    .toBe(true);
+  const profileForm = page.locator("form").filter({
+    has: page.getByLabel("名称", { exact: true }),
+  });
+  await expect(profileForm).toHaveCount(1);
+  await expect(page.getByRole("group", { name: "全部头像" })).toHaveCount(0);
+  await expect(page.getByRole("group", { name: "头像风格" })).toHaveCount(0);
+  await expect(profileForm.locator(".profile-lock-avatar")).toHaveCount(0);
+  await expect(page.getByLabel("名称", { exact: true })).toHaveValue(profile.name);
   await page.getByRole("button", { name: "启用密码" }).click();
   const nameBounds = await page.getByLabel("名称", { exact: true }).boundingBox();
   const passwordBounds = await page.getByLabel("新密码", { exact: true }).boundingBox();
-  expect(passwordBounds?.x).toBe(nameBounds?.x);
-  expect(passwordBounds?.width).toBe(nameBounds?.width);
+  expect(nameBounds).not.toBeNull();
+  expect(passwordBounds).not.toBeNull();
+  expect(passwordBounds!.x).toBe(nameBounds!.x);
+  expect(passwordBounds!.width).toBe(nameBounds!.width);
   const confirmation = page.getByLabel("再次输入密码", { exact: true });
   const confirmationBounds = await confirmation.boundingBox();
-  expect(confirmationBounds?.x).toBe(passwordBounds?.x);
-  expect(confirmationBounds?.width).toBe(passwordBounds?.width);
+  expect(confirmationBounds).not.toBeNull();
+  expect(confirmationBounds!.x).toBe(passwordBounds!.x);
+  expect(confirmationBounds!.width).toBe(passwordBounds!.width);
   const save = page.getByRole("button", { name: "保存更改", exact: true });
   await expect(save).toHaveCount(1);
+  await expect(profileForm.getByRole("button", { name: "保存更改", exact: true })).toHaveCount(1);
   const saveBounds = await save.boundingBox();
-  const galleryBounds = await gallery.boundingBox();
-  expect(saveBounds!.x).toBeGreaterThanOrEqual(galleryBounds!.x);
-  expect(saveBounds!.x + saveBounds!.width).toBeLessThanOrEqual(
-    galleryBounds!.x + galleryBounds!.width,
-  );
+  const formBounds = await profileForm.boundingBox();
+  expect(saveBounds).not.toBeNull();
+  expect(formBounds).not.toBeNull();
+  expect(saveBounds!.x).toBeGreaterThanOrEqual(formBounds!.x);
+  expect(saveBounds!.x + saveBounds!.width).toBeLessThanOrEqual(formBounds!.x + formBounds!.width);
   expect(saveBounds!.y).toBeGreaterThan(confirmationBounds!.y + confirmationBounds!.height);
-  expect(saveBounds!.y).toBeGreaterThanOrEqual(galleryBounds!.y + galleryBounds!.height);
+  expect(saveBounds!.y + saveBounds!.height).toBeLessThanOrEqual(
+    formBounds!.y + formBounds!.height,
+  );
   await page.getByLabel("新密码", { exact: true }).fill("a new passphrase 🔒");
   await confirmation.fill("does not match");
   await page.getByRole("button", { name: "保存更改", exact: true }).click();
@@ -213,6 +222,8 @@ test("profile settings keeps the avatar gallery usable on desktop and mobile", a
   await ready(page, profile.name);
   await page.getByRole("button", { name: `${profile.name} 的个人资料菜单` }).click();
   await page.getByRole("menuitem", { name: "个人资料设置" }).click();
+  await expect(page.locator("html")).toHaveClass(/dark/);
+  await expect(page.getByLabel("名称", { exact: true })).toBeVisible();
   await page.screenshot({ path: "/tmp/wealthfolio-profile-settings-dark.png", fullPage: true });
 });
 
@@ -237,10 +248,7 @@ test("sets, changes, and recovers a password with confirmation", async ({ page, 
     } else {
       await page.getByRole("menuitem", { name: "个人资料设置" }).click();
       if (flow === "setup") await page.getByRole("button", { name: "启用密码" }).click();
-      else
-        await page
-          .getByLabel("当前密码或恢复代码", { exact: true })
-          .fill(previousPassword);
+      else await page.getByLabel("当前密码或恢复代码", { exact: true }).fill(previousPassword);
     }
     const password = ` ${flow} passphrase é🔒 `;
     await page.getByLabel("新密码", { exact: true }).fill(password);

@@ -26,7 +26,7 @@ export function ApplicationHeader({
   return (
     <div
       className={cn(
-        "flex w-full flex-col items-start justify-between gap-3 sm:flex-row sm:items-center sm:gap-4",
+        "studio-application-header flex w-full flex-col items-start justify-between gap-3 sm:flex-row sm:items-center sm:gap-4",
         className,
       )}
     >
@@ -47,14 +47,16 @@ export function ApplicationHeader({
         <div data-tauri-drag-region="true" className="draggable flex items-center space-x-4">
           {headingPrefix && (
             <>
-              <h1 className="font-heading text-muted-foreground text-xl font-bold tracking-tight md:text-2xl">
+              <h1 className="font-heading text-muted-foreground text-xl font-semibold tracking-[-.025em] md:text-[1.625rem]">
                 {headingPrefix}
               </h1>
               <span className="h-6 border-l-2"></span>
             </>
           )}
 
-          <h1 className="font-heading text-xl font-bold tracking-tight md:text-2xl">{heading}</h1>
+          <h1 className="font-heading text-xl font-semibold tracking-[-.025em] md:text-[1.625rem]">
+            {heading}
+          </h1>
           {text && <p className="text-muted-foreground ml-4 text-lg font-light">{text}</p>}
         </div>
       </div>

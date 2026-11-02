@@ -521,30 +521,26 @@ impl SnapshotRepository {
         &self,
         snapshot: &AccountStateSnapshot,
     ) -> Result<()> {
-        use crate::schema::holdings_snapshots::dsl::*;
-
-        let snap_id = snapshot.id.clone();
-        let positions_to_write = snapshot.positions.clone();
-        let db_model = AccountStateSnapshotDB::from(snapshot.clone());
-        debug!(
-            "Saving/updating snapshot for account {} on date {}",
-            snapshot.account_id, snapshot.snapshot_date
-        );
-
+        let snapshot = snapshot.clone();
         self.writer
-            .exec_tx(move |tx| {
-                diesel::replace_into(holdings_snapshots)
-                    .values(&db_model)
-                    .execute(tx.conn())
-                    .map_err(StorageError::from)?;
-
-                // Dual-write positions to the relational table. Empty maps
-                // intentionally clear any stale relational rows.
-                Self::write_snapshot_positions(tx.conn(), &snap_id, &positions_to_write)?;
-
-                Ok(())
-            })
+            .exec_tx(move |tx| Self::save_snapshot_tx(tx.conn(), snapshot))
             .await
+    }
+
+    /// Save both snapshot representations in an existing business transaction.
+    pub fn save_snapshot_tx(
+        conn: &mut SqliteConnection,
+        snapshot: AccountStateSnapshot,
+    ) -> Result<()> {
+        let positions = snapshot.positions.clone();
+        let id = snapshot.id.clone();
+        let db = AccountStateSnapshotDB::from(snapshot);
+        diesel::replace_into(crate::schema::holdings_snapshots::table)
+            .values(&db)
+            .execute(conn)
+            .map_err(StorageError::from)?;
+        Self::write_snapshot_positions(conn, &id, &positions)?;
+        Ok(())
     }
 
     // --- snapshot_positions helpers ---

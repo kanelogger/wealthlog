@@ -21,6 +21,7 @@ import {
 import { usePersistentState } from "@/hooks/use-persistent-state";
 import {
   AccountPurpose,
+  HoldingType,
   HOLDING_CATEGORY_FILTERS,
   apiKindToAlternativeAssetKind,
 } from "@/lib/constants";
@@ -115,7 +116,7 @@ export const HoldingsPage = () => {
     {
       includeClosed,
       probeClosedWhenEmpty: showClosedPositions,
-      excludeCash: true,
+      excludeCash: false,
     },
   );
   const { data: portfolios = [] } = usePortfolios();
@@ -385,7 +386,10 @@ export const HoldingsPage = () => {
     if (investmentsFilter?.assetKinds) {
       const allowedKinds = investmentsFilter.assetKinds as readonly string[];
       scopedHoldings = allHoldings.filter((holding) => {
-        return holding.assetKind && allowedKinds.includes(holding.assetKind);
+        return (
+          holding.holdingType === HoldingType.CASH ||
+          (holding.assetKind && allowedKinds.includes(holding.assetKind))
+        );
       });
     }
 
@@ -474,7 +478,7 @@ export const HoldingsPage = () => {
   const investmentsContent = (
     <>
       {(healthFilter || healthContext === "holding") && (
-        <div className="border-border bg-muted/30 mb-4 flex items-center justify-between gap-3 rounded-md border px-3 py-2">
+        <div className="border-border bg-secondary/40 mb-4 flex items-center justify-between gap-3 rounded-md border px-4 py-3">
           <div className="flex min-w-0 items-center gap-2">
             <Icons.Info className="text-muted-foreground h-4 w-4 shrink-0" />
             <p className="text-sm">{t("holdings:health_filter_active")}</p>
@@ -526,7 +530,7 @@ export const HoldingsPage = () => {
       ) : (
         <>
           {/* Desktop View */}
-          <div className="hidden md:block">
+          <div className="studio-holdings-section hidden min-w-0 md:block">
             <HoldingsTable
               holdings={filteredHoldings ?? []}
               isLoading={isDataLoading}
@@ -604,7 +608,7 @@ export const HoldingsPage = () => {
       ) : (
         <>
           {/* Desktop View */}
-          <div className="hidden md:block">
+          <div className="studio-holdings-section hidden min-w-0 md:block">
             <AlternativeHoldingsTable
               holdings={assetsHoldings}
               isLoading={isDataLoading}
@@ -733,7 +737,13 @@ export const HoldingsPage = () => {
 
   return (
     <>
-      <SwipablePage views={views} defaultView="investments" />
+      <SwipablePage
+        views={views}
+        title={t("common:holdings")}
+        defaultView="investments"
+        className="studio-holdings-page"
+        desktopContentClassName="md:px-6 lg:px-8"
+      />
 
       {/* Alternative Asset Quick Add Modal */}
       <AlternativeAssetQuickAddModal

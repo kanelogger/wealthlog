@@ -17,8 +17,8 @@ test.describe("Activity Form Validation", () => {
   test("1. Setup: login", async () => {
     test.setTimeout(180000);
     await loginIfNeeded(page);
-    await page.goto(`${BASE_URL}/dashboard`, { waitUntil: "domcontentloaded" });
-    await expect(page.getByTestId("portfolio-balance-value")).toBeVisible({ timeout: 30000 });
+    await page.goto(`${BASE_URL}/activities`, { waitUntil: "domcontentloaded" });
+    await expect(page).toHaveURL(/\/activities/);
   });
 
   test("2. Deposit — missing account and amount shows errors", async () => {
@@ -104,8 +104,8 @@ test.describe("Activity Form Validation", () => {
     await page.waitForTimeout(500);
 
     // Should show quantity error
-    await expect(
-      page.getByText("数量必须大于 0。", { exact: true }).first(),
-    ).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("数量必须大于 0。", { exact: true }).first()).toBeVisible({
+      timeout: 5000,
+    });
   });
 });

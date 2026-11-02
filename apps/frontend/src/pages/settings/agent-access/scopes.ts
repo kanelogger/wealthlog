@@ -15,6 +15,8 @@ export type ScopeKey =
   | "activities:draft"
   | "activities:write"
   | "ordinary:write"
+  | "transfers:write"
+  | "holdings:write"
   | "classification:suggest"
   | "classification:write";
 
@@ -38,6 +40,8 @@ export const SCOPES: ScopeMeta[] = [
   { key: "activities:draft", i18n: "activities_draft", group: "write" },
   { key: "activities:write", i18n: "activities_write", group: "write" },
   { key: "ordinary:write", i18n: "ordinary_write", group: "write" },
+  { key: "transfers:write", i18n: "transfers_write", group: "write" },
+  { key: "holdings:write", i18n: "holdings_write", group: "write" },
   { key: "classification:suggest", i18n: "classification_suggest", group: "write" },
   { key: "classification:write", i18n: "classification_write", group: "write" },
 ];
@@ -83,6 +87,8 @@ export const UNAVAILABLE_SCOPES: ScopeKey[] = [
   "activities:write",
   "classification:write",
   "ordinary:write",
+  "transfers:write",
+  "holdings:write",
 ];
 
 /**
@@ -93,18 +99,22 @@ export const WEB_UNAVAILABLE_SCOPES: ScopeKey[] = [
   "activities:write",
   "classification:write",
   "ordinary:write",
+  "transfers:write",
+  "holdings:write",
 ];
 
 /** Scopes hidden from the create dialog for the current host. */
 export function unavailableScopesForHost(isDesktop: boolean): ScopeKey[] {
   return isDesktop
-    ? UNAVAILABLE_SCOPES.filter((scope) => scope !== "ordinary:write")
+    ? UNAVAILABLE_SCOPES.filter(
+        (scope) => !["ordinary:write", "transfers:write", "holdings:write"].includes(scope),
+      )
     : WEB_UNAVAILABLE_SCOPES;
 }
 
 /** Whether a token that carries this scope can use it on the current host. */
 export function scopeAvailableOnHost(scope: string, isDesktop: boolean): boolean {
-  return scope !== "ordinary:write" || isDesktop;
+  return !["ordinary:write", "transfers:write", "holdings:write"].includes(scope) || isDesktop;
 }
 
 const SCOPE_I18N = new Map(SCOPES.map((scope) => [scope.key, scope.i18n]));
@@ -137,10 +147,11 @@ export function applyScopeDependencies(scopes: Iterable<string>): ScopeKey[] {
   if (set.has("classification:write")) {
     set.add("classification:suggest");
   }
-  if (set.has("ordinary:write")) {
+  if (set.has("ordinary:write") || set.has("transfers:write") || set.has("holdings:write")) {
     set.add("activities:read");
     set.add("accounts:read");
   }
+  if (set.has("holdings:write")) set.add("holdings:read");
   return SCOPES.filter((scope) => set.has(scope.key)).map((scope) => scope.key);
 }
 

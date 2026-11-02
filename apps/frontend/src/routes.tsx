@@ -4,21 +4,15 @@ import useNavigationEventListener from "@/hooks/use-navigation-event-listener";
 import ActivityManagerPage from "@/pages/activity/activity-manager-page";
 import ActivityPage from "@/pages/activity/activity-page";
 import AssetsPage from "@/pages/asset/assets-page";
-import PortfolioPage from "@/pages/dashboard/portfolio-page";
 import HoldingsPage from "@/pages/holdings/holdings-page";
-import IncomePage from "@/pages/income/income-page";
-import PortfolioInsightsPage from "@/pages/insights/portfolio-insights";
 import { AppLayout } from "@/pages/layouts/app-layout";
 import { OnboardingLayout } from "@/pages/layouts/onboarding-layout";
 import NotFoundPage from "@/pages/not-found";
-import PerformancePage from "@/pages/performance/performance-page";
 import SettingsAccountsPage from "@/pages/settings/accounts/accounts-page";
 import SettingsAppearancePage from "@/pages/settings/appearance/appearance-page";
 import PortfoliosPage from "@/pages/settings/portfolios/portfolios-page";
 import SettingsLayout from "@/pages/settings/settings-layout";
 import AboutPage from "@/pages/settings/about/about-page";
-import SpendingBudgetPage from "./features/spending/pages/spending-budget-page";
-import SpendingInsightsPage from "./features/spending/pages/spending-insights-page";
 import AccountPage from "./pages/account/account-page";
 import AssetProfilePage from "./pages/asset/asset-profile-page";
 import HealthPage from "./pages/health/health-page";
@@ -51,24 +45,26 @@ export function AppRoutes() {
 
         {/* Main app with sidebar */}
         <Route path="/" element={<AppLayout />}>
-          <Route index element={<PortfolioPage />} />
-          <Route path="dashboard" element={<PortfolioPage />} />
+          <Route index element={<Navigate to="/activities" replace />} />
+          {[
+            "dashboard",
+            "insights",
+            "net-worth",
+            "performance",
+            "income",
+            "allocation-targets",
+            "spending/insights",
+            "spending/budget",
+          ].map((path) => (
+            <Route key={path} path={path} element={<Navigate to="/activities" replace />} />
+          ))}
           <Route path="activities" element={<ActivityPage />} />
           <Route path="activities/manage" element={<ActivityManagerPage />} />
           <Route path="holdings" element={<HoldingsPage />} />
           <Route path="holdings/:assetId" element={<AssetProfilePage />} />
 
           <Route path="accounts/:id" element={<AccountPage />} />
-          <Route path="income" element={<IncomePage />} />
-          <Route path="performance" element={<PerformancePage />} />
-          <Route path="insights" element={<PortfolioInsightsPage />} />
           <Route path="health" element={<HealthPage />} />
-          <Route
-            path="allocation-targets"
-            element={<Navigate to="/insights?tab=overview" replace />}
-          />
-          <Route path="spending/insights" element={<SpendingInsightsPage />} />
-          <Route path="spending/budget" element={<SpendingBudgetPage />} />
           <Route path="settings" element={<SettingsLayout />}>
             <Route index element={<GeneralSettingsPage />} />
             <Route path="general" element={<GeneralSettingsPage />} />

@@ -1,6 +1,5 @@
 ---
 source: crates/portfolio-engine/tests/goldens.rs
-assertion_line: 34
 ---
 as_of: 2025-01-04
 base_currency: USD
@@ -174,9 +173,9 @@ baseline:
       disposals: []
       flows:
         - date: 2025-01-03
-          inflow_base: "50"
-          outflow_base: "0"
-          source: QUOTE_DERIVED_MARKET_VALUE
+          inflow_base: "100"
+          outflow_base: "50"
+          source: MIXED_EXACT
       keyframes:
         - cash:
             USD: "100"
@@ -290,9 +289,9 @@ baseline:
           cost_basis: "0"
           cost_basis_base: "0"
           date: 2025-01-03
-          external_flow_source: QUOTE_DERIVED_MARKET_VALUE
-          external_inflow_base: "50"
-          external_outflow_base: "0"
+          external_flow_source: MIXED_EXACT
+          external_inflow_base: "100"
+          external_outflow_base: "50"
           fx_rate_to_base: "1"
           investment_market_value: "0"
           investment_market_value_base: "0"
@@ -368,7 +367,7 @@ baseline:
         quality: partial
   portfolio_flows:
     - date: 2025-01-03
-      inflow_base: "50"
-      outflow_base: "100"
+      inflow_base: "0"
+      outflow_base: "50"
       source: MIXED_EXACT
 scenario: EDGE-MIX-03

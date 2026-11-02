@@ -1,11 +1,14 @@
 ---
 name: wealthlog
-description: Use when the user asks to query, add, edit or draft ordinary income/expense entries in Wealthlog (记账、查支出、改一笔账、先存草稿) through the local CLI or MCP. Includes bank-message extraction, automatic categorization from live categories/rules/history, account lookup, calendar dates, request snapshots and duplicate handling.
+description: >-
+  Use for Wealthlog bookkeeping through local scripts, CLI or MCP: ordinary income/expense, drafts, cash transfers, manual securities trades, holdings and per-currency cash reconciliation. Includes categorization, explicit dates, frozen requests, replay and concurrent-edit protection. Records completed events; never executes bank payments or brokerage orders.
 ---
 
 # Wealthlog 操作
 
-在用户的本地 Wealthlog 上处理普通收支（DEPOSIT / WITHDRAWAL）。只做查询、明确授权的正式新增与修改、缺字段草稿；转账、证券、贷款、删除、批量写入和自动确认草稿都引导到 GUI。
+Agent 通过脚本、CLI 或 MCP 操作用户的本地 Wealthlog。应用界面供人查看、解锁和管理授权；业务录入使用下面的接口，不通过 Computer Use 点击记账，不直接修改 SQLite。
+
+普通收支沿用本页流程。查询证券/现金、补录内部现金转账、记录手动证券账户已成交买卖、校准持仓或现金时，先读 [投资账户操作](references/portfolio.md)。当前不支持的操作明确说明缺失能力；贷款、删除、批量写入、自动确认草稿和交易模式证券买卖尚未在这些写入口中开放。
 
 ## 启动
 
@@ -102,7 +105,7 @@ MCP 对应 `get_bookkeeping_context`。需要 `accounts:read`、`activities:read
 3. `notes` 每次显式传完整值：不改就回传原值；“补上”保留原文后追加；“改为”替换；只有明确清空才传 `null`。
 4. `fee/tax/fxRate/taxonomyId/categoryId`：省略表示保留，显式 `null` 表示清空。事件清空用 `clearEvent`，并同时省略 `eventId`；两者同时提交时 `eventId` 优先，会导致清空不生效。
 5. 更新不传 `idempotencyKey`，不截断读到的完整 `activityDate`。
-6. 修改目标不明或越界（转账、证券、贷款、已覆盖类型）时澄清或引导 GUI，不转新增。
+6. 普通收支修改接口不能修改转账或证券记录。新转账、手动持仓和现金校准按 references/portfolio.md；既有转账编辑、交易模式证券写入或贷款操作明确说明尚未支持，不转新增。
 7. 任何重读发现版本或内容不同（包括失败后的重读），都先展示差异并等待用户确认新方案；确认后才生成新版本的快照和请求键。不以是否收到 `version_conflict` 决定是否需要确认。
 
 ## 继续之前的操作
@@ -140,13 +143,15 @@ python3 <skill>/scripts/wealthlog_snapshot.py mark --request-dir "$REQUEST_DIR" 
 
 最终回答必须明确属于哪一种：**查询结果、正式新增、正式修改、已存草稿、重复、拒绝、结果待核实**。
 
-- 正式新增和正式修改每次都完整报告：`账本 <ledgerId>；账户 <账户>；金额 <amount currency>；记录 <activityId>；版本 <version>`。输出前逐项核对，续轮也保留账本标识。
+- 普通收支正式新增和正式修改每次都完整报告：`账本 <ledgerId>；账户 <账户>；金额 <amount currency>；记录 <activityId>；版本 <version>`。输出前逐项核对，续轮也保留账本标识。
 - 草稿：草稿 ID、缺失字段。
 - 重复：既有 ID，新增数为零。
 - 拒绝：拒绝层（认证、权限、账本绑定、锁定或发送前环境检查）与实际限制；已确认未发送就明确“未发送”，不使用“结果待核实”。
 - 未知：请求键、已核对的候选、仍待核实的内容。
 
 ## 按需阅读
+
+- 投资账户查询、现金转账、手动成交记录和持仓/现金校准：`references/portfolio.md`
 
 - 连接、配置、CLI/MCP、权限与 token：`references/connection.md`
 - 字段、错误码、快照状态与恢复：`references/operations.md`
