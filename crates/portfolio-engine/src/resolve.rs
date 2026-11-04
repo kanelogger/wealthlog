@@ -5,6 +5,7 @@
 //! currencies. No "latest rate of any date" last resort (EDGE-FX-07).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 use chrono::NaiveDate;
 use rust_decimal::Decimal;
@@ -14,9 +15,15 @@ use crate::model::{FxObservation, Policy};
 
 type Pair = (String, String);
 
+#[derive(Debug, Clone)]
+struct FxPoint {
+    rate: Decimal,
+    original: Arc<FxObservation>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct FxSurface {
-    series: BTreeMap<Pair, BTreeMap<NaiveDate, Decimal>>,
+    series: BTreeMap<Pair, BTreeMap<NaiveDate, FxPoint>>,
     /// Sorted adjacency so path search is order-independent.
     adjacency: BTreeMap<String, BTreeSet<String>>,
 }
@@ -28,8 +35,9 @@ impl FxSurface {
     /// inverse of another row.
     pub fn from_observations(observations: &[FxObservation]) -> Self {
         let mut surface = Self::default();
+        let originals: Vec<_> = observations.iter().cloned().map(Arc::new).collect();
         let pairs = || {
-            observations
+            originals
                 .iter()
                 .map(|o| (o.from.as_str(), o.to.as_str(), o))
                 .filter(|(from, to, _)| from != to)
@@ -39,7 +47,13 @@ impl FxSurface {
                 .series
                 .entry((from.to_string(), to.to_string()))
                 .or_default()
-                .insert(observation.day, observation.rate);
+                .insert(
+                    observation.day,
+                    FxPoint {
+                        rate: observation.rate,
+                        original: observation.clone(),
+                    },
+                );
             surface
                 .adjacency
                 .entry(from.to_string())
@@ -50,12 +64,16 @@ impl FxSurface {
             let Some(inverse) = arith::div(Decimal::ONE, observation.rate) else {
                 continue;
             };
+            let original = observation.clone();
             surface
                 .series
                 .entry((to.to_string(), from.to_string()))
                 .or_default()
                 .entry(observation.day)
-                .or_insert(inverse);
+                .or_insert(FxPoint {
+                    rate: inverse,
+                    original,
+                });
             surface
                 .adjacency
                 .entry(to.to_string())
@@ -86,7 +104,7 @@ impl FxSurface {
     /// Nearest observation for a direct pair: exact day, else the closer of
     /// the last-before and first-after observations (tie → past), with its
     /// distance in days from `date`.
-    fn direct_rate(&self, from: &str, to: &str, date: NaiveDate) -> Option<(Decimal, i64)> {
+    fn direct_rate(&self, from: &str, to: &str, date: NaiveDate) -> Option<(&FxPoint, i64)> {
         let history = self.series.get(&(from.to_string(), to.to_string()))?;
         let prev = history.range(..=date).next_back();
         let next = history.range(date..).next();
@@ -94,15 +112,15 @@ impl FxSurface {
         match (prev, next) {
             (Some((d1, r1)), Some((d2, r2))) => {
                 if d1 == d2 {
-                    return Some((*r1, 0));
+                    return Some((r1, 0));
                 }
                 Some(if distance(d1) <= distance(d2) {
-                    (*r1, distance(d1))
+                    (r1, distance(d1))
                 } else {
-                    (*r2, distance(d2))
+                    (r2, distance(d2))
                 })
             }
-            (Some((day, rate)), None) | (None, Some((day, rate))) => Some((*rate, distance(day))),
+            (Some((day, rate)), None) | (None, Some((day, rate))) => Some((rate, distance(day))),
             (None, None) => None,
         }
     }
@@ -111,17 +129,23 @@ impl FxSurface {
     /// path (neighbors visited in code order, so equal-length paths resolve
     /// deterministically), each hop nearest-neighbour resolved on `date`.
     /// Also returns the largest distance of any hop's observation from `date`.
-    fn path_rate(&self, from: &str, to: &str, date: NaiveDate) -> Option<(Decimal, i64)> {
+    fn path_rate_observed(
+        &self,
+        from: &str,
+        to: &str,
+        date: NaiveDate,
+        retain_sources: bool,
+    ) -> Option<(Decimal, i64, Vec<FxObservation>)> {
         if from == to {
-            return Some((Decimal::ONE, 0));
+            return Some((Decimal::ONE, 0, vec![]));
         }
-        let mut queue: VecDeque<(String, Decimal, i64)> = VecDeque::new();
+        let mut queue: VecDeque<(String, Decimal, i64, Vec<FxObservation>)> = VecDeque::new();
         let mut visited: BTreeSet<String> = BTreeSet::new();
-        queue.push_back((from.to_string(), Decimal::ONE, 0));
+        queue.push_back((from.to_string(), Decimal::ONE, 0, vec![]));
         visited.insert(from.to_string());
-        while let Some((current, accumulated, age)) = queue.pop_front() {
+        while let Some((current, accumulated, age, sources)) = queue.pop_front() {
             if current == to {
-                return Some((accumulated, age));
+                return Some((accumulated, age, sources));
             }
             let Some(neighbors) = self.adjacency.get(&current) else {
                 continue;
@@ -130,12 +154,22 @@ impl FxSurface {
                 if visited.contains(neighbor) {
                     continue;
                 }
-                if let Some((rate, hop_age)) = self
+                if let Some((rate, hop_age, original)) = self
                     .direct_rate(&current, neighbor, date)
-                    .and_then(|(rate, hop_age)| Some((arith::mul(accumulated, rate)?, hop_age)))
+                    .and_then(|(point, hop_age)| {
+                        Some((
+                            arith::mul(accumulated, point.rate)?,
+                            hop_age,
+                            point.original.clone(),
+                        ))
+                    })
                 {
+                    let mut next_sources = sources.clone();
+                    if retain_sources {
+                        next_sources.push(original.as_ref().clone());
+                    }
                     visited.insert(neighbor.clone());
-                    queue.push_back((neighbor.clone(), rate, age.max(hop_age)));
+                    queue.push_back((neighbor.clone(), rate, age.max(hop_age), next_sources));
                 }
             }
         }
@@ -160,8 +194,29 @@ impl FxResolver<'_> {
     /// [`Self::rate`] plus how many days the furthest observation it used lies
     /// from `date` (0 when every hop was observed that day).
     pub fn rate_with_age(&self, from: &str, to: &str, date: NaiveDate) -> Option<(Decimal, i64)> {
+        self.rate_observed(from, to, date, false)
+            .map(|(rate, age, _)| (rate, age))
+    }
+
+    pub fn rate_with_sources(
+        &self,
+        from: &str,
+        to: &str,
+        date: NaiveDate,
+    ) -> Option<(Decimal, Vec<FxObservation>)> {
+        self.rate_observed(from, to, date, true)
+            .map(|(rate, _, sources)| (rate, sources))
+    }
+
+    fn rate_observed(
+        &self,
+        from: &str,
+        to: &str,
+        date: NaiveDate,
+        retain_sources: bool,
+    ) -> Option<(Decimal, i64, Vec<FxObservation>)> {
         if from == to {
-            return Some((Decimal::ONE, 0));
+            return Some((Decimal::ONE, 0, vec![]));
         }
         if !valid_code(from) || !valid_code(to) {
             return None;
@@ -181,10 +236,13 @@ impl FxResolver<'_> {
             Decimal::ONE / to_factor
         };
         if major_from == major_to {
-            return arith::mul(source_multiplier, target_multiplier).map(|rate| (rate, 0));
+            return arith::mul(source_multiplier, target_multiplier).map(|rate| (rate, 0, vec![]));
         }
-        let (base_rate, age) = self.surface.path_rate(major_from, major_to, date)?;
-        arith::product(&[source_multiplier, base_rate, target_multiplier]).map(|rate| (rate, age))
+        let (base_rate, age, sources) =
+            self.surface
+                .path_rate_observed(major_from, major_to, date, retain_sources)?;
+        arith::product(&[source_multiplier, base_rate, target_multiplier])
+            .map(|rate| (rate, age, sources))
     }
 
     pub fn convert(
@@ -264,6 +322,35 @@ mod tests {
         assert_eq!(fx.rate("USD", "CAD", day(2)), Some(dec!(1.30)));
         // No direct CAD->USD row on day 3: the inverse fills it.
         assert_eq!(fx.rate("CAD", "USD", day(3)), Some(dec!(1) / dec!(1.25)));
+        assert_eq!(
+            fx.rate_with_sources("CAD", "USD", day(2)),
+            Some((dec!(0.70), vec![observation("CAD", "USD", 2, dec!(0.70))]))
+        );
+        assert_eq!(
+            fx.rate_with_sources("CAD", "USD", day(3)),
+            Some((
+                dec!(1) / dec!(1.25),
+                vec![observation("USD", "CAD", 3, dec!(1.25))]
+            ))
+        );
+    }
+
+    #[test]
+    fn inverse_source_matches_the_rate_even_for_duplicate_input_days() {
+        let first = observation("USD", "CAD", 2, dec!(1.25));
+        let second = observation("USD", "CAD", 2, dec!(1.30));
+        let surface = FxSurface::from_observations(&[first.clone(), second]);
+        let policy = policy();
+        let fx = FxResolver {
+            surface: &surface,
+            policy: &policy,
+        };
+        // Existing numerical behavior fills the absent inverse from the first
+        // input; its retained origin must be that same observation.
+        assert_eq!(
+            fx.rate_with_sources("CAD", "USD", day(2)),
+            Some((dec!(0.8), vec![first]))
+        );
     }
 
     #[test]
@@ -282,6 +369,36 @@ mod tests {
         assert_eq!(fx.rate("GBP", "GBp", day(2)), Some(dec!(100)));
         assert_eq!(fx.rate("XYZ", "USD", day(2)), None);
         assert_eq!(fx.rate("", "USD", day(2)), None);
+    }
+
+    #[test]
+    fn grouped_split_provenance_uses_the_same_ranked_source_as_quantity_carry() {
+        let row = |id: &str, d: u32, ratio: Decimal, modified: bool| SplitRow {
+            id: id.into(),
+            asset: AssetId::new("stock"),
+            date: day(d),
+            ratio,
+            is_user_modified: modified,
+            source_system: Some("BROKER".into()),
+            updated_at: DateTime::<Utc>::from_naive_utc_and_offset(
+                day(d).and_hms_opt(0, 0, 0).unwrap(),
+                Utc,
+            ),
+        };
+        let rows = vec![
+            row("broker", 5, dec!(2), false),
+            row("user", 6, dec!(3), true),
+            row("later", 15, dec!(4), false),
+        ];
+        let selected = group_splits_with_sources(rows.clone());
+        let original = group_splits(rows);
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].source_id, "user");
+        assert_eq!(selected[0].event.ratio, dec!(3));
+        assert_eq!(selected[0].event.split_date, day(6));
+        assert_eq!(selected[1].source_id, "later");
+        assert_eq!(original[0].ratio, selected[0].event.ratio);
+        assert_eq!(original[1].ratio, selected[1].event.ratio);
     }
 }
 
@@ -530,6 +647,20 @@ impl SplitRow {
 /// each other are one split, and its best-ranked row (then the latest
 /// updated, then the id) gives its day and ratio. Sorted by day, then asset.
 pub fn group_splits(rows: impl IntoIterator<Item = SplitRow>) -> Vec<SplitEvent> {
+    group_splits_with_sources(rows)
+        .into_iter()
+        .map(|s| s.event)
+        .collect()
+}
+
+/// The exact selected source of a grouped split, for versioned reconciliation.
+#[derive(Debug, Clone)]
+pub struct SelectedSplit {
+    pub source_id: String,
+    pub event: SplitEvent,
+}
+
+pub fn group_splits_with_sources(rows: impl IntoIterator<Item = SplitRow>) -> Vec<SelectedSplit> {
     const MERGE_GAP_DAYS: i64 = 1;
     let mut by_asset: BTreeMap<AssetId, Vec<SplitRow>> = BTreeMap::new();
     for row in rows {
@@ -561,17 +692,21 @@ pub fn group_splits(rows: impl IntoIterator<Item = SplitRow>) -> Vec<SplitEvent>
             }) else {
                 continue;
             };
-            events.push(SplitEvent {
-                asset: asset.clone(),
-                split_date: selected.date,
-                ratio: selected.ratio,
+            events.push(SelectedSplit {
+                source_id: selected.id.clone(),
+                event: SplitEvent {
+                    asset: asset.clone(),
+                    split_date: selected.date,
+                    ratio: selected.ratio,
+                },
             });
         }
     }
     events.sort_by(|a, b| {
-        a.split_date
-            .cmp(&b.split_date)
-            .then_with(|| a.asset.cmp(&b.asset))
+        a.event
+            .split_date
+            .cmp(&b.event.split_date)
+            .then_with(|| a.event.asset.cmp(&b.event.asset))
     });
     events
 }

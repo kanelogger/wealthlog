@@ -1046,6 +1046,18 @@
       "ordinary_write": {
         "label": "普通收支——正式写入",
         "description": "直接创建和修改正式普通收支流水；需要活动与账户读取权限。仅桌面宿主可用。"
+      },
+      "investments_read": {
+        "label": "投资记录（读取）",
+        "description": "读取资金用途、决策、成交关联、复盘和原则及财务背景；需要账户、持仓和活动读取权限，仅桌面可用。"
+      },
+      "investments_write": {
+        "label": "投资记录——编辑与起草",
+        "description": "管理资金用途，保存决策、复盘和原则草稿，关联已有成交。正式确认与成交记账需另外授权。"
+      },
+      "investments_confirm": {
+        "label": "投资记录——确认与发布",
+        "description": "允许程序确认指定决策版本、提交复盘和发布原则，并记录实际调用身份。"
       }
     },
     "preset": {
@@ -1059,7 +1071,9 @@
     "pat_scope_custom_other": "自定义 · {{count}} 个作用域",
     "scope_unavailable_on_host": "本宿主不可用",
     "grant_lifecycle_title": "本地授权生命周期",
-    "grant_lifecycle_description": "关闭窗口只隐藏界面，服务继续运行。受保护账本在锁屏、休眠或五分钟空闲后自动上锁，外部调用会暂停并返回 profile_locked，解锁后恢复；显式上锁、停止服务、退出应用、撤销凭据或凭据到期会阻止后续调用。"
+    "grant_lifecycle_description": "关闭窗口只隐藏界面，服务继续运行。受保护账本在锁屏、休眠或五分钟空闲后自动上锁，外部调用会暂停并返回 profile_locked，解锁后恢复；显式上锁、停止服务、退出应用、撤销凭据或凭据到期会阻止后续调用。",
+    "dialog_confirm_access": "确认与发布（单独授权）",
+    "dialog_confirm_description": "允许程序正式确认指定决策、提交复盘和发布原则。此项需单独勾选，并包含所需的编辑与读取权限。"
   },
   "tax_add_category": "添加类别",
   "tax_export": "导出",

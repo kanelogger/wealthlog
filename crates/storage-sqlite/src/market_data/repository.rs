@@ -134,6 +134,60 @@ fn reset_context(conn: &mut SqliteConnection, id: &str) -> Result<ProviderHistor
 
 #[async_trait]
 impl QuoteStore for MarketDataRepository {
+    fn get_quotes_by_source_keys(
+        &self,
+        keys: &[(String, NaiveDate, String)],
+    ) -> Result<Vec<Quote>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let keys = serde_json::to_string(keys)
+            .map_err(|error| wealthfolio_core::Error::Unexpected(error.to_string()))?;
+        let mut conn = get_connection(&self.pool)?;
+        let rows = sql_query(
+            "SELECT q.* FROM json_each(?1) k JOIN quotes q
+             ON q.asset_id=json_extract(k.value,'$[0]') AND q.day=json_extract(k.value,'$[1]')
+             AND q.source=json_extract(k.value,'$[2]')",
+        )
+        .bind::<Text, _>(keys)
+        .load::<QuoteDB>(&mut conn)
+        .into_core()?;
+        Ok(rows.into_iter().map(Quote::from).collect())
+    }
+
+    fn verify_quote_sources(
+        &self,
+        selected: &[Quote],
+    ) -> Result<wealthfolio_core::quotes::QuoteSourceChecks> {
+        use wealthfolio_core::quotes::QuoteSourceQuality;
+        if selected.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<_> = selected.iter().map(|quote| quote.id.clone()).collect();
+        let mut conn = get_connection(&self.pool)?;
+        let mut originals = HashMap::new();
+        for chunk in chunk_for_sqlite(&ids) {
+            for row in quotes_dsl::quotes
+                .filter(quotes_dsl::id.eq_any(chunk))
+                .load::<QuoteDB>(&mut conn)
+                .into_core()?
+            {
+                originals.insert(row.id.clone(), row);
+            }
+        }
+        Ok(selected
+            .iter()
+            .map(|quote| {
+                (
+                    quote.id.clone(),
+                    originals
+                        .get(&quote.id)
+                        .map(|raw| raw.source_quality(quote))
+                        .unwrap_or(QuoteSourceQuality::Unavailable),
+                )
+            })
+            .collect())
+    }
     // =========================================================================
     // Mutations
     // =========================================================================

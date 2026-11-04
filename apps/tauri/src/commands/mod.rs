@@ -12,6 +12,7 @@ pub mod database;
 pub mod error;
 
 pub mod health;
+pub mod investment_journal;
 
 pub mod market_data;
 pub mod mcp;

@@ -16,7 +16,7 @@ import { toast } from "@wealthfolio/ui/components/ui/use-toast";
 import { buildClientConfig, STANDARD_PRESET_ID } from "../mcp-client-config";
 import {
   applyScopeDependencies,
-  READ_SCOPES,
+  readScopesForHost,
   scopeDescription,
   scopeLabel,
   SCOPES,
@@ -52,9 +52,15 @@ const EXPIRY_OPTIONS = [
   },
 ] as const;
 
-const READ_GROUP = SCOPES.filter((scope) => scope.group === "read");
 const isDesktopHost = isTauri;
 const UNAVAILABLE = unavailableScopesForHost(isDesktopHost);
+const HOST_READ_SCOPES = readScopesForHost(isDesktopHost);
+const READ_GROUP = SCOPES.filter(
+  (scope) => scope.group === "read" && !UNAVAILABLE.includes(scope.key),
+);
+const CONFIRM_GROUP = SCOPES.filter(
+  (scope) => scope.group === "confirm" && !UNAVAILABLE.includes(scope.key),
+);
 const WRITE_GROUP = SCOPES.filter(
   (scope) => scope.group === "write" && !UNAVAILABLE.includes(scope.key),
 );
@@ -80,7 +86,7 @@ export function PatCreateDialog({
   const [name, setName] = useState("");
   const [expiry, setExpiry] = useState<string>("90");
   // Default to read-only: the common case is one edit away.
-  const [selected, setSelected] = useState<Set<ScopeKey>>(() => new Set(READ_SCOPES));
+  const [selected, setSelected] = useState<Set<ScopeKey>>(() => new Set(HOST_READ_SCOPES));
   const [newToken, setNewToken] = useState<string | null>(null);
 
   const selectedScopes = useMemo<ScopeKey[]>(() => applyScopeDependencies(selected), [selected]);
@@ -91,7 +97,7 @@ export function PatCreateDialog({
   const reset = () => {
     setName("");
     setExpiry("90");
-    setSelected(new Set(READ_SCOPES));
+    setSelected(new Set(HOST_READ_SCOPES));
     setNewToken(null);
   };
 
@@ -150,6 +156,7 @@ export function PatCreateDialog({
 
   const renderScope = (scope: (typeof SCOPES)[number]) => {
     const checked = selectedScopes.includes(scope.key);
+    const implied = checked && !selected.has(scope.key);
     const label = scopeLabel(t, scope.key);
     const description = scopeDescription(t, scope.key);
     return (
@@ -160,6 +167,8 @@ export function PatCreateDialog({
         aria-checked={checked}
         aria-label={t("settings:agentAccess.dialog_scope_aria", { label, description })}
         title={description}
+        aria-describedby={scope.group === "confirm" ? "pat-confirm-description" : undefined}
+        disabled={implied}
         onClick={() => toggleScope(scope.key)}
         className={cn(
           "flex w-full items-center justify-between gap-2 rounded-md border px-3 py-2 text-left text-sm transition-colors",
@@ -169,13 +178,13 @@ export function PatCreateDialog({
             : "border-border hover:border-muted-foreground/30 hover:bg-muted/40",
         )}
       >
-        <span className="truncate font-medium">{label}</span>
+        <span className="min-w-0 break-words text-left font-medium">{label}</span>
         <span
           className={cn(
             "grid h-4 w-4 shrink-0 place-items-center transition-colors",
             checked
               ? "bg-success rounded-[5px] text-white"
-              : "border-muted-foreground/30 rounded-full border-2",
+              : "border-muted-foreground rounded-full border-2",
           )}
           aria-hidden
         >
@@ -188,7 +197,10 @@ export function PatCreateDialog({
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent
-        className={cn("overflow-hidden p-0", newToken === null ? "sm:max-w-5xl" : "sm:max-w-lg")}
+        className={cn(
+          "max-h-[90dvh] overflow-y-auto p-0 md:overflow-hidden",
+          newToken === null ? "sm:max-w-5xl" : "sm:max-w-lg",
+        )}
       >
         {newToken === null ? (
           <div className="md:grid md:grid-cols-[1fr_22rem]">
@@ -252,6 +264,22 @@ export function PatCreateDialog({
                   </p>
                   <div className="grid gap-2 sm:grid-cols-2">{WRITE_GROUP.map(renderScope)}</div>
                 </div>
+                {CONFIRM_GROUP.length > 0 && (
+                  <section className="space-y-2" aria-labelledby="pat-confirm-access">
+                    <p id="pat-confirm-access" className="text-sm font-medium">
+                      {t("settings:agentAccess.dialog_confirm_access")}
+                    </p>
+                    <p
+                      id="pat-confirm-description"
+                      className="text-muted-foreground text-sm leading-relaxed"
+                    >
+                      {t("settings:agentAccess.dialog_confirm_description")}
+                    </p>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      {CONFIRM_GROUP.map(renderScope)}
+                    </div>
+                  </section>
+                )}
               </div>
             </div>
 

@@ -26,6 +26,8 @@ wealthfolio-business = { path = "../business" }
 [dev-dependencies]
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
+wealthfolio-storage-sqlite = { path = "../storage-sqlite" }
 
 [lints]
 workspace = true

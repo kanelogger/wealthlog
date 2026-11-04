@@ -18,7 +18,7 @@ const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 #[command(
     name = "wealthlog",
     version,
-    about = "Local Wealthlog CLI (bookkeeping, transfers, manual holdings and cash)",
+    about = "Local Wealthlog CLI (bookkeeping, transfers, manual holdings and investment journal)",
     long_about = "Calls the running Wealthlog desktop service over its private Unix socket. \
                   Writes require --ledger and a frozen requestKey in the input JSON. The CLI \
                   prints one JSON object on stdout and logs nothing else there; tokens are never \
@@ -66,6 +66,11 @@ pub enum Command {
     Transfers {
         #[command(subcommand)]
         command: TransfersCommand,
+    },
+    /// Versioned investment journal commands served by the desktop app.
+    Investments {
+        #[command(subcommand)]
+        command: InvestmentsCommand,
     },
     /// Local service discovery.
     Service {
@@ -150,6 +155,20 @@ pub enum TransfersCommand {
     Create {
         #[arg(long, value_name = "FILE|-")]
         input: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum InvestmentsCommand {
+    /// List the current desktop command catalog and exact JSON schemas.
+    Commands,
+    /// Read one command schema from the desktop's authoritative catalog.
+    Schema { operation: String },
+    /// Execute one journal command with its exact JSON arguments. Writes require --ledger.
+    Call {
+        operation: String,
+        #[arg(long, value_name = "FILE|-")]
+        input: Option<String>,
     },
 }
 
@@ -279,7 +298,7 @@ pub async fn run(cli: Cli) -> Result<Outcome, CliError> {
     let session = Session::connect(&discovery, &token, ledger.clone())
         .await
         .map_err(|error| error.with_ledger(ledger.clone()))?;
-    let result = execute(&session, &cli.command).await;
+    let result = execute(&session, &cli.command, cli.ledger.is_some()).await;
     session.close().await;
     let result = result.map_err(|error| error.with_ledger(ledger.clone()));
 
@@ -309,8 +328,12 @@ async fn execute_portfolio_write(
 async fn execute(
     session: &Session,
     command: &Command,
+    explicit_ledger: bool,
 ) -> Result<(Option<String>, Option<String>, Value), CliError> {
     match command {
+        Command::Investments { command } => {
+            execute_investment_journal(session, command, explicit_ledger).await
+        }
         Command::Accounts {
             command: AccountsCommand::List,
         } => {
@@ -432,10 +455,83 @@ async fn execute(
 }
 
 fn request_id_of_data(data: &Value) -> Option<String> {
-    data.get("result")
-        .and_then(|result| result.get("requestId"))
+    data.get("requestId")
         .and_then(Value::as_str)
+        .or_else(|| {
+            data.get("result")
+                .and_then(|result| result.get("requestId"))
+                .and_then(Value::as_str)
+        })
         .map(str::to_string)
+}
+
+fn journal_request_key(
+    definition: &Value,
+    input: &Value,
+    explicit_ledger: bool,
+) -> Result<Option<String>, CliError> {
+    if definition["access"] == "read" {
+        return Ok(None);
+    }
+    if !explicit_ledger {
+        return Err(CliError::usage(
+            "investment writes and confirmations require --ledger <UUID>",
+        ));
+    }
+    let pointer = definition["requestKeyPointer"].as_str().ok_or_else(|| {
+        CliError::unavailable("the desktop command has no write requestKey contract")
+    })?;
+    let key = input
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| {
+            CliError::usage(format!(
+                "the input must contain a non-blank requestKey at {pointer}"
+            ))
+        })?;
+    Ok(Some(key.into()))
+}
+async fn execute_investment_journal(
+    session: &Session,
+    command: &InvestmentsCommand,
+    explicit_ledger: bool,
+) -> Result<(Option<String>, Option<String>, Value), CliError> {
+    let (_, catalog) = session
+        .call("get_investment_commands", serde_json::json!({}))
+        .await?;
+    let definitions = catalog.as_array().ok_or_else(|| {
+        CliError::unavailable("the desktop investment command catalog is invalid")
+    })?;
+    let operation = match command {
+        InvestmentsCommand::Commands => return Ok((None, None, catalog)),
+        InvestmentsCommand::Schema { operation } | InvestmentsCommand::Call { operation, .. } => {
+            operation
+        }
+    };
+    let definition = definitions
+        .iter()
+        .find(|definition| definition["name"].as_str() == Some(operation))
+        .ok_or_else(|| {
+            CliError::usage("unknown or unavailable investment command; use investments commands")
+        })?;
+    if matches!(command, InvestmentsCommand::Schema { .. }) {
+        return Ok((None, None, definition.clone()));
+    }
+    let InvestmentsCommand::Call { input, .. } = command else {
+        unreachable!()
+    };
+    let input = input
+        .as_deref()
+        .map(read_input)
+        .transpose()?
+        .unwrap_or_else(|| serde_json::json!({}));
+    let key = journal_request_key(definition, &input, explicit_ledger)?;
+    let (_, data) = session
+        .call(operation, input)
+        .await
+        .map_err(|error| error.with_request_key(key.clone()))?;
+    Ok((key, request_id_of_data(&data), data))
 }
 
 async fn service_status(cli: &Cli) -> Result<Outcome, CliError> {
@@ -507,4 +603,64 @@ async fn service_status(cli: &Cli) -> Result<Outcome, CliError> {
 
 pub fn success_exit() -> u8 {
     EXIT_OK
+}
+
+#[cfg(test)]
+mod investment_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn actual_catalog_access_requires_explicit_ledger_and_preserves_nested_request_keys() {
+        for access in ["write", "confirm"] {
+            let definition = json!({"access":access,"requestKeyPointer":"/requestKey"});
+            assert!(
+                journal_request_key(&definition, &json!({"requestKey":"frozen"}), false).is_err()
+            );
+            assert_eq!(
+                journal_request_key(&definition, &json!({"requestKey":"frozen"}), true)
+                    .unwrap()
+                    .as_deref(),
+                Some("frozen")
+            );
+        }
+        let manual = json!({"access":"write","requestKeyPointer":"/trade/requestKey"});
+        assert_eq!(
+            journal_request_key(
+                &manual,
+                &json!({"trade":{"requestKey":"native-trade"}}),
+                true
+            )
+            .unwrap()
+            .as_deref(),
+            Some("native-trade")
+        );
+        assert!(journal_request_key(&manual, &json!({"requestKey":"wrong-level"}), true).is_err());
+        assert!(journal_request_key(&manual, &json!({"trade":{"requestKey":"  "}}), true).is_err());
+        assert_eq!(
+            journal_request_key(
+                &json!({"access":"read","requestKeyPointer":null}),
+                &json!({}),
+                false
+            )
+            .unwrap(),
+            None
+        );
+        assert!(
+            journal_request_key(&json!({"access":"unknown"}), &json!({}), false).is_err(),
+            "an unknown access classification cannot become an implicit-ledger write"
+        );
+    }
+    #[test]
+    fn native_and_legacy_request_ids_survive_the_cli_output_contract() {
+        assert_eq!(
+            request_id_of_data(&json!({"requestId":"native"})).as_deref(),
+            Some("native")
+        );
+        assert_eq!(
+            request_id_of_data(&json!({"result":{"requestId":"legacy"}})).as_deref(),
+            Some("legacy")
+        );
+        assert_eq!(request_id_of_data(&json!([])), None);
+    }
 }

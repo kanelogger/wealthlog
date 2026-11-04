@@ -22,6 +22,9 @@ use crate::audit::{BusinessAuditEntry, BusinessChannel};
 use crate::requests::{RequestOutcome, RequestRecord};
 use crate::store::BusinessStore;
 
+pub(crate) mod ordinary_aggregation;
+pub use ordinary_aggregation::*;
+
 /// One ordinary activity row returned by the scoped query.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -864,48 +867,16 @@ impl BusinessService {
             .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         let page = query.page.unwrap_or(0).max(0);
-        let eligible = self.account_service.get_active_non_archived_accounts()?;
-        let account_ids: Vec<String> = eligible
-            .into_iter()
-            .filter(|account| {
-                wealthfolio_core::accounts::account_supports_purpose(
-                    &account.account_type,
-                    AccountPurpose::Spending,
-                ) && query
-                    .account_ids
-                    .as_ref()
-                    .is_none_or(|requested| requested.contains(&account.id))
-            })
-            .map(|account| account.id)
-            .collect();
-        if account_ids.is_empty() {
-            return Ok(OrdinaryActivityPage {
-                rows: Vec::new(),
-                total_count: 0,
-                page,
-                page_size,
-            });
-        }
-
         let mut conn = wealthfolio_storage_sqlite::db::get_connection(self.store.pool())
             .map_err(OrdinaryActivityError::Storage)?;
         use diesel::prelude::*;
-        use wealthfolio_storage_sqlite::schema::{accounts, activities};
+        use wealthfolio_storage_sqlite::schema::activities;
 
         let scoped_query = || {
-            let mut filter = activities::table
-                .inner_join(accounts::table.on(activities::account_id.eq(accounts::id)))
-                .filter(accounts::is_archived.eq(false))
-                .filter(activities::status.eq("POSTED"))
-                .filter(activities::account_id.eq_any(account_ids.clone()))
-                .filter(activities::asset_id.is_null())
-                .filter(activities::source_group_id.is_null())
-                .filter(activities::subtype.is_null().or(activities::subtype.eq("")))
-                .filter(
-                    activities::activity_type
-                        .eq_any([ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_WITHDRAWAL]),
-                )
-                .into_boxed();
+            let mut filter = ordinary_activity_scope();
+            if let Some(ids) = &query.account_ids {
+                filter = filter.filter(activities::account_id.eq_any(ids.clone()));
+            }
             if let Some(from) = query.date_from.as_deref() {
                 filter = filter.filter(activities::activity_date.ge(format!("{from}T00:00:00")));
             }
@@ -1165,6 +1136,27 @@ impl ScopeVerdict {
     pub fn is_eligible(self) -> bool {
         self == ScopeVerdict::Eligible
     }
+}
+
+/// One qualification definition for paged ordinary rows and full native aggregates.
+/// Account eligibility and facts are read on the same SQLite connection.
+pub(crate) fn ordinary_activity_scope(
+) -> wealthfolio_storage_sqlite::schema::activities::BoxedQuery<'static, diesel::sqlite::Sqlite> {
+    use diesel::prelude::*;
+    use wealthfolio_storage_sqlite::schema::{accounts, activities};
+    let eligible = accounts::table
+        .filter(accounts::is_active.eq(true))
+        .filter(accounts::is_archived.eq(false))
+        .filter(accounts::account_type.eq_any(wealthfolio_core::accounts::SPENDING_ACCOUNT_TYPES))
+        .select(accounts::id);
+    activities::table
+        .filter(activities::account_id.eq_any(eligible))
+        .filter(activities::status.eq("POSTED"))
+        .filter(activities::asset_id.is_null())
+        .filter(activities::source_group_id.is_null())
+        .filter(activities::subtype.is_null().or(activities::subtype.eq("")))
+        .filter(activities::activity_type.eq_any([ACTIVITY_TYPE_DEPOSIT, ACTIVITY_TYPE_WITHDRAWAL]))
+        .into_boxed()
 }
 
 #[cfg(test)]

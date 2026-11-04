@@ -6,7 +6,10 @@
 
 use wealthfolio_business::audit::BusinessChannel;
 
-use crate::scope::AgentScopeSet;
+use crate::scope::{AgentScope, AgentScopeSet};
+use wealthfolio_business::investment_journal::{
+    JournalActorKind, JournalCaller, JournalFactPermissions,
+};
 
 /// How the caller was authenticated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +55,39 @@ pub struct ToolCallContext {
 }
 
 impl ToolCallContext {
+    /// Map authenticated host facts, never tool arguments. A program keeps its
+    /// program identity even when it declares USER_PROVIDED contents or a GUI channel.
+    pub fn journal_caller(&self) -> JournalCaller {
+        let read = self.scopes.grants_all(&[
+            AgentScope::InvestmentsRead,
+            AgentScope::AccountsRead,
+            AgentScope::HoldingsRead,
+            AgentScope::ActivitiesRead,
+        ]);
+        let write = read && self.scopes.contains(AgentScope::InvestmentsWrite);
+        let gui_session =
+            self.actor_kind == CallActorKind::Session && self.channel == BusinessChannel::Gui;
+        JournalCaller {
+            channel: self.channel,
+            actor_id: self.actor.clone(),
+            credential_id: self.credential_id.clone(),
+            actor_kind: if gui_session {
+                JournalActorKind::GuiSession
+            } else {
+                JournalActorKind::Program
+            },
+            authenticated: self.authenticated,
+            can_read: read,
+            can_write: write,
+            can_confirm: write && self.scopes.contains(AgentScope::InvestmentsConfirm),
+            fact_permissions: JournalFactPermissions {
+                holdings_write: self.scopes.contains(AgentScope::HoldingsWrite),
+                transfers_write: self.scopes.contains(AgentScope::TransfersWrite),
+                // External security writes retain the existing manual-only boundary.
+                activities_write: gui_session && self.scopes.contains(AgentScope::ActivitiesWrite),
+            },
+        }
+    }
     pub fn pat(
         actor: impl Into<String>,
         credential_id: Option<String>,
@@ -110,5 +146,83 @@ impl ToolCallContext {
     pub fn with_channel(mut self, channel: BusinessChannel) -> Self {
         self.channel = channel;
         self
+    }
+}
+
+#[cfg(test)]
+mod journal_tests {
+    use super::*;
+    fn granted() -> AgentScopeSet {
+        AgentScopeSet::from_strs([
+            "accounts:read",
+            "holdings:read",
+            "activities:read",
+            "investments:read",
+            "investments:write",
+        ])
+    }
+    #[test]
+    fn ordinary_write_never_grants_confirmation_or_ledger_security_writes() {
+        let context = ToolCallContext::pat("program", Some("credential".into()), granted())
+            .with_channel(BusinessChannel::Cli);
+        let caller = context.journal_caller();
+        assert!(caller.require_write().is_ok());
+        assert!(caller.require_confirm().is_err());
+        assert!(matches!(caller.actor_kind, JournalActorKind::Program));
+        assert_eq!(caller.actor_id, "program");
+        assert_eq!(caller.credential_id.as_deref(), Some("credential"));
+        let mut confirmed = context.clone();
+        confirmed.scopes.insert(AgentScope::InvestmentsConfirm);
+        assert!(confirmed.journal_caller().require_confirm().is_ok());
+        confirmed.scopes.insert(AgentScope::ActivitiesWrite);
+        confirmed.scopes.insert(AgentScope::ActivitiesDraft);
+        confirmed.channel = BusinessChannel::Gui;
+        let mapped = confirmed.journal_caller();
+        assert!(!mapped.fact_permissions.activities_write);
+        assert!(matches!(mapped.actor_kind, JournalActorKind::Program));
+    }
+    #[test]
+    fn old_tokens_and_incomplete_dependencies_cannot_enter_the_journal() {
+        let old = ToolCallContext::pat(
+            "old",
+            None,
+            AgentScopeSet::from_strs([
+                "accounts:read",
+                "holdings:read",
+                "activities:read",
+                "holdings:write",
+            ]),
+        );
+        assert!(old.journal_caller().require_read().is_err());
+        let mut incomplete = ToolCallContext::pat(
+            "incomplete",
+            None,
+            AgentScopeSet::from_strs([
+                "investments:read",
+                "investments:write",
+                "investments:confirm",
+            ]),
+        );
+        assert!(incomplete.journal_caller().require_confirm().is_err());
+        incomplete.authenticated = false;
+        incomplete.scopes = granted();
+        assert!(incomplete.journal_caller().require_write().is_err());
+        assert!(ToolCallContext::anonymous(granted())
+            .journal_caller()
+            .require_read()
+            .is_err());
+    }
+    #[test]
+    fn gui_session_identity_does_not_imply_independent_confirmation_permission() {
+        let mut context = ToolCallContext::session("unlocked-session", granted());
+        context.scopes.insert(AgentScope::ActivitiesWrite);
+        let mapped = context.journal_caller();
+        assert!(matches!(mapped.actor_kind, JournalActorKind::GuiSession));
+        assert!(mapped.fact_permissions.activities_write);
+        assert!(mapped.require_confirm().is_err());
+        context.scopes.insert(AgentScope::InvestmentsConfirm);
+        assert!(context.journal_caller().require_confirm().is_ok());
+        context.channel = BusinessChannel::Rest;
+        assert!(context.journal_caller().require_read().is_err());
     }
 }

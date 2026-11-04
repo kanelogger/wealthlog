@@ -2908,6 +2908,7 @@ mod tests {
             performance_eligible_value_base: total,
             value_status: ValueStatus::Complete,
             basis_status: BasisStatus::default(),
+            quote_inputs: None,
             flow: DailyFlow::default(),
         }
     }

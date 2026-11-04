@@ -36,14 +36,14 @@ pub use measure::{
     measure_account, measure_price_series, measure_scope, MeasureInputs, MeasureProfile,
 };
 pub use normalize::{
-    fx_conflicts, normalize, normalize_fx_rates, normalize_quotes, FxConflict, Normalized,
-    FX_CONFLICT_TOLERANCE,
+    fx_conflicts, normalize, normalize_fx_rates, normalize_fx_rates_with_sources, normalize_quotes,
+    FxConflict, Normalized, FX_CONFLICT_TOLERANCE,
 };
 pub use project::lot_records;
 pub use project::{project, project_accounts};
 pub use resolve::{
-    group_splits, resolve_surfaces, split_quantity_factor, FxResolver, FxSurface, QuoteSurface,
-    ResolvedSurfaces, SplitEvent, SplitRow,
+    group_splits, group_splits_with_sources, resolve_surfaces, split_quantity_factor, FxResolver,
+    FxSurface, QuoteSurface, ResolvedSurfaces, SelectedSplit, SplitEvent, SplitRow,
 };
 pub use scope::{facts_needed, FactsRequest};
 pub use value::{aggregate_scope, effects, value, value_window, Resolved, ValueInputs, Window};

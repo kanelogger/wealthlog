@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use chrono::NaiveDate;
 
-use super::net_worth_model::{NetWorthHistoryPoint, NetWorthResponse};
+use super::net_worth_model::{DetailedNetWorthResponse, NetWorthHistoryPoint, NetWorthResponse};
 use crate::errors::Result;
 
 /// Trait defining the contract for net worth service operations.
@@ -24,6 +24,13 @@ pub trait NetWorthServiceTrait: Send + Sync {
     /// - Breakdown by category
     /// - Staleness information
     async fn get_net_worth(&self, date: NaiveDate) -> Result<NetWorthResponse>;
+
+    /// Detailed diagnostics are opt-in; a legacy implementation cannot claim completeness.
+    async fn get_net_worth_detailed(&self, _date: NaiveDate) -> Result<DetailedNetWorthResponse> {
+        Err(crate::errors::Error::Calculation(
+            crate::errors::CalculatorError::Calculation("Detailed net worth is unavailable".into()),
+        ))
+    }
 
     /// Get net worth history over a date range.
     ///

@@ -23,6 +23,9 @@ pub enum AgentScope {
     HoldingsWrite,
     ClassificationSuggest,
     ClassificationWrite,
+    InvestmentsRead,
+    InvestmentsWrite,
+    InvestmentsConfirm,
 }
 
 impl AgentScope {
@@ -35,6 +38,7 @@ impl AgentScope {
         AgentScope::ActivitiesRead,
         AgentScope::HealthRead,
         AgentScope::ClassificationRead,
+        AgentScope::InvestmentsRead,
         AgentScope::ActivitiesDraft,
         AgentScope::ActivitiesWrite,
         AgentScope::OrdinaryWrite,
@@ -42,6 +46,8 @@ impl AgentScope {
         AgentScope::HoldingsWrite,
         AgentScope::ClassificationSuggest,
         AgentScope::ClassificationWrite,
+        AgentScope::InvestmentsWrite,
+        AgentScope::InvestmentsConfirm,
     ];
 
     /// The read-only scopes — what the `read-only` preset grants. Kept
@@ -54,6 +60,7 @@ impl AgentScope {
         AgentScope::ActivitiesRead,
         AgentScope::HealthRead,
         AgentScope::ClassificationRead,
+        AgentScope::InvestmentsRead,
     ];
 
     /// Canonical wire format, e.g. `"accounts:read"`.
@@ -72,6 +79,9 @@ impl AgentScope {
             AgentScope::HoldingsWrite => "holdings:write",
             AgentScope::ClassificationSuggest => "classification:suggest",
             AgentScope::ClassificationWrite => "classification:write",
+            AgentScope::InvestmentsRead => "investments:read",
+            AgentScope::InvestmentsWrite => "investments:write",
+            AgentScope::InvestmentsConfirm => "investments:confirm",
         }
     }
 
@@ -168,6 +178,27 @@ impl AgentScopeSet {
     /// granted scope is missing a prerequisite: committing requires the
     /// matching draft/suggest scope.
     pub fn dependency_error(&self) -> Option<String> {
+        if self.contains(AgentScope::InvestmentsRead)
+            && !self.grants_all(&[
+                AgentScope::AccountsRead,
+                AgentScope::HoldingsRead,
+                AgentScope::ActivitiesRead,
+            ])
+        {
+            return Some(
+                "investments:read requires accounts:read, holdings:read and activities:read".into(),
+            );
+        }
+        if self.contains(AgentScope::InvestmentsWrite)
+            && !self.contains(AgentScope::InvestmentsRead)
+        {
+            return Some("investments:write requires investments:read".into());
+        }
+        if self.contains(AgentScope::InvestmentsConfirm)
+            && !self.contains(AgentScope::InvestmentsWrite)
+        {
+            return Some("investments:confirm requires investments:write".into());
+        }
         if self.contains(AgentScope::ActivitiesWrite) && !self.contains(AgentScope::ActivitiesDraft)
         {
             return Some(
@@ -228,6 +259,36 @@ mod tests {
             incomplete.insert(scope);
             assert!(incomplete.dependency_error().is_some());
         }
+    }
+
+    #[test]
+    fn journal_permission_dependencies_and_independent_confirmation() {
+        let mut scopes = AgentScopeSet::from_strs(["investments:confirm"]);
+        assert!(scopes.dependency_error().is_some());
+        scopes.insert(AgentScope::InvestmentsWrite);
+        assert!(scopes.dependency_error().is_some());
+        scopes.insert(AgentScope::InvestmentsRead);
+        assert!(scopes.dependency_error().is_some());
+        for required in [
+            AgentScope::AccountsRead,
+            AgentScope::HoldingsRead,
+            AgentScope::ActivitiesRead,
+        ] {
+            scopes.insert(required);
+        }
+        assert!(scopes.dependency_error().is_none());
+        let read = AgentScopeSet::read_only();
+        assert!(read.contains(AgentScope::InvestmentsRead));
+        assert!(!read.contains(AgentScope::InvestmentsWrite));
+        assert!(!read.contains(AgentScope::InvestmentsConfirm));
+        let legacy = AgentScopeSet::from_strs([
+            "accounts:read",
+            "holdings:read",
+            "activities:read",
+            "holdings:write",
+        ]);
+        assert!(!legacy.contains(AgentScope::InvestmentsRead));
+        assert!(!legacy.contains(AgentScope::InvestmentsConfirm));
     }
 
     #[test]

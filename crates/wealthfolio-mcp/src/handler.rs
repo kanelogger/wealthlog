@@ -353,7 +353,10 @@ impl ServerHandler for WealthfolioMcpHandler {
         let requires_profile = matches!(
             tool.access_level(),
             wealthfolio_agent_tools::AgentToolAccess::Write
-        );
+        )
+            || wealthfolio_agent_tools::tools::investment_journal::journal_formal_write(
+                tool.name(),
+            );
         self.check_profile(&ctx, requires_profile, effective_ledger)?;
 
         let args = request

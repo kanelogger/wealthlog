@@ -227,6 +227,17 @@ pub fn normalize_fx_rates(
     raw: Vec<RawFxRate>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<FxObservation> {
+    normalize_fx_rates_with_sources(raw, diagnostics)
+        .into_iter()
+        .map(|(observation, _)| observation)
+        .collect()
+}
+
+/// Same canonical choice, retaining its original provider for source checks.
+pub fn normalize_fx_rates_with_sources(
+    raw: Vec<RawFxRate>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<(FxObservation, String)> {
     let mut fx_rates = Vec::with_capacity(raw.len());
     for rate in raw {
         match (Currency::parse(&rate.from), Currency::parse(&rate.to)) {
@@ -276,12 +287,12 @@ pub fn normalize_fx_rates(
             .then_with(|| a_source.cmp(b_source))
             .then_with(|| a.rate.cmp(&b.rate))
     });
-    let mut fx_rates: Vec<FxObservation> = fx_rates
+    let mut fx_rates: Vec<(FxObservation, String)> = fx_rates
         .into_iter()
-        .map(|(_, _, observation)| observation)
+        .map(|(_, source, observation)| (observation, source))
         .collect();
     fx_rates.dedup_by(|later, earlier| {
-        later.from == earlier.from && later.to == earlier.to && later.day == earlier.day
+        later.0.from == earlier.0.from && later.0.to == earlier.0.to && later.0.day == earlier.0.day
     });
     fx_rates
 }

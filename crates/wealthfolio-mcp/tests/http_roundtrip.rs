@@ -136,6 +136,35 @@ struct HiddenTool;
 /// A formal-write tool: filtered from every MCP catalog and catalog listing.
 struct WriteTool;
 
+/// A custom adapter accidentally labels a known journal mutation as a draft.
+/// Host binding still follows the authoritative command classification.
+struct JournalDraftLabel;
+#[async_trait::async_trait]
+impl AgentTool for JournalDraftLabel {
+    fn name(&self) -> &'static str {
+        "save_investment_decision_draft"
+    }
+    fn description(&self) -> &'static str {
+        "Synthetic mislabeled command; must not execute"
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object"})
+    }
+    fn required_scopes(&self) -> &'static [AgentScope] {
+        &[AgentScope::AccountsRead]
+    }
+    fn access_level(&self) -> AgentToolAccess {
+        AgentToolAccess::Draft
+    }
+    async fn call(
+        &self,
+        _env: Arc<dyn AgentEnvironment>,
+        _args: serde_json::Value,
+    ) -> Result<AgentToolResult, AgentToolError> {
+        panic!("journal call reached a service without explicit ledger binding")
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentTool for WriteTool {
     fn name(&self) -> &'static str {
@@ -264,6 +293,45 @@ fn init_body() -> serde_json::Value {
             "clientInfo": { "name": "test", "version": "1.0" }
         }
     })
+}
+
+#[tokio::test]
+async fn journal_binding_and_server_hiding_ignore_a_custom_draft_label() {
+    use wealthfolio_agent_tools::McpHost;
+    for host in [McpHost::Desktop, McpHost::Server] {
+        let service = McpServerBuilder::new(Arc::new(StubEnv))
+            .host(host)
+            .ledger("synthetic-ledger")
+            .tools(vec![Arc::new(JournalDraftLabel)])
+            .build_http_service(
+                StreamableHttpServerConfig::default()
+                    .with_stateful_mode(false)
+                    .with_json_response(true)
+                    .with_sse_keep_alive(None),
+            );
+        let router = axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(middleware::from_fn(inject_auth));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = reqwest::Client::new();
+        let initialized = rpc(&client, &url, init_body()).await;
+        assert_eq!(initialized["result"]["serverInfo"]["name"], "wealthlog");
+        let call=rpc(&client,&url,serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"save_investment_decision_draft","arguments":{}}})).await;
+        if host == McpHost::Desktop {
+            assert_eq!(call["error"]["data"]["code"], "profile_required");
+        } else {
+            assert!(call["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unknown tool"));
+        }
+        server.abort();
+        let _ = server.await;
+    }
 }
 
 #[tokio::test]

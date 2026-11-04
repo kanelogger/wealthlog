@@ -189,7 +189,7 @@ pub(crate) const SQL_WHITESPACE: &str = "char(9, 10, 11, 12, 13, 32, 133, 160, 5
 /// its override when not blank, else its stored type, as core's
 /// `effective_activity_type` and the engine read it (engine rules §5). Every
 /// query reads the type through this.
-pub(crate) fn effective_type_sql(table: &str) -> String {
+pub fn effective_type_sql(table: &str) -> String {
     format!(
         "COALESCE(NULLIF(TRIM({table}.activity_type_override, {SQL_WHITESPACE}), ''), {table}.activity_type)"
     )

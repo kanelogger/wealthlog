@@ -24,6 +24,15 @@ pub struct ExchangeRate {
     pub timestamp: DateTime<Utc>,
 }
 
+/// One native route resolution: its exact result and its original dated basis
+/// stay together. A missing source date is normal for deterministic identities.
+#[derive(Debug, Clone)]
+pub struct ExchangeRateObservation {
+    pub rate: Decimal,
+    pub source_date: Option<NaiveDate>,
+    pub verified: bool,
+}
+
 impl ExchangeRate {
     /// Converts this exchange rate into a Quote for database storage.
     /// `self.id` must be the asset UUID.

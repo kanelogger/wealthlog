@@ -194,6 +194,9 @@ pub struct DailyValuation {
     pub performance_eligible_value_base: Decimal,
     pub value_status: ValueStatus,
     pub basis_status: BasisStatus,
+    /// Native market rows used for this account day. Aggregate and legacy rows have no proof.
+    #[serde(skip)]
+    pub quote_inputs: Option<Vec<super::QuoteObservation>>,
     pub flow: DailyFlow,
 }
 
@@ -219,6 +222,7 @@ impl DailyValuation {
             performance_eligible_value_base: r(self.performance_eligible_value_base),
             value_status: self.value_status,
             basis_status: self.basis_status,
+            quote_inputs: self.quote_inputs.clone(),
             flow: DailyFlow {
                 inflow_base: r(self.flow.inflow_base),
                 outflow_base: r(self.flow.outflow_base),

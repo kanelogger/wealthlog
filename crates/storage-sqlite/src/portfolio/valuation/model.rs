@@ -43,6 +43,7 @@ pub struct DailyAccountValuationDB {
     pub value_status: String,
     pub basis_status: String,
     pub calculated_at: String,
+    pub quote_inputs: Option<String>,
 }
 
 impl From<DailyAccountValuation> for DailyAccountValuationDB {
@@ -101,6 +102,9 @@ impl From<DailyAccountValuation> for DailyAccountValuationDB {
             value_status: value.value_status.as_str().to_string(),
             basis_status: value.basis_status.as_str().to_string(),
             calculated_at: value.calculated_at.to_rfc3339(),
+            quote_inputs: value
+                .quote_inputs
+                .and_then(|quotes| serde_json::to_string(&quotes).ok()),
         }
     }
 }
@@ -144,6 +148,9 @@ impl From<DailyAccountValuationDB> for DailyAccountValuation {
             .unwrap_or_default(),
             value_status: ValuationStatus::from_code(&value.value_status),
             basis_status: BasisStatus::from_code(&value.basis_status),
+            quote_inputs: value
+                .quote_inputs
+                .and_then(|quotes| serde_json::from_str(&quotes).ok()),
             calculated_at: DateTime::parse_from_rfc3339(&value.calculated_at)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),
@@ -189,6 +196,7 @@ mod tests {
             external_flow_source: "NET_CONTRIBUTION_FALLBACK".to_string(),
             performance_eligible_value_base: "30".to_string(),
             value_status: "PARTIAL_UNPRICED".to_string(),
+            quote_inputs: None,
             basis_status: "PARTIAL_UNKNOWN".to_string(),
             calculated_at: "2026-04-22T00:00:00Z".to_string(),
         };
@@ -233,6 +241,7 @@ mod tests {
             external_flow_source: "MIXED_EXACT".to_string(),
             performance_eligible_value_base: "30".to_string(),
             value_status: "COMPLETE".to_string(),
+            quote_inputs: None,
             basis_status: "COMPLETE".to_string(),
             calculated_at: "2026-04-23T00:00:00Z".to_string(),
         };

@@ -188,6 +188,7 @@ fn aggregate_rows(
                 performance_eligible_value_base: Decimal::ZERO,
                 value_status: ValuationStatus::Complete,
                 basis_status: BasisStatus::NotApplicable,
+                quote_inputs: None,
                 calculated_at: row.calculated_at,
             });
         entry.cash_balance += row.cash_balance_base;

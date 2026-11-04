@@ -36,6 +36,84 @@ impl ProjectionStore {
 
 const SOURCE_CALCULATED: &str = "CALCULATED";
 
+/// Reuse the coordinator's persistent invalidations. Price-only changes do not
+/// invalidate native holdings when the caller is revaluing them live.
+pub(crate) fn pending_for_read(
+    conn: &mut SqliteConnection,
+    snapshots: &HashMap<String, wealthfolio_core::portfolio::snapshot::AccountStateSnapshot>,
+    day: NaiveDate,
+    read_scope: wealthfolio_core::portfolio::projection::ProjectionReadScope,
+) -> Result<std::collections::BTreeSet<String>> {
+    use wealthfolio_core::portfolio::projection::ProjectionReadScope;
+    let rows: Vec<MarkerRow> = diesel::sql_query(
+        "SELECT scope,dirty_from,version FROM projection_state WHERE dirty_from IS NOT NULL",
+    )
+    .load(conn)
+    .map_err(StorageError::from)?;
+    let markers: Vec<_> = rows
+        .into_iter()
+        .filter(|row| {
+            row.dirty_from
+                .as_deref()
+                .and_then(parse_day)
+                .unwrap_or(GENESIS)
+                <= day
+        })
+        .map(|row| MarkerScope::parse(&row.scope))
+        .collect();
+    if markers.iter().any(|scope| {
+        matches!(scope, MarkerScope::All)
+            || (read_scope != ProjectionReadScope::Holdings && matches!(scope, MarkerScope::Fx(_)))
+    }) {
+        return Ok(snapshots.keys().cloned().collect());
+    }
+    let mut pending = std::collections::BTreeSet::new();
+    let mut assets = HashSet::new();
+    for scope in markers {
+        match scope {
+            MarkerScope::Account(account) => {
+                if snapshots.contains_key(&account) {
+                    pending.insert(account);
+                }
+            }
+            MarkerScope::Asset(asset) => {
+                assets.insert(asset);
+            }
+            MarkerScope::Prices(asset) if read_scope == ProjectionReadScope::FullValuation => {
+                assets.insert(asset);
+            }
+            _ => {}
+        }
+    }
+    if assets.is_empty() {
+        return Ok(pending);
+    }
+    for (account, snapshot) in snapshots {
+        if snapshot
+            .positions
+            .keys()
+            .any(|asset| assets.contains(asset))
+        {
+            pending.insert(account.clone());
+        }
+    }
+    // Asset facts can also affect the historical fold of an account which no
+    // longer holds the asset. Query only when an asset marker actually exists.
+    #[derive(QueryableByName)]
+    struct AccountRow {
+        #[diesel(sql_type=Text)]
+        account_id: String,
+    }
+    let account_ids = serde_json::to_string(&snapshots.keys().collect::<Vec<_>>())
+        .map_err(|e| wealthfolio_core::Error::Unexpected(e.to_string()))?;
+    let asset_ids = serde_json::to_string(&assets)
+        .map_err(|e| wealthfolio_core::Error::Unexpected(e.to_string()))?;
+    let exposed: Vec<AccountRow> = diesel::sql_query("SELECT DISTINCT account_id FROM activities WHERE account_id IN (SELECT value FROM json_each(?1)) AND asset_id IN (SELECT value FROM json_each(?2))")
+        .bind::<Text,_>(account_ids).bind::<Text,_>(asset_ids).load(conn).map_err(StorageError::from)?;
+    pending.extend(exposed.into_iter().map(|row| row.account_id));
+    Ok(pending)
+}
+
 /// Lowers a marker's dirty day and bumps its version, as the triggers do.
 const INVALIDATE: &str = "INSERT INTO projection_state (scope, dirty_from, version) VALUES (?, ?, 1) \
      ON CONFLICT (scope) DO UPDATE SET \
@@ -589,6 +667,7 @@ mod tests {
             performance_eligible_value_base: Decimal::from(total),
             value_status: ValuationStatus::Complete,
             basis_status: BasisStatus::Complete,
+            quote_inputs: None,
             calculated_at: Utc::now(),
         }
     }

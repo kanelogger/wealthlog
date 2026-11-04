@@ -7,9 +7,11 @@ use rust_decimal::Decimal;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use super::details::NetWorthDetails;
 use super::net_worth_model::{
-    AssetCategory, AssetsSection, BreakdownItem, LiabilitiesSection, NetWorthHistoryPoint,
-    NetWorthResponse, StaleAssetInfo, ValuationInfo,
+    AssetCategory, AssetsSection, BreakdownItem, DetailedNetWorthResponse, DetailedValuationBasis,
+    LiabilitiesSection, NetWorthHistoryPoint, NetWorthIssueCode, NetWorthResponse, StaleAssetInfo,
+    ValuationInfo,
 };
 use super::net_worth_traits::NetWorthServiceTrait;
 use crate::accounts::{account_types, is_liability_account_type, AccountRepositoryTrait};
@@ -21,7 +23,7 @@ use crate::fx::currency::normalize_amount;
 use crate::fx::FxServiceTrait;
 use crate::portfolio::snapshot::SnapshotServiceTrait;
 use crate::portfolio::valuation::{DailyAccountValuation, ValuationRepositoryTrait};
-use crate::quotes::QuoteServiceTrait;
+use crate::quotes::{Quote, QuoteServiceTrait, QuoteSourceQuality};
 use crate::utils::time_utils::parse_user_timezone_or_default;
 
 /// Number of days after which a valuation is considered stale.
@@ -164,14 +166,41 @@ impl NetWorthService {
         asset_id: &str,
         date: NaiveDate,
     ) -> Option<(Decimal, String, NaiveDate)> {
-        // Get all quotes for this symbol and find the latest one <= date
+        self.selected_quote_as_of(asset_id, date)
+            .map(|q| (q.close, q.currency, q.timestamp.date_naive()))
+    }
+
+    fn selected_quote_as_of(&self, asset_id: &str, date: NaiveDate) -> Option<Quote> {
+        // Preserve the original selection and legacy values. Source validation
+        // is a separate diagnostic, never a silent switch to an older price.
         let quotes = self.quote_service.get_historical_quotes(asset_id).ok()?;
 
         quotes
             .iter()
             .filter(|q| q.timestamp.date_naive() <= date)
             .max_by_key(|q| q.timestamp.date_naive())
-            .map(|q| (q.close, q.currency.clone(), q.timestamp.date_naive()))
+            .cloned()
+    }
+
+    fn quote_with_sources(
+        &self,
+        asset_id: &str,
+        date: NaiveDate,
+        sources: &mut HashMap<String, Quote>,
+    ) -> Option<(Decimal, String, NaiveDate)> {
+        if !sources.contains_key(asset_id) {
+            sources.insert(
+                asset_id.to_string(),
+                self.selected_quote_as_of(asset_id, date)?,
+            );
+        }
+        sources.get(asset_id).map(|quote| {
+            (
+                quote.close,
+                quote.currency.clone(),
+                quote.timestamp.date_naive(),
+            )
+        })
     }
 
     /// Calculate market value for a position, converting to base currency.
@@ -199,6 +228,44 @@ impl NetWorthService {
         )?;
 
         Ok(converted.round_dp(DECIMAL_PRECISION))
+    }
+
+    fn fx_is_known(
+        &self,
+        from: &str,
+        to: &str,
+        date: NaiveDate,
+        details: &mut NetWorthDetails,
+        item: &str,
+        projected: bool,
+    ) -> bool {
+        if from == to {
+            return true;
+        }
+        let read = details
+            .fx_reads
+            .entry((from.into(), to.into(), date, projected))
+            .or_insert_with(|| {
+                if projected {
+                    self.fx_service
+                        .get_projection_exchange_rate_observation(from, to, date)
+                        .ok()
+                } else {
+                    self.fx_service
+                        .get_exchange_rate_observation(from, to, Some(date))
+                        .ok()
+                }
+            })
+            .clone();
+        let Some(read) = read else {
+            return false;
+        };
+        if read.verified {
+            if let Some(day) = read.source_date {
+                details.fx_date(item, day);
+            }
+        }
+        read.verified && read.rate > Decimal::ZERO
     }
 
     fn convert_cash_balance_to_base(
@@ -242,7 +309,7 @@ impl NetWorthService {
     }
 
     /// Get category key string for serialization.
-    fn category_key(category: AssetCategory) -> &'static str {
+    pub(super) fn category_key(category: AssetCategory) -> &'static str {
         match category {
             AssetCategory::Cash => "cash",
             AssetCategory::Investment => "investments",
@@ -396,6 +463,10 @@ impl NetWorthService {
 #[async_trait]
 impl NetWorthServiceTrait for NetWorthService {
     async fn get_net_worth(&self, date: NaiveDate) -> Result<NetWorthResponse> {
+        Ok(self.get_net_worth_detailed(date).await?.legacy)
+    }
+
+    async fn get_net_worth_detailed(&self, date: NaiveDate) -> Result<DetailedNetWorthResponse> {
         let base_currency = self
             .base_currency
             .read()
@@ -428,7 +499,95 @@ impl NetWorthServiceTrait for NetWorthService {
             .map(|valuation| (valuation.account_id.clone(), valuation))
             .collect();
 
+        let stored_quote_keys: Vec<_> = stored_valuations_by_account
+            .values()
+            .filter_map(|row| row.quote_inputs.as_ref())
+            .flatten()
+            .map(|quote| {
+                (
+                    quote.asset.as_str().to_string(),
+                    quote.day,
+                    quote.source.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let stored_quotes = if stored_quote_keys.is_empty() {
+            Vec::new()
+        } else {
+            self.quote_service
+                .get_quotes_by_source_keys(&stored_quote_keys)
+                .unwrap_or_default()
+        };
+        let stored_quote_checks = self
+            .quote_service
+            .verify_quote_sources(&stored_quotes)
+            .unwrap_or_default();
+        let stored_quotes: HashMap<_, _> = stored_quotes
+            .into_iter()
+            .map(|quote| {
+                (
+                    (
+                        quote.asset_id.clone(),
+                        quote.timestamp.date_naive(),
+                        quote.data_source.clone(),
+                    ),
+                    quote,
+                )
+            })
+            .collect();
+
         let mut valuations: Vec<ValuationInfo> = Vec::new();
+        let mut details = NetWorthDetails::default();
+        let pending_holdings = self
+            .snapshot_service
+            .pending_projection_accounts(
+                &snapshots,
+                date,
+                crate::portfolio::projection::ProjectionReadScope::Holdings,
+            )
+            .ok()
+            .flatten();
+        let pending_values = self
+            .snapshot_service
+            .pending_projection_accounts(
+                &snapshots,
+                date,
+                crate::portfolio::projection::ProjectionReadScope::FullValuation,
+            )
+            .ok()
+            .flatten();
+        let pending_cash = self
+            .snapshot_service
+            .pending_projection_accounts(
+                &snapshots,
+                date,
+                crate::portfolio::projection::ProjectionReadScope::CashValuation,
+            )
+            .ok()
+            .flatten();
+        let missing_final_cash = self
+            .snapshot_service
+            .snapshots_missing_final_cash(&snapshots)?;
+        let mut quote_sources = HashMap::new();
+        for account in &accounts {
+            if !snapshots.contains_key(&account.id) {
+                details.issue(
+                    NetWorthIssueCode::MissingSnapshot,
+                    &format!("ACCOUNT:{}", account.id),
+                    Some(&account.id),
+                    None,
+                    Some(&account.name),
+                    if is_liability_account_type(&account.account_type) {
+                        "liabilities"
+                    } else {
+                        "cash"
+                    },
+                    Some(&account.currency),
+                );
+            }
+        }
 
         // Process each account's snapshot
         for (account_id, snapshot) in &snapshots {
@@ -448,7 +607,318 @@ impl NetWorthServiceTrait for NetWorthService {
                 stored_valuations_by_account.get(account_id)
             };
 
+            if missing_final_cash.contains(account_id) {
+                // The omitted settlement may change the sign of a credit-card
+                // balance, so both financial assets and liabilities can be incomplete.
+                let cash_items = if is_liability_account {
+                    vec![
+                        (format!("CASH:{account_id}"), "cash", None),
+                        (format!("CREDIT_CARD:{account_id}"), "liabilities", None),
+                    ]
+                } else if stored_account_valuation.is_some() || snapshot.cash_balances.is_empty() {
+                    vec![(format!("CASH:{account_id}"), "cash", None)]
+                } else {
+                    snapshot
+                        .cash_balances
+                        .keys()
+                        .map(|currency| {
+                            (
+                                format!("CASH:{account_id}:{currency}"),
+                                "cash",
+                                Some(currency.as_str()),
+                            )
+                        })
+                        .collect()
+                };
+                for (item, category, currency) in cash_items {
+                    details.date(&item, snapshot.snapshot_date);
+                    details.issue(
+                        NetWorthIssueCode::MissingFinalCash,
+                        &item,
+                        Some(account_id),
+                        None,
+                        Some(&account.name),
+                        category,
+                        currency,
+                    );
+                }
+            }
+
+            let holdings_unverified = snapshot.source
+                == crate::portfolio::snapshot::SnapshotSource::Calculated
+                && pending_holdings
+                    .as_ref()
+                    .is_none_or(|pending| pending.contains(account_id));
+            let value_unverified = stored_account_valuation.is_some()
+                && pending_values
+                    .as_ref()
+                    .is_none_or(|pending| pending.contains(account_id));
+            let cash_unverified = stored_account_valuation.is_some()
+                && pending_cash
+                    .as_ref()
+                    .is_none_or(|pending| pending.contains(account_id));
+            if holdings_unverified || value_unverified {
+                for (item, category) in [
+                    (format!("CASH:{account_id}"), "cash"),
+                    (
+                        if is_liability_account {
+                            format!("CREDIT_CARD:{account_id}")
+                        } else {
+                            format!("INVESTMENTS:{account_id}")
+                        },
+                        if is_liability_account {
+                            "liabilities"
+                        } else {
+                            "investments"
+                        },
+                    ),
+                ] {
+                    if category == "cash"
+                        && stored_account_valuation.is_none()
+                        && !is_liability_account
+                        && !snapshot.cash_balances.is_empty()
+                    {
+                        continue;
+                    }
+                    if category == "cash" && !holdings_unverified && !cash_unverified {
+                        continue;
+                    }
+                    if category != "cash" && !holdings_unverified && !value_unverified {
+                        continue;
+                    }
+                    details.issue(
+                        NetWorthIssueCode::ProjectionNotCurrent,
+                        &item,
+                        Some(account_id),
+                        None,
+                        Some(&account.name),
+                        category,
+                        Some(&account.currency),
+                    );
+                }
+                if holdings_unverified && stored_account_valuation.is_none() {
+                    if !is_liability_account {
+                        for currency in snapshot.cash_balances.keys() {
+                            details.issue(
+                                NetWorthIssueCode::ProjectionNotCurrent,
+                                &format!("CASH:{account_id}:{currency}"),
+                                Some(account_id),
+                                None,
+                                Some(&format!("{} ({currency})", account.name)),
+                                "cash",
+                                Some(currency),
+                            );
+                        }
+                    }
+                    for (asset_id, position) in &snapshot.positions {
+                        if position.quantity.is_zero() {
+                            continue;
+                        }
+                        let asset = asset_map.get(asset_id);
+                        let category = asset.map_or(account_category, |asset| {
+                            Self::categorize_by_asset_kind(&asset.kind)
+                        });
+                        details.issue(
+                            NetWorthIssueCode::ProjectionNotCurrent,
+                            asset_id,
+                            Some(account_id),
+                            Some(asset_id),
+                            asset.and_then(|asset| asset.name.as_deref()),
+                            Self::category_key(category),
+                            Some(&position.currency),
+                        );
+                    }
+                }
+            }
+
             if let Some(account_valuation) = stored_account_valuation {
+                let investment_id = format!("INVESTMENTS:{}", account.id);
+                let cash_id = format!("CASH:{}", account.id);
+                details.basis.insert(
+                    investment_id.clone(),
+                    DetailedValuationBasis::StoredValuation,
+                );
+                details
+                    .basis
+                    .insert(cash_id.clone(), DetailedValuationBasis::StoredValuation);
+                details.date(&cash_id, snapshot.snapshot_date);
+                if !account_valuation.value_status.is_complete() {
+                    details.issue(
+                        NetWorthIssueCode::StoredValuationPartial,
+                        &investment_id,
+                        Some(account_id),
+                        None,
+                        Some(&account.name),
+                        "investments",
+                        None,
+                    );
+                    if account_valuation.value_status.is_unavailable_for_returns() {
+                        details.issue(
+                            NetWorthIssueCode::StoredValuationPartial,
+                            &cash_id,
+                            Some(account_id),
+                            None,
+                            Some(&account.name),
+                            "cash",
+                            None,
+                        );
+                    }
+                }
+                if account_valuation.base_currency != base_currency {
+                    details.issue(
+                        NetWorthIssueCode::StoredCurrencyMismatch,
+                        &investment_id,
+                        Some(account_id),
+                        None,
+                        Some(&account.name),
+                        "investments",
+                        Some(&account_valuation.base_currency),
+                    );
+                    details.issue(
+                        NetWorthIssueCode::StoredCurrencyMismatch,
+                        &cash_id,
+                        Some(account_id),
+                        None,
+                        Some(&account.name),
+                        "cash",
+                        Some(&account_valuation.base_currency),
+                    );
+                }
+                // Verify the exact original sources, not whichever quote a fresh
+                // query would select now. An old row without a proof stays a
+                // compatibility value only until the native projection revalues it.
+                let mut position_assets = std::collections::BTreeSet::new();
+                for (asset_id, position) in &snapshot.positions {
+                    if position.quantity.is_zero() || position.is_alternative {
+                        continue;
+                    }
+                    if let Some(asset) = asset_map.get(asset_id) {
+                        if asset.kind.is_alternative() || Self::is_expired_option_asset(asset, date)
+                        {
+                            continue;
+                        }
+                    } else {
+                        details.issue(
+                            NetWorthIssueCode::MissingAsset,
+                            &investment_id,
+                            Some(account_id),
+                            Some(asset_id),
+                            Some(&account.name),
+                            "investments",
+                            None,
+                        );
+                    }
+                    position_assets.insert(asset_id.as_str());
+                }
+                if !position_assets.is_empty()
+                    || !account_valuation.investment_market_value_base.is_zero()
+                {
+                    let proof = account_valuation.quote_inputs.as_deref();
+                    let proven_assets: std::collections::BTreeSet<_> = proof
+                        .into_iter()
+                        .flatten()
+                        .map(|quote| quote.asset.as_str())
+                        .collect();
+                    if proof.is_none_or(|inputs| inputs.len() != position_assets.len())
+                        || proven_assets != position_assets
+                        || proven_assets.is_empty()
+                    {
+                        details.issue(
+                            NetWorthIssueCode::StoredQuoteUnverified,
+                            &investment_id,
+                            Some(account_id),
+                            None,
+                            Some(&account.name),
+                            "investments",
+                            None,
+                        );
+                    } else if let Some(proof) = proof {
+                        for input in proof {
+                            let key = (
+                                input.asset.as_str().to_string(),
+                                input.day,
+                                input.source.clone(),
+                            );
+                            let verified = stored_quotes.get(&key).is_some_and(|quote| {
+                                stored_quote_checks.get(&quote.id)
+                                    == Some(&QuoteSourceQuality::Verified)
+                                    && input.close > Decimal::ZERO
+                                    && quote.close == input.close
+                                    && wealthfolio_portfolio_engine::model::Currency::parse(
+                                        &quote.currency,
+                                    )
+                                    .as_ref()
+                                        == Some(&input.currency)
+                                    && input.day <= date
+                            });
+                            if !verified {
+                                details.issue(
+                                    NetWorthIssueCode::InvalidQuoteSource,
+                                    &investment_id,
+                                    Some(account_id),
+                                    Some(input.asset.as_str()),
+                                    Some(&account.name),
+                                    "investments",
+                                    Some(input.currency.as_str()),
+                                );
+                                continue;
+                            }
+                            details.date(&investment_id, input.day);
+                            let (_, currency) =
+                                normalize_amount(Decimal::ONE, input.currency.as_str());
+                            let account_currency = account_valuation.account_currency.as_str();
+                            let quote_to_account = self.fx_is_known(
+                                currency,
+                                account_currency,
+                                date,
+                                &mut details,
+                                &investment_id,
+                                true,
+                            );
+                            let account_to_base = self.fx_is_known(
+                                account_currency,
+                                &base_currency,
+                                date,
+                                &mut details,
+                                &investment_id,
+                                true,
+                            );
+                            if !quote_to_account || !account_to_base {
+                                details.issue(
+                                    NetWorthIssueCode::MissingFx,
+                                    &investment_id,
+                                    Some(account_id),
+                                    Some(input.asset.as_str()),
+                                    Some(&account.name),
+                                    "investments",
+                                    Some(currency),
+                                );
+                            }
+                        }
+                    }
+                }
+                for (currency, amount) in &snapshot.cash_balances {
+                    if !amount.is_zero()
+                        && !self.fx_is_known(
+                            currency,
+                            &base_currency,
+                            date,
+                            &mut details,
+                            &cash_id,
+                            true,
+                        )
+                    {
+                        details.issue(
+                            NetWorthIssueCode::MissingFx,
+                            &cash_id,
+                            Some(account_id),
+                            None,
+                            Some(&account.name),
+                            "cash",
+                            Some(currency),
+                        );
+                    }
+                }
                 if !account_valuation.investment_market_value_base.is_zero() {
                     valuations.push(ValuationInfo {
                         asset_id: format!("INVESTMENTS:{}", account.id),
@@ -496,6 +966,17 @@ impl NetWorthServiceTrait for NetWorthService {
 
                     // Get asset info to determine category more precisely
                     let asset = asset_map.get(asset_id).copied();
+                    if asset.is_none() {
+                        details.issue(
+                            NetWorthIssueCode::MissingAsset,
+                            asset_id,
+                            Some(account_id),
+                            Some(asset_id),
+                            None,
+                            Self::category_key(account_category),
+                            None,
+                        );
+                    }
                     if let Some(asset) = asset {
                         if Self::is_expired_option_asset(asset, date) {
                             debug!(
@@ -521,34 +1002,74 @@ impl NetWorthServiceTrait for NetWorthService {
                     };
 
                     // Get the latest quote for this asset as of the date
-                    let (price, quote_currency, valuation_date) = match self
-                        .get_latest_quote_as_of(asset_id, date)
-                    {
-                        Some((p, c, d)) => (p, c, d),
-                        None => {
-                            // No quote found, use cost basis as fallback
-                            if position.quantity > Decimal::ZERO {
-                                let implied_price = position.total_cost_basis / position.quantity;
-                                // Use snapshot date as valuation date; cost basis is in position.currency (major unit)
-                                (
-                                    implied_price,
-                                    position.currency.clone(),
-                                    snapshot.snapshot_date,
-                                )
-                            } else {
-                                warn!(
-                                    "No quote found for {} and cannot derive from cost basis",
-                                    asset_id
+                    let (price, quote_currency, valuation_date) =
+                        match self.quote_with_sources(asset_id, date, &mut quote_sources) {
+                            Some((p, c, d)) => (p, c, d),
+                            None => {
+                                details.issue(
+                                    NetWorthIssueCode::MissingQuote,
+                                    asset_id,
+                                    Some(account_id),
+                                    Some(asset_id),
+                                    asset_name.as_deref(),
+                                    Self::category_key(category),
+                                    Some(&position.currency),
                                 );
-                                continue;
+                                // No quote found, use cost basis as fallback
+                                if position.quantity > Decimal::ZERO {
+                                    details.issue(
+                                        NetWorthIssueCode::CostBasisFallback,
+                                        asset_id,
+                                        Some(account_id),
+                                        Some(asset_id),
+                                        asset_name.as_deref(),
+                                        Self::category_key(category),
+                                        Some(&position.currency),
+                                    );
+                                    details.basis.insert(
+                                        asset_id.clone(),
+                                        DetailedValuationBasis::CostBasis,
+                                    );
+                                    let implied_price =
+                                        position.total_cost_basis / position.quantity;
+                                    // Use snapshot date as valuation date; cost basis is in position.currency (major unit)
+                                    (
+                                        implied_price,
+                                        position.currency.clone(),
+                                        snapshot.snapshot_date,
+                                    )
+                                } else {
+                                    warn!(
+                                        "No quote found for {} and cannot derive from cost basis",
+                                        asset_id
+                                    );
+                                    continue;
+                                }
                             }
-                        }
-                    };
+                        };
 
                     // Normalize minor-currency quotes (e.g. GBp → GBP, ZAc → ZAR) before valuation.
                     let (normalized_price, normalized_currency) =
                         normalize_amount(price, &quote_currency);
 
+                    if !self.fx_is_known(
+                        normalized_currency,
+                        &base_currency,
+                        date,
+                        &mut details,
+                        asset_id,
+                        false,
+                    ) {
+                        details.issue(
+                            NetWorthIssueCode::MissingFx,
+                            asset_id,
+                            Some(account_id),
+                            Some(asset_id),
+                            asset_name.as_deref(),
+                            Self::category_key(category),
+                            Some(normalized_currency),
+                        );
+                    }
                     // Calculate market value in base currency
                     let market_value_base = match self.calculate_market_value(
                         position.quantity,
@@ -560,6 +1081,15 @@ impl NetWorthServiceTrait for NetWorthService {
                     ) {
                         Ok(v) => v,
                         Err(e) => {
+                            details.issue(
+                                NetWorthIssueCode::MissingFx,
+                                asset_id,
+                                Some(account_id),
+                                Some(asset_id),
+                                asset_name.as_deref(),
+                                Self::category_key(category),
+                                Some(normalized_currency),
+                            );
                             warn!(
                                 "Failed to calculate market value for {}: {}. Using local value.",
                                 asset_id, e
@@ -582,6 +1112,22 @@ impl NetWorthServiceTrait for NetWorthService {
             if is_liability_account {
                 // Rounded before the sign checks so residual dust does not emit a
                 // phantom $0 liability (or cash) row for the account.
+                let fx_missing: Vec<_> = snapshot
+                    .cash_balances
+                    .iter()
+                    .filter(|(currency, amount)| {
+                        !amount.is_zero()
+                            && !self.fx_is_known(
+                                currency,
+                                &base_currency,
+                                date,
+                                &mut details,
+                                &format!("BALANCE:{}", account.id),
+                                false,
+                            )
+                    })
+                    .map(|(currency, _)| currency.clone())
+                    .collect();
                 let cash_base_total = snapshot
                     .cash_balances
                     .iter()
@@ -599,6 +1145,25 @@ impl NetWorthServiceTrait for NetWorthService {
                     })
                     .round_dp(DECIMAL_PRECISION);
 
+                let balance_id = if cash_base_total > Decimal::ZERO {
+                    format!("CASH:{}", account.id)
+                } else {
+                    format!("CREDIT_CARD:{}", account.id)
+                };
+                if let Some(fx_date) = details.fx_dates.remove(&format!("BALANCE:{}", account.id)) {
+                    details.fx_date(&balance_id, fx_date);
+                }
+                for currency in fx_missing {
+                    details.issue(
+                        NetWorthIssueCode::MissingFx,
+                        &balance_id,
+                        Some(account_id),
+                        None,
+                        Some(&account.name),
+                        "liabilities",
+                        Some(&currency),
+                    );
+                }
                 if cash_base_total < Decimal::ZERO {
                     valuations.push(ValuationInfo {
                         asset_id: format!("CREDIT_CARD:{}", account.id),
@@ -630,6 +1195,24 @@ impl NetWorthServiceTrait for NetWorthService {
                     continue;
                 }
 
+                if !self.fx_is_known(
+                    currency,
+                    &base_currency,
+                    date,
+                    &mut details,
+                    &format!("CASH:{}:{}", account.id, currency),
+                    false,
+                ) {
+                    details.issue(
+                        NetWorthIssueCode::MissingFx,
+                        &format!("CASH:{}:{}", account.id, currency),
+                        Some(account_id),
+                        None,
+                        Some(&format!("{} ({})", account.name, currency)),
+                        "cash",
+                        Some(currency),
+                    );
+                }
                 let cash_base = self
                     .convert_cash_balance_to_base(amount, currency, &base_currency, date)
                     .round_dp(DECIMAL_PRECISION);
@@ -687,6 +1270,13 @@ impl NetWorthServiceTrait for NetWorthService {
                     .is_some_and(|m| m.get(crate::assets::loan::LOAN_PROJECTION_KEY).is_some())
             {
                 let quotes = self.quote_service.get_historical_quotes(&asset.id)?;
+                if let Some(selected) = quotes
+                    .iter()
+                    .filter(|quote| quote.timestamp.date_naive() <= date)
+                    .max_by_key(|quote| quote.timestamp.date_naive())
+                {
+                    quote_sources.insert(asset.id.clone(), selected.clone());
+                }
                 crate::assets::loan::loan_value(
                     asset.metadata.as_ref(),
                     &quotes,
@@ -697,11 +1287,26 @@ impl NetWorthServiceTrait for NetWorthService {
             } else {
                 None
             };
+            let is_calculated = calculated.is_some();
             let Some((price, quote_currency, valuation_date)) =
-                calculated.or_else(|| self.get_latest_quote_as_of(&asset.id, date))
+                calculated.or_else(|| self.quote_with_sources(&asset.id, date, &mut quote_sources))
             else {
+                details.issue(
+                    NetWorthIssueCode::MissingQuote,
+                    &asset.id,
+                    None,
+                    Some(&asset.id),
+                    asset.name.as_deref(),
+                    Self::category_key(Self::categorize_by_asset_kind(&asset.kind)),
+                    Some(&asset.quote_ccy),
+                );
                 continue;
             };
+            if is_calculated {
+                details
+                    .basis
+                    .insert(asset.id.clone(), DetailedValuationBasis::CalculatedLoan);
+            }
 
             // For alternative assets, quantity is always 1 (value-based model)
             let quantity = Decimal::ONE;
@@ -709,6 +1314,24 @@ impl NetWorthServiceTrait for NetWorthService {
             // Normalize minor-currency quotes before valuation.
             let (normalized_price, normalized_currency) = normalize_amount(price, &quote_currency);
 
+            if !self.fx_is_known(
+                normalized_currency,
+                &base_currency,
+                date,
+                &mut details,
+                &asset.id,
+                false,
+            ) {
+                details.issue(
+                    NetWorthIssueCode::MissingFx,
+                    &asset.id,
+                    None,
+                    Some(&asset.id),
+                    asset.name.as_deref(),
+                    Self::category_key(Self::categorize_by_asset_kind(&asset.kind)),
+                    Some(normalized_currency),
+                );
+            }
             // Calculate market value in base currency
             let market_value_base = match self.calculate_market_value(
                 quantity,
@@ -720,6 +1343,15 @@ impl NetWorthServiceTrait for NetWorthService {
             ) {
                 Ok(v) => v,
                 Err(e) => {
+                    details.issue(
+                        NetWorthIssueCode::MissingFx,
+                        &asset.id,
+                        None,
+                        Some(&asset.id),
+                        asset.name.as_deref(),
+                        Self::category_key(Self::categorize_by_asset_kind(&asset.kind)),
+                        Some(normalized_currency),
+                    );
                     warn!(
                         "Failed to convert alternative asset {} value to base currency: {}. Using local value.",
                         asset.id, e
@@ -744,6 +1376,57 @@ impl NetWorthServiceTrait for NetWorthService {
             });
         }
 
+        let selected: Vec<_> = quote_sources.values().cloned().collect();
+        let checks = self
+            .quote_service
+            .verify_quote_sources(&selected)
+            .unwrap_or_default();
+        for (asset_id, quote) in &quote_sources {
+            let origin_known = checks.get(&quote.id) == Some(&QuoteSourceQuality::Verified);
+            let numeric_known =
+                crate::fx::currency::normalize_amount_exact(quote.close, &quote.currency).is_some();
+            if origin_known && numeric_known {
+                continue;
+            }
+            let code = if origin_known {
+                NetWorthIssueCode::ArithmeticOverflow
+            } else {
+                NetWorthIssueCode::InvalidQuoteSource
+            };
+            let mut affected = false;
+            for value in &valuations {
+                if value.asset_id != *asset_id {
+                    continue;
+                }
+                details.issue(
+                    code,
+                    &value.asset_id,
+                    None,
+                    Some(asset_id),
+                    value.name.as_deref(),
+                    Self::category_key(value.category),
+                    Some(&quote.currency),
+                );
+                affected = true;
+            }
+            if !affected {
+                let asset = asset_map.get(asset_id);
+                details.issue(
+                    code,
+                    asset_id,
+                    None,
+                    Some(asset_id),
+                    asset.and_then(|asset| asset.name.as_deref()),
+                    Self::category_key(
+                        asset
+                            .map(|asset| Self::categorize_by_asset_kind(&asset.kind))
+                            .unwrap_or(AssetCategory::Investment),
+                    ),
+                    Some(&quote.currency),
+                );
+            }
+        }
+
         // Build assets and liabilities sections
         let assets = Self::build_assets_section(&valuations);
         let liabilities = Self::build_liabilities_section(&valuations);
@@ -759,7 +1442,7 @@ impl NetWorthServiceTrait for NetWorthService {
             assets.total, liabilities.total, net_worth
         );
 
-        Ok(NetWorthResponse {
+        let legacy = NetWorthResponse {
             date,
             assets,
             liabilities,
@@ -767,7 +1450,8 @@ impl NetWorthServiceTrait for NetWorthService {
             currency: base_currency,
             oldest_valuation_date,
             stale_assets,
-        })
+        };
+        Ok(details.finish(legacy, &valuations))
     }
 
     fn get_net_worth_history(

@@ -108,12 +108,16 @@ fn validate_requested_scopes(requested: &[String]) -> Result<Vec<String>, ApiErr
     for scope in requested {
         let parsed = AgentScope::parse(scope)
             .ok_or_else(|| ApiError::BadRequest(format!("Unknown scope: {scope}")))?;
-        // This host has no formal ordinary write tools, so it must not mint a
-        // credential that claims one. Existing tokens carrying the scope are
-        // shown as unavailable in the UI.
+        // Desktop bookkeeping and the journal are absent on this host. Do
+        // not mint credentials that claim access to those capabilities.
         if matches!(
             parsed,
-            AgentScope::OrdinaryWrite | AgentScope::TransfersWrite | AgentScope::HoldingsWrite
+            AgentScope::OrdinaryWrite
+                | AgentScope::TransfersWrite
+                | AgentScope::HoldingsWrite
+                | AgentScope::InvestmentsRead
+                | AgentScope::InvestmentsWrite
+                | AgentScope::InvestmentsConfirm
         ) {
             return Err(ApiError::BadRequest(format!(
                 "{parsed} is not available on this host"
@@ -317,6 +321,26 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
 #[cfg(test)]
 mod portfolio_scope_tests {
     use super::*;
+    #[test]
+    fn server_does_not_mint_investment_journal_permissions() {
+        for scope in [
+            "investments:read",
+            "investments:write",
+            "investments:confirm",
+        ] {
+            let error = validate_requested_scopes(&[
+                scope.into(),
+                "accounts:read".into(),
+                "holdings:read".into(),
+                "activities:read".into(),
+            ])
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains(&format!("{scope} is not available on this host")));
+        }
+    }
+
     #[test]
     fn server_does_not_mint_desktop_portfolio_write_permissions() {
         for scope in ["transfers:write", "holdings:write"] {

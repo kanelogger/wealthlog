@@ -267,11 +267,21 @@ pub struct NewAuditRow {
 pub struct BusinessStore {
     pool: Arc<DbPool>,
     writer: WriteHandle,
+    // Background index bookkeeping must not interrupt a multi-read financial capture.
+    investment_read_window: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl BusinessStore {
     pub fn new(pool: Arc<DbPool>, writer: WriteHandle) -> Self {
-        Self { pool, writer }
+        Self {
+            pool,
+            writer,
+            investment_read_window: Arc::new(tokio::sync::RwLock::new(())),
+        }
+    }
+
+    pub(crate) fn investment_read_window(&self) -> &tokio::sync::RwLock<()> {
+        &self.investment_read_window
     }
 
     pub fn writer(&self) -> &WriteHandle {

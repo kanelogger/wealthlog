@@ -92,6 +92,13 @@ pub trait AgentEnvironment: Send + Sync {
         None
     }
 
+    /// The journal is composed only by the desktop host after all module migrations.
+    fn investment_journal_service(
+        &self,
+    ) -> Option<Arc<wealthfolio_business::investment_journal::InvestmentJournalService>> {
+        None
+    }
+
     /// Pending entries (待确认收支). `None` on hosts without the store.
     fn pending_service(&self) -> Option<Arc<wealthfolio_business::PendingService>> {
         None

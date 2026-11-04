@@ -1,0 +1,23 @@
+DROP TRIGGER IF EXISTS fund_transfer_first_application;
+DROP TRIGGER IF EXISTS investment_dependencies_assets_update;
+DROP TRIGGER IF EXISTS investment_dependencies_accounts_update;
+-- Development rollback only. Production uses pre-migration backups / forward repair.
+DROP TRIGGER IF EXISTS investment_source_holdings_snapshots_delete;
+DROP TRIGGER IF EXISTS investment_source_holdings_snapshots_update;
+DROP TRIGGER IF EXISTS investment_source_holdings_snapshots_insert;
+DROP TRIGGER IF EXISTS investment_source_business_requests_delete;
+DROP TRIGGER IF EXISTS investment_source_business_requests_update;
+DROP TRIGGER IF EXISTS investment_source_business_requests_insert;
+DROP TRIGGER IF EXISTS investment_source_activities_delete;
+DROP TRIGGER IF EXISTS investment_source_activities_update;
+DROP TRIGGER IF EXISTS investment_source_activities_insert;
+DROP TRIGGER IF EXISTS fund_allocation_entries_no_update;
+DROP TRIGGER IF EXISTS fund_allocation_entries_no_delete;
+DROP TRIGGER IF EXISTS fund_allocation_operations_no_update;
+DROP TRIGGER IF EXISTS fund_allocation_operations_no_delete;
+DROP TABLE investment_projection_state;
+DROP TABLE investment_executions;
+DROP TABLE fund_allocations;
+DROP TABLE fund_allocation_entries;
+DROP TABLE fund_allocation_operations;
+DROP TABLE fund_purposes;

@@ -16,7 +16,8 @@ use crate::tool::{AgentTool, AgentToolAccess, AgentToolError, AgentToolResult};
 /// were removed (plan task two).
 pub const MCP_HIDDEN_TOOLS: &[&str] = &["prepare_activity_updates"];
 
-/// The only formal writes a desktop-hosted MCP/CLI surface may execute.
+/// Legacy bookkeeping writes available on desktop. The investment journal adds
+/// its typed command list through `journal_formal_write`, with the same host gate.
 pub const DESKTOP_FORMAL_WRITE_TOOLS: &[&str] = &[
     "create_ordinary_activity",
     "update_ordinary_activity",
@@ -37,15 +38,17 @@ pub enum McpHost {
 
 impl McpHost {
     pub fn permits_formal_write(self, tool: &str) -> bool {
-        matches!(self, McpHost::Desktop) && DESKTOP_FORMAL_WRITE_TOOLS.contains(&tool)
+        matches!(self, McpHost::Desktop)
+            && (DESKTOP_FORMAL_WRITE_TOOLS.contains(&tool)
+                || crate::tools::investment_journal::journal_formal_write(tool))
     }
 }
 
 /// Whether `tool` is blocked from MCP exposure and execution.
 ///
-/// Every `Write`-access tool and the by-name hidden previews stay blocked. The
-/// persistent surface for agents is the pending-entry tools, which are
-/// `Draft`/`Read`; formal activity writes remain GUI/REST-only this round.
+/// On the server, every `Write` tool, hidden preview and all investment-journal
+/// tools stay blocked. Desktop permits its explicit bookkeeping/journal commands;
+/// transaction-account security creation remains GUI-only.
 /// Applied when the default and custom MCP catalogs are built and enforced
 /// again at the MCP execution entry (`wealthfolio-mcp` handler).
 pub fn mcp_write_blocked(tool: &dyn AgentTool) -> bool {
@@ -55,6 +58,13 @@ pub fn mcp_write_blocked(tool: &dyn AgentTool) -> bool {
 /// Host-aware policy: desktop exposes explicitly listed bookkeeping writes.
 /// Other writes and unsupported server-only reads remain unavailable.
 pub fn mcp_write_blocked_for(tool: &dyn AgentTool, host: McpHost) -> bool {
+    if let Some(command) = crate::tools::investment_journal::journal_command(tool.name()) {
+        // The complete module stays absent on the server, including reads and
+        // any custom catalog that relabels a persistent command as a draft.
+        if host == McpHost::Server || !command.external_available() {
+            return true;
+        }
+    }
     let blocked_write = matches!(tool.access_level(), AgentToolAccess::Write)
         && !host.permits_formal_write(tool.name());
     blocked_write
@@ -80,11 +90,11 @@ impl AgentToolCatalog {
         Self::new(crate::tools::v1_read_tools())
     }
 
-    /// The MCP catalog: reads, drafts/suggestions and transfer matching.
+    /// The server MCP catalog: reads, drafts/suggestions and transfer matching.
     ///
-    /// Formal-write (`Write` access) tools and [`MCP_HIDDEN_TOOLS`] are
-    /// filtered out — MCP does not expose formal writes this release. Scope
-    /// filtering additionally hides tools that a token cannot access.
+    /// Formal writes, [`MCP_HIDDEN_TOOLS`] and the entire investment journal are
+    /// filtered out. Desktop callers explicitly choose `McpHost::Desktop`.
+    /// Scope filtering additionally hides tools a token cannot access.
     pub fn mcp_catalog() -> Self {
         Self::mcp_catalog_for(McpHost::Server)
     }
@@ -98,6 +108,7 @@ impl AgentToolCatalog {
         tools.extend(crate::tools::activity_update_tools());
         tools.extend(crate::tools::ordinary_tools());
         tools.extend(crate::tools::investments::investment_tools());
+        tools.extend(crate::tools::investment_journal::journal_tools());
         tools.retain(|tool| !mcp_write_blocked_for(tool.as_ref(), host));
         Self::new(tools)
     }

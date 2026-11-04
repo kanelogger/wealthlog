@@ -185,6 +185,15 @@ impl MockSnapshotRepository {
 
 #[async_trait]
 impl SnapshotRepositoryTrait for MockSnapshotRepository {
+    fn pending_projection_accounts(
+        &self,
+        _: &HashMap<String, AccountStateSnapshot>,
+        _: NaiveDate,
+        _: crate::portfolio::projection::ProjectionReadScope,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        // These snapshots are explicitly constructed fresh fixtures.
+        Ok(Some(Default::default()))
+    }
     async fn save_snapshots(&self, _snapshots: &[AccountStateSnapshot]) -> Result<()> {
         unimplemented!()
     }
@@ -289,6 +298,39 @@ impl MockMarketDataRepository {
 
 #[async_trait]
 impl QuoteServiceTrait for MockMarketDataRepository {
+    fn get_quotes_by_source_keys(
+        &self,
+        keys: &[(String, NaiveDate, String)],
+    ) -> Result<Vec<Quote>> {
+        Ok(self
+            .quotes
+            .iter()
+            .filter(|quote| {
+                keys.contains(&(
+                    quote.asset_id.clone(),
+                    quote.timestamp.date_naive(),
+                    quote.data_source.clone(),
+                ))
+            })
+            .cloned()
+            .collect())
+    }
+
+    fn verify_quote_sources(&self, quotes: &[Quote]) -> Result<crate::quotes::QuoteSourceChecks> {
+        Ok(quotes
+            .iter()
+            .map(|quote| {
+                (
+                    quote.id.clone(),
+                    if self.quotes.iter().any(|original| original.id == quote.id) {
+                        crate::quotes::QuoteSourceQuality::Verified
+                    } else {
+                        crate::quotes::QuoteSourceQuality::Unavailable
+                    },
+                )
+            })
+            .collect())
+    }
     // =========================================================================
     // Quote CRUD Operations
     // =========================================================================
@@ -593,6 +635,10 @@ impl MockFxService {
 
 #[async_trait]
 impl FxServiceTrait for MockFxService {
+    fn is_exchange_rate_verified(&self, _: &str, _: &str, _: Option<NaiveDate>) -> bool {
+        // Explicitly trusted 1:1 fixture; production providers default to unknown.
+        true
+    }
     fn initialize(&self) -> Result<()> {
         Ok(())
     }
@@ -994,6 +1040,7 @@ fn create_total_valuation(
         external_flow_source: ExternalFlowSource::Unknown,
         performance_eligible_value_base: total_value,
         value_status: ValuationStatus::Complete,
+        quote_inputs: None,
         basis_status: if total_value.is_zero() {
             BasisStatus::NotApplicable
         } else {
@@ -1033,6 +1080,7 @@ fn create_account_valuation(
         performance_eligible_value_base: total_value,
         value_status: ValuationStatus::Complete,
         basis_status: BasisStatus::NotApplicable,
+        quote_inputs: None,
         calculated_at: Utc::now(),
     }
 }
@@ -2674,6 +2722,16 @@ async fn automated_loan_net_worth_and_history_use_the_same_as_of_balance() {
         )],
     );
     let current = service.get_net_worth(end).await.unwrap();
+    let detailed = service.get_net_worth_detailed(end).await.unwrap();
+    assert_eq!(
+        detailed
+            .items
+            .iter()
+            .find(|i| i.id == "LIAB-automatic")
+            .unwrap()
+            .basis,
+        DetailedValuationBasis::CalculatedLoan
+    );
     let history = service.get_net_worth_history(start, end).unwrap();
     assert_eq!(current.liabilities.total, dec!(700));
     assert_eq!(history.last().unwrap().total_liabilities, dec!(700));
@@ -2815,4 +2873,247 @@ async fn tagged_loan_payments_count_in_net_worth_and_its_history() {
     let history = service.get_net_worth_history(start, end).unwrap();
     assert_eq!(current.liabilities.total, dec!(700));
     assert_eq!(history.last().unwrap().total_liabilities, dec!(700));
+}
+
+#[tokio::test]
+async fn detailed_net_worth_retains_unvalued_names_and_stale_valid_children() {
+    let date = NaiveDate::from_ymd_opt(2024, 6, 1).unwrap();
+    let quote_date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let service = create_net_worth_service(
+        vec![],
+        vec![
+            create_test_asset("home", AssetKind::Property, "USD"),
+            create_test_asset("car-no-value", AssetKind::Vehicle, "USD"),
+        ],
+        vec![],
+        vec![create_test_quote(
+            "home",
+            dec!(9007199254740993.01),
+            quote_date,
+            "USD",
+        )],
+    );
+    let detailed = service.get_net_worth_detailed(date).await.unwrap();
+    assert_eq!(detailed.total_assets, None);
+    assert_eq!(detailed.net_worth, None);
+    assert_eq!(detailed.total_liabilities, Some(Decimal::ZERO));
+    let home = detailed.items.iter().find(|i| i.id == "home").unwrap();
+    assert!(home.stale);
+    assert_eq!(home.valuation_date, Some(quote_date));
+    assert_eq!(home.value, Some(dec!(9007199254740993.01)));
+    let car = detailed
+        .items
+        .iter()
+        .find(|i| i.id == "car-no-value")
+        .unwrap();
+    assert_eq!(car.name, "Asset car-no-value");
+    assert_eq!(car.value, None);
+    assert_eq!(car.issues[0].code, NetWorthIssueCode::MissingQuote);
+    let json = serde_json::to_value(&detailed).unwrap();
+    assert!(json.get("legacy").is_none());
+    assert_eq!(
+        json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["id"] == "home")
+            .unwrap()["value"],
+        "9007199254740993.01"
+    );
+    let legacy = service.get_net_worth(date).await.unwrap();
+    assert_eq!(legacy.net_worth, detailed.legacy.net_worth);
+    assert_eq!(legacy.net_worth, dec!(9007199254740993.01));
+}
+
+#[tokio::test]
+async fn detailed_cost_substitution_and_missing_asset_never_become_verified_totals() {
+    let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let snapshot = create_test_snapshot(
+        "acc",
+        vec![
+            create_test_position("acc", "no-quote", dec!(2), dec!(20.05), "USD"),
+            create_test_position("acc", "deleted-asset", dec!(3), dec!(30), "USD"),
+        ],
+        HashMap::from([("USD".into(), dec!(100.01))]),
+    );
+    let service = create_net_worth_service(
+        vec![create_test_account("acc", "SECURITIES", "USD")],
+        vec![create_test_asset("no-quote", AssetKind::Investment, "USD")],
+        vec![snapshot],
+        vec![create_test_quote("deleted-asset", dec!(10), date, "USD")],
+    );
+    let detailed = service.get_net_worth_detailed(date).await.unwrap();
+    assert_eq!(detailed.total_assets, None);
+    let fallback = detailed.items.iter().find(|i| i.id == "no-quote").unwrap();
+    assert_eq!(fallback.value, None);
+    assert_eq!(fallback.substitute_value, Some(dec!(20.05)));
+    assert_eq!(fallback.basis, DetailedValuationBasis::CostBasis);
+    assert!(fallback
+        .issues
+        .iter()
+        .any(|i| i.code == NetWorthIssueCode::CostBasisFallback));
+    let missing = detailed
+        .items
+        .iter()
+        .find(|i| i.id == "deleted-asset")
+        .unwrap();
+    assert_eq!(missing.value, None);
+    assert!(missing
+        .issues
+        .iter()
+        .any(|i| i.code == NetWorthIssueCode::MissingAsset));
+    let cash = detailed
+        .items
+        .iter()
+        .find(|i| i.category == "cash")
+        .unwrap();
+    assert_eq!(cash.value, Some(dec!(100.01)));
+    assert_eq!(detailed.legacy.net_worth, dec!(150.06));
+}
+
+#[tokio::test]
+async fn detailed_stored_partial_valuation_preserves_cash_and_original_quote_date() {
+    let date = NaiveDate::from_ymd_opt(2024, 6, 1).unwrap();
+    let quote_date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let mut snapshot = create_test_snapshot(
+        "account-1",
+        vec![create_test_position(
+            "account-1",
+            "stock",
+            dec!(2),
+            dec!(20),
+            "USD",
+        )],
+        HashMap::from([("USD".into(), dec!(50))]),
+    );
+    snapshot.snapshot_date = date;
+    let mut valuation = create_total_valuation(date, dec!(200), Decimal::ZERO);
+    valuation.cash_balance_base = dec!(50);
+    valuation.value_status = ValuationStatus::PartialUnpriced;
+    let quote = create_test_quote("stock", dec!(100), quote_date, "USD");
+    valuation.quote_inputs = Some(vec![
+        wealthfolio_portfolio_engine::model::QuoteObservation {
+            asset: wealthfolio_portfolio_engine::model::AssetId::new("stock"),
+            day: quote_date,
+            close: quote.close,
+            currency: wealthfolio_portfolio_engine::model::Currency::parse(&quote.currency)
+                .unwrap(),
+            source: quote.data_source.clone(),
+        },
+    ]);
+    let service = create_net_worth_service_with_valuations(
+        vec![create_test_account("account-1", "SECURITIES", "USD")],
+        vec![create_test_asset("stock", AssetKind::Investment, "USD")],
+        vec![snapshot],
+        vec![quote],
+        vec![valuation],
+    );
+    let detailed = service.get_net_worth_detailed(date).await.unwrap();
+    assert_eq!(detailed.total_assets, None);
+    let investment = detailed
+        .items
+        .iter()
+        .find(|i| i.id == "INVESTMENTS:account-1")
+        .unwrap();
+    assert_eq!(investment.value, None);
+    assert_eq!(investment.valuation_date, Some(quote_date));
+    assert!(investment.stale);
+    assert_eq!(
+        detailed
+            .items
+            .iter()
+            .find(|i| i.id == "CASH:account-1")
+            .unwrap()
+            .value,
+        Some(dec!(50))
+    );
+}
+
+#[tokio::test]
+async fn detailed_same_asset_across_accounts_retains_the_entire_verified_value() {
+    let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let accounts = vec![
+        create_test_account("a", "SECURITIES", "USD"),
+        create_test_account("b", "SECURITIES", "USD"),
+    ];
+    let snapshots = vec![
+        create_test_snapshot(
+            "a",
+            vec![create_test_position("a", "stock", dec!(2), dec!(20), "USD")],
+            HashMap::new(),
+        ),
+        create_test_snapshot(
+            "b",
+            vec![create_test_position("b", "stock", dec!(3), dec!(30), "USD")],
+            HashMap::new(),
+        ),
+    ];
+    let service = create_net_worth_service(
+        accounts,
+        vec![create_test_asset("stock", AssetKind::Investment, "USD")],
+        snapshots,
+        vec![create_test_quote("stock", dec!(10), date, "USD")],
+    );
+    let detailed = service.get_net_worth_detailed(date).await.unwrap();
+    assert_eq!(detailed.total_assets, Some(dec!(50)));
+    assert_eq!(detailed.items.len(), 1);
+    assert_eq!(detailed.items[0].value, Some(dec!(50)));
+}
+
+#[tokio::test]
+async fn detailed_missing_fx_does_not_label_local_fallback_as_report_currency() {
+    use crate::test_support::in_memory::InMemoryFxRepository;
+    let date = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+    let accounts = Arc::new(MockAccountRepository::new(vec![create_test_account(
+        "acc",
+        "SECURITIES",
+        "USD",
+    )]));
+    let snapshot = create_test_snapshot(
+        "acc",
+        vec![],
+        HashMap::from([("USD".into(), dec!(100)), ("EUR".into(), dec!(50))]),
+    );
+    let snapshots = Arc::new(SnapshotService::new(
+        Arc::new(RwLock::new("UTC".into())),
+        accounts.clone(),
+        Arc::new(MockSnapshotRepository::new(vec![snapshot])),
+        Arc::new(InMemoryActivityRepository::new(vec![], HashSet::new())),
+    ));
+    let fx = Arc::new(crate::fx::FxService::new(Arc::new(
+        InMemoryFxRepository::new(vec![]),
+    )));
+    fx.initialize().unwrap();
+    let service = NetWorthService::new(
+        Arc::new(RwLock::new("USD".into())),
+        accounts,
+        Arc::new(MockAssetRepository::new(vec![])),
+        snapshots,
+        Arc::new(MockMarketDataRepository::new(vec![])),
+        Arc::new(MockValuationRepository::new(vec![])),
+        fx,
+    );
+    let detailed = service.get_net_worth_detailed(date).await.unwrap();
+    assert_eq!(detailed.total_assets, None);
+    assert_eq!(detailed.net_worth, None);
+    assert_eq!(
+        detailed
+            .items
+            .iter()
+            .find(|i| i.id == "CASH:acc:USD")
+            .unwrap()
+            .value,
+        Some(dec!(100))
+    );
+    let eur = detailed
+        .items
+        .iter()
+        .find(|i| i.id == "CASH:acc:EUR")
+        .unwrap();
+    assert_eq!(eur.value, None);
+    assert_eq!(eur.substitute_value, None);
+    assert_eq!(eur.issues[0].code, NetWorthIssueCode::MissingFx);
+    assert_eq!(eur.issues[0].currency.as_deref(), Some("EUR"));
+    // Compatibility remains exactly as before: the old API returns its unconverted fallback.
+    assert_eq!(detailed.legacy.net_worth, dec!(150));
 }

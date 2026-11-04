@@ -396,6 +396,32 @@ pub trait ActivityServiceTrait: Send + Sync {
     /// transaction.
     async fn prepare_activity_for_commit(&self, activity: NewActivity) -> Result<NewActivity>;
 
+    /// Pure preparation for an existing-asset atomic use case. In particular,
+    /// previewing must not create fallback quotes, assets or FX registrations.
+    async fn prepare_activity_for_atomic_commit(
+        &self,
+        _activity: NewActivity,
+    ) -> Result<NewActivity> {
+        Err(crate::Error::Validation(
+            crate::errors::ValidationError::InvalidInput(
+                "pure activity preparation is unavailable".into(),
+            ),
+        ))
+    }
+
+    /// Preserve explicitly unknown final cash on a flagged BUY/SELL. Reuses
+    /// pure existing-asset preparation without deriving an estimated amount.
+    async fn prepare_incomplete_trade_for_atomic_commit(
+        &self,
+        _activity: NewActivity,
+    ) -> Result<NewActivity> {
+        Err(crate::Error::Validation(
+            crate::errors::ValidationError::InvalidInput(
+                "incomplete trade preparation is unavailable".into(),
+            ),
+        ))
+    }
+
     /// Validate and normalize an update exactly as `update_activity` would,
     /// without writing it. Returns the prepared patch and the row it targets.
     async fn prepare_activity_update_for_commit(
@@ -438,6 +464,16 @@ pub trait ActivityServiceTrait: Send + Sync {
         Err(crate::errors::Error::Validation(
             crate::errors::ValidationError::InvalidInput(
                 "cash transfer preparation unavailable".into(),
+            ),
+        ))
+    }
+    async fn prepare_internal_cash_transfer_for_atomic_commit(
+        &self,
+        _request: InternalTransferPairRequest,
+    ) -> Result<Vec<NewActivity>> {
+        Err(crate::Error::Validation(
+            crate::errors::ValidationError::InvalidInput(
+                "pure cash transfer preparation is unavailable".into(),
             ),
         ))
     }

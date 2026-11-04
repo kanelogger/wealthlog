@@ -1,4 +1,7 @@
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { lazy, Suspense } from "react";
+import { isTauri } from "@/adapters";
+import i18n from "@/i18n/i18n";
 
 import useNavigationEventListener from "@/hooks/use-navigation-event-listener";
 import ActivityManagerPage from "@/pages/activity/activity-manager-page";
@@ -27,6 +30,7 @@ import SpendingSettingsRulesPage from "./pages/settings/spending/rules/spending-
 import SpendingSetupPage from "./pages/settings/spending/setup/spending-setup-page";
 import SpendingSettingsPage from "./pages/settings/spending/spending-settings-page";
 import TaxonomiesPage from "./pages/settings/taxonomies/taxonomies-page";
+const InvestmentPage = lazy(() => import("./features/investment-journal/investment-page"));
 
 function NavigationEventBridge() {
   useNavigationEventListener();
@@ -61,6 +65,18 @@ export function AppRoutes() {
           <Route path="activities" element={<ActivityPage />} />
           <Route path="activities/manage" element={<ActivityManagerPage />} />
           <Route path="holdings" element={<HoldingsPage />} />
+          <Route
+            path="investments"
+            element={
+              isTauri ? (
+                <Suspense fallback={<p role="status">{i18n.t("common:loading")}</p>}>
+                  <InvestmentPage />
+                </Suspense>
+              ) : (
+                <Navigate to="/activities" replace />
+              )
+            }
+          />
           <Route path="holdings/:assetId" element={<AssetProfilePage />} />
 
           <Route path="accounts/:id" element={<AccountPage />} />

@@ -12,6 +12,11 @@ use rust_decimal::Decimal;
 pub trait FxRepositoryTrait: Send + Sync {
     fn get_latest_exchange_rates(&self) -> Result<Vec<ExchangeRate>>;
     fn get_historical_exchange_rates(&self) -> Result<Vec<ExchangeRate>>;
+    /// Validate selected observations against original stored rows, before any
+    /// compatibility decimal/timestamp fallback. Unknown providers fail closed.
+    fn verify_exchange_rate_sources(&self, rates: &[ExchangeRate]) -> Result<bool> {
+        Ok(rates.is_empty())
+    }
     fn get_latest_exchange_rate(&self, from: &str, to: &str) -> Result<Option<ExchangeRate>>;
     fn get_latest_exchange_rate_by_symbol(&self, symbol: &str) -> Result<Option<ExchangeRate>>;
     fn get_historical_quotes(
@@ -56,6 +61,37 @@ pub trait FxServiceTrait: Send + Sync {
         to_currency: &str,
         date: NaiveDate,
     ) -> Result<Decimal>;
+    /// Quality of the actual native route, never a separate conversion path.
+    /// None selects today's latest-lookup policy; Some selects the dated policy.
+    fn is_exchange_rate_verified(&self, from: &str, to: &str, _date: Option<NaiveDate>) -> bool {
+        super::currency::normalize_currency_code(from)
+            == super::currency::normalize_currency_code(to)
+    }
+    fn get_exchange_rate_observation(
+        &self,
+        from: &str,
+        to: &str,
+        date: Option<NaiveDate>,
+    ) -> Result<super::ExchangeRateObservation> {
+        let rate = match date {
+            Some(day) => self.get_exchange_rate_for_date(from, to, day)?,
+            None => self.get_latest_exchange_rate(from, to)?,
+        };
+        Ok(super::ExchangeRateObservation {
+            rate,
+            source_date: None,
+            verified: self.is_exchange_rate_verified(from, to, date),
+        })
+    }
+    /// Stored portfolio rows use the kernel's provider and inverse precedence.
+    fn get_projection_exchange_rate_observation(
+        &self,
+        from: &str,
+        to: &str,
+        date: NaiveDate,
+    ) -> Result<super::ExchangeRateObservation> {
+        self.get_exchange_rate_observation(from, to, Some(date))
+    }
     /// Resolves a historical rate for each requested (currency pair, date).
     /// Never fails the whole batch for one bad pair — each result carries
     /// either a rate or an error.

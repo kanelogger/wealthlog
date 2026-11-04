@@ -63,6 +63,47 @@ pub struct QuoteDB {
     pub timestamp: String,
 }
 
+impl QuoteDB {
+    pub(crate) fn source_quality(
+        &self,
+        selected: &Quote,
+    ) -> wealthfolio_core::quotes::QuoteSourceQuality {
+        use wealthfolio_core::quotes::QuoteSourceQuality as Q;
+        let price = Decimal::from_str_exact(&self.close);
+        if self.close.trim() != self.close
+            || price.is_err()
+            || price.as_ref().is_ok_and(|v| *v < Decimal::ZERO)
+        {
+            return Q::InvalidPrice;
+        }
+        if price.ok() != Some(selected.close) {
+            return Q::InconsistentSource;
+        }
+        let Ok(timestamp) = DateTime::parse_from_rfc3339(&self.timestamp) else {
+            return Q::InvalidTimestamp;
+        };
+        if NaiveDate::parse_from_str(&self.day, "%Y-%m-%d").ok()
+            != Some(timestamp.with_timezone(&Utc).date_naive())
+            || timestamp.with_timezone(&Utc) != selected.timestamp
+        {
+            return Q::InvalidTimestamp;
+        }
+        if self.currency.trim() != self.currency
+            || !(3..=12).contains(&self.currency.len())
+            || !self.currency.bytes().all(|c| c.is_ascii_alphabetic())
+        {
+            return Q::InvalidCurrency;
+        }
+        if self.id != selected.id
+            || self.asset_id != selected.asset_id
+            || self.source != selected.data_source
+        {
+            return Q::InconsistentSource;
+        }
+        Q::Verified
+    }
+}
+
 /// Database model for market data provider settings
 #[derive(
     Debug,

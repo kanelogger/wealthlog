@@ -465,6 +465,18 @@ impl Asset {
             && matches!(self.instrument_type, None | Some(InstrumentType::Equity))
     }
 
+    /// Whether one quoted unit is also one position unit. An absent equity
+    /// multiplier has the conventional basis of one; a malformed explicit
+    /// override cannot establish that basis for journal ownership.
+    pub fn is_unit_equity(&self) -> bool {
+        self.is_equity_like()
+            && self
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(CONTRACT_MULTIPLIER_METADATA_KEY))
+                .is_none_or(|_| self.explicit_contract_multiplier() == Some(Decimal::ONE))
+    }
+
     /// Returns true if this asset is a bond / fixed-income instrument.
     pub fn is_bond(&self) -> bool {
         self.instrument_type == Some(InstrumentType::Bond)

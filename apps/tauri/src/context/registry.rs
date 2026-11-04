@@ -19,6 +19,8 @@ use wealthfolio_spending::settings::SpendingSettingsService;
 use wealthfolio_storage_sqlite::agent::{McpAuditRepository, PatRepository};
 
 pub struct ServiceContext {
+    pub investment_projection:
+        Arc<wealthfolio_business::investment_journal::InvestmentProjectionService>,
     pub portfolio_tasks: crate::listeners::PortfolioTasks,
 
     pub active: AtomicBool,

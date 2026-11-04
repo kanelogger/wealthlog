@@ -2,6 +2,11 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { PatCreateDialog } from "./pat-create-dialog";
 
+vi.mock("@/adapters", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/adapters")>();
+  return { ...actual, isTauri: false };
+});
+
 vi.mock("@wealthfolio/ui/components/ui/use-toast", () => ({ toast: vi.fn() }));
 
 function scopeCheckbox(label: string) {
@@ -16,6 +21,7 @@ describe("PatCreateDialog scopes", () => {
 
     expect(scopeCheckbox("持仓与价值")).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByRole("checkbox", { name: /财务规划/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /投资记录/ })).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("textbox", { name: "名称" }), {
       target: { value: "Reader" },
     });
@@ -24,7 +30,7 @@ describe("PatCreateDialog scopes", () => {
     await waitFor(() =>
       expect(onCreate).toHaveBeenCalledWith({
         name: "Reader",
-        expiresAt: expect.any(String),
+        expiresAt: expect.any(String) as string,
         scopes: [
           "accounts:read",
           "holdings:read",

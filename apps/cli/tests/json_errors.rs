@@ -68,3 +68,26 @@ fn portfolio_commands_are_discoverable_and_require_explicit_input() {
             .contains("--input"));
     }
 }
+
+#[test]
+fn investment_catalog_schema_and_calls_are_discoverable_without_loading_credentials() {
+    let help = wealthlog()
+        .args(["investments", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let text = String::from_utf8_lossy(&help.stdout);
+    for command in ["commands", "schema", "call"] {
+        assert!(text.contains(command));
+    }
+    for args in [["investments", "schema"], ["investments", "call"]] {
+        let out = wealthlog().args(args).output().unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_input");
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("<OPERATION>"));
+    }
+}

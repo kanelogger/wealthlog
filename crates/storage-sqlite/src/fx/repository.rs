@@ -482,6 +482,40 @@ impl FxRepository {
 
 #[async_trait]
 impl FxRepositoryTrait for FxRepository {
+    fn verify_exchange_rate_sources(&self, selected: &[ExchangeRate]) -> Result<bool> {
+        if selected.is_empty() {
+            return Ok(true);
+        }
+        let ids: Vec<_> = selected.iter().map(|rate| rate.id.clone()).collect();
+        let mut conn = get_connection(&self.pool)?;
+        let rows: Vec<(QuoteDB, AssetDB)> = quotes::table
+            .inner_join(assets::table.on(quotes::asset_id.eq(assets::id)))
+            .filter(assets::kind.eq(AssetKind::Fx.as_db_str()))
+            .filter(quotes::asset_id.eq_any(ids))
+            .select((quotes::all_columns, assets::all_columns))
+            .load(&mut conn)
+            .map_err(StorageError::from)?;
+        Ok(selected.iter().all(|rate| {
+            if rate.rate <= Decimal::ZERO { return false; }
+            let candidates: Vec<_> = rows.iter().filter(|(quote, _)| {
+                quote.asset_id == rate.id && quote.source == rate.source &&
+                (quote.day == rate.timestamp.date_naive().to_string() || DateTime::parse_from_rfc3339(&quote.timestamp).is_ok_and(|stamp| stamp.with_timezone(&Utc) == rate.timestamp))
+            }).collect();
+            !candidates.is_empty() && candidates.into_iter().all(|(raw, asset)| {
+                let currency_valid = |value: &str| value.len() == 3 && value.bytes().all(|c| c.is_ascii_uppercase());
+                let mut quote: Quote = raw.clone().into();
+                quote.close = rate.rate;
+                quote.timestamp = rate.timestamp;
+                quote.data_source = rate.source.clone();
+                currency_valid(&rate.from_currency) && currency_valid(&rate.to_currency) &&
+                asset.instrument_symbol.as_deref() == Some(rate.from_currency.as_str()) && asset.quote_ccy == rate.to_currency &&
+                // Native manual FX quotes use the base currency; provider quotes
+                // can use the quote currency. Both are existing storage forms.
+                (raw.currency == rate.from_currency || raw.currency == rate.to_currency) &&
+                raw.source_quality(&quote) == wealthfolio_core::quotes::QuoteSourceQuality::Verified
+            })
+        }))
+    }
     fn get_latest_exchange_rates(&self) -> Result<Vec<ExchangeRate>> {
         self.get_exchange_rates()
     }

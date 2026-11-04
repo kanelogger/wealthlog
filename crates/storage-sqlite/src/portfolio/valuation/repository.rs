@@ -242,7 +242,7 @@ impl ValuationRepositoryTrait for ValuationRepository {
                     investment_market_value_base, total_value_base, cost_basis_base, \
                     net_contribution_base, external_inflow_base, external_outflow_base, \
                     external_flow_source, performance_eligible_value_base, value_status, \
-                    basis_status, calculated_at, \
+                    basis_status, calculated_at, quote_inputs, \
                     ROW_NUMBER() OVER (PARTITION BY account_id ORDER BY valuation_date DESC) as rn \
                 FROM {} \
                 WHERE account_id IN ({}) \
@@ -254,7 +254,7 @@ impl ValuationRepositoryTrait for ValuationRepository {
                 investment_market_value_base, total_value_base, cost_basis_base, \
                 net_contribution_base, external_inflow_base, external_outflow_base, \
                 external_flow_source, performance_eligible_value_base, value_status, \
-                basis_status, calculated_at \
+                basis_status, calculated_at, quote_inputs \
             FROM RankedValuations \
             WHERE rn = 1",
             "daily_account_valuation", // Use direct table name string
@@ -422,6 +422,7 @@ mod tests {
             performance_eligible_value_base: Decimal::from(total),
             value_status: ValuationStatus::Complete,
             basis_status: BasisStatus::Complete,
+            quote_inputs: None,
             calculated_at: Utc::now(),
         }
     }

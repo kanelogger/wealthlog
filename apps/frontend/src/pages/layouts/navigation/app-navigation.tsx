@@ -1,6 +1,8 @@
 import { Icons } from "@wealthfolio/ui/components/ui/icons";
 import { useMemo, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { isTauri } from "@/adapters";
+import { usePersistentState } from "@/hooks/use-persistent-state";
 
 export interface NavLink {
   id?: string;
@@ -49,7 +51,18 @@ function buildStaticNavigation(t: TFunction): NavigationProps {
 
 export function useNavigation() {
   const { t } = useTranslation();
-  return useMemo(() => buildStaticNavigation(t), [t]);
+  const [investmentLanguage] = usePersistentState("investment-journal-language", "zh");
+  return useMemo(() => {
+    const navigation = buildStaticNavigation(t);
+    if (isTauri)
+      navigation.primary.push({
+        icon: <Icons.Files className="size-6" />,
+        title: investmentLanguage === "en" ? "Investments" : "投资",
+        href: "/investments",
+        keywords: ["investment", "decision", "funding", "投资", "决策"],
+      });
+    return navigation;
+  }, [t, investmentLanguage]);
 }
 
 export function isPathActive(pathname: string, href: string): boolean {

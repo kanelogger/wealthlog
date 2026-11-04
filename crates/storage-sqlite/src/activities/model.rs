@@ -24,7 +24,7 @@ fn normalize_subtype_for_storage(subtype: Option<String>) -> Option<String> {
 ///   3. Date-only `YYYY-MM-DD` — midnight UTC (matches the JSON-side `timestamp_format` deserializer)
 ///
 /// Returns `None` only when none of the above match; callers fall back to `Utc::now()` and log.
-fn parse_db_datetime(s: &str) -> Option<chrono::DateTime<Utc>> {
+pub fn parse_db_datetime(s: &str) -> Option<chrono::DateTime<Utc>> {
     use chrono::DateTime;
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));

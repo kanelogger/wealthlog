@@ -1,3 +1,7 @@
+use super::{
+    CurrentResourceValuation, CurrentValuationIssue, CurrentValuationIssueCode,
+    DetailedCurrentAccountValuation, DetailedCurrentValuationResponse, ValuationComponent,
+};
 use chrono::{DateTime, NaiveDate, Utc};
 use log::warn;
 use rust_decimal::Decimal;
@@ -79,24 +83,55 @@ impl<'a> CurrentAccountValuationService<'a> {
         include_accounts: bool,
         calculated_at: DateTime<Utc>,
     ) -> Result<CurrentValuationResponse> {
-        let accounts = self.resolve_requested_accounts(account_ids)?;
-        if accounts.is_empty() {
-            return Ok(empty_current_valuation_response(
+        Ok(self
+            .get_current_valuation_detailed_for_scope_at(
                 scope_id,
+                account_ids,
                 base_currency,
+                latest_snapshot_cutoff,
+                include_accounts,
                 calculated_at,
-            ));
-        }
+            )
+            .await?
+            .legacy)
+    }
 
-        let account_ids: Vec<String> = accounts.iter().map(|account| account.id.clone()).collect();
-        let snapshots =
-            self.latest_snapshots_with_positions(&account_ids, latest_snapshot_cutoff)?;
+    pub async fn get_current_valuation_detailed_for_scope(
+        &self,
+        scope_id: &str,
+        account_ids: &[String],
+        base_currency: &str,
+        day: NaiveDate,
+    ) -> Result<DetailedCurrentValuationResponse> {
+        self.get_current_valuation_detailed_for_scope_at(
+            scope_id,
+            account_ids,
+            base_currency,
+            day,
+            true,
+            crate::utils::clock::now(),
+        )
+        .await
+    }
+
+    pub async fn get_current_valuation_detailed_for_scope_at(
+        &self,
+        scope_id: &str,
+        account_ids: &[String],
+        base_currency: &str,
+        latest_snapshot_cutoff: NaiveDate,
+        include_accounts: bool,
+        calculated_at: DateTime<Utc>,
+    ) -> Result<DetailedCurrentValuationResponse> {
+        let accounts = self.resolve_requested_accounts(account_ids)?;
+        let selected: Vec<_> = accounts.iter().map(|a| a.id.clone()).collect();
+        let snapshots = self.latest_snapshots_with_positions(&selected, latest_snapshot_cutoff)?;
         let assets_by_id = self.load_assets_by_id(&snapshots).await?;
         let latest_quote_pairs =
             self.load_latest_quotes(&snapshots, &assets_by_id, latest_snapshot_cutoff)?;
         let mut fx_cache = FxRateCache::new(self.fx_service);
-
-        Ok(calculate_current_valuation_response_from_snapshots(
+        fx_cache.verify_sources = true;
+        let mut response = calculate_current_valuation_detailed_from_snapshots(
             scope_id,
             &accounts,
             &snapshots,
@@ -106,7 +141,222 @@ impl<'a> CurrentAccountValuationService<'a> {
             calculated_at,
             include_accounts,
             |from, to| fx_cache.get(from, to),
-        ))
+        );
+        let quotes: Vec<_> = latest_quote_pairs
+            .values()
+            .map(|pair| pair.latest.clone())
+            .collect();
+        let checks = self
+            .quote_service
+            .verify_quote_sources(&quotes)
+            .unwrap_or_default();
+        let pending = self
+            .snapshot_service
+            .pending_projection_accounts(
+                &snapshots,
+                latest_snapshot_cutoff,
+                crate::portfolio::projection::ProjectionReadScope::Holdings,
+            )
+            .ok()
+            .flatten();
+        let missing_final_cash = self
+            .snapshot_service
+            .snapshots_missing_final_cash(&snapshots)?;
+        for account in &mut response.accounts {
+            for resource in &mut account.resources {
+                resource.fx_source_date = resource.valuation_currency.as_ref().and_then(|from| {
+                    fx_cache
+                        .source_dates
+                        .get(&(from.clone(), base_currency.to_string()))
+                        .copied()
+                        .flatten()
+                });
+            }
+            if snapshots.get(&account.account_id).is_some_and(|snapshot| {
+                snapshot.source == super::super::snapshot::SnapshotSource::Calculated
+            }) && pending
+                .as_ref()
+                .is_none_or(|pending| pending.contains(&account.account_id))
+            {
+                let issue = CurrentValuationIssue {
+                    code: CurrentValuationIssueCode::ProjectionNotCurrent,
+                    component: ValuationComponent::All,
+                    account_id: account.account_id.clone(),
+                    asset_id: None,
+                    currency: None,
+                };
+                account.issues.push(issue.clone());
+                response.issues.push(issue.clone());
+                account.cash_balance_base = None;
+                account.investment_market_value_base = None;
+                account.total_value_base = None;
+                response.cash_balance_base = None;
+                response.investment_market_value_base = None;
+                response.total_value_base = None;
+                for resource in &mut account.resources {
+                    resource.native_amount = None;
+                    resource.local_value = None;
+                    resource.value_base = None;
+                    resource.issues.push(issue.clone());
+                }
+            }
+            for resource in &mut account.resources {
+                if resource.kind == "CASH"
+                    && resource.currency.as_deref().is_some_and(|currency| {
+                        resource.native_amount.is_some_and(|amount| {
+                            crate::fx::currency::normalize_amount_exact(amount, currency).is_none()
+                        })
+                    })
+                {
+                    let issue = CurrentValuationIssue {
+                        code: CurrentValuationIssueCode::ArithmeticOverflow,
+                        component: ValuationComponent::Cash,
+                        account_id: account.account_id.clone(),
+                        asset_id: None,
+                        currency: resource.currency.clone(),
+                    };
+                    resource.local_value = None;
+                    resource.value_base = None;
+                    resource.issues.push(issue.clone());
+                    account.issues.push(issue.clone());
+                    response.issues.push(issue);
+                    account.cash_balance_base = None;
+                    account.total_value_base = None;
+                    response.cash_balance_base = None;
+                    response.total_value_base = None;
+                    continue;
+                }
+                let Some(asset) = &resource.asset_id else {
+                    continue;
+                };
+                let Some(pair) = latest_quote_pairs.get(asset) else {
+                    continue;
+                };
+                let origin_known = checks.get(&pair.latest.id)
+                    == Some(&crate::quotes::QuoteSourceQuality::Verified);
+                let numeric_known = crate::fx::currency::normalize_amount_exact(
+                    pair.latest.close,
+                    &pair.latest.currency,
+                )
+                .is_some();
+                if origin_known && numeric_known {
+                    continue;
+                }
+                let issue = CurrentValuationIssue {
+                    code: if origin_known {
+                        CurrentValuationIssueCode::ArithmeticOverflow
+                    } else {
+                        CurrentValuationIssueCode::InvalidQuoteSource
+                    },
+                    component: ValuationComponent::Investments,
+                    account_id: account.account_id.clone(),
+                    asset_id: Some(asset.clone()),
+                    currency: resource.valuation_currency.clone(),
+                };
+                resource.unit_value = None;
+                resource.local_value = None;
+                resource.value_base = None;
+                resource.valuation_date = None;
+                resource.stale = false;
+                resource.issues.push(issue.clone());
+                account.issues.push(issue.clone());
+                response.issues.push(issue);
+                account.investment_market_value_base = None;
+                account.total_value_base = None;
+                response.investment_market_value_base = None;
+                response.total_value_base = None;
+            }
+            if missing_final_cash.contains(&account.account_id) {
+                let issue = CurrentValuationIssue {
+                    code: CurrentValuationIssueCode::MissingFinalCash,
+                    component: ValuationComponent::Cash,
+                    account_id: account.account_id.clone(),
+                    asset_id: None,
+                    currency: None,
+                };
+                for cash in account
+                    .resources
+                    .iter_mut()
+                    .filter(|row| row.kind == "CASH")
+                {
+                    cash.native_amount = None;
+                    cash.local_value = None;
+                    cash.value_base = None;
+                    cash.issues.push(issue.clone());
+                }
+                account.issues.push(issue.clone());
+                response.issues.push(issue);
+                account.cash_balance_base = None;
+                account.total_value_base = None;
+                response.cash_balance_base = None;
+                response.total_value_base = None;
+            }
+            account.source_data_as_of = account
+                .resources
+                .iter()
+                .flat_map(|r| r.valuation_date.into_iter().chain(r.fx_source_date))
+                .min()
+                .or_else(|| {
+                    snapshots
+                        .get(&account.account_id)
+                        .map(|snapshot| snapshot.snapshot_date)
+                });
+        }
+        response.source_data_as_of = response
+            .accounts
+            .iter()
+            .filter_map(|account| account.source_data_as_of)
+            .min();
+        for account in unique_account_ids(account_ids.iter().cloned())
+            .into_iter()
+            .filter(|id| !selected.contains(id))
+        {
+            let issue = CurrentValuationIssue {
+                code: CurrentValuationIssueCode::AccountNotEligible,
+                component: ValuationComponent::All,
+                account_id: account.clone(),
+                asset_id: None,
+                currency: None,
+            };
+            response.issues.push(issue.clone());
+            response.accounts.push(DetailedCurrentAccountValuation {
+                account_id: account,
+                account_currency: String::new(),
+                base_currency: base_currency.into(),
+                cash_balance_base: None,
+                investment_market_value_base: None,
+                total_value_base: None,
+                source_data_as_of: None,
+                calculated_at,
+                warnings: Vec::new(),
+                issues: vec![issue],
+                resources: Vec::new(),
+                stale: false,
+            });
+            response.cash_balance_base = None;
+            response.investment_market_value_base = None;
+            response.total_value_base = None;
+        }
+        // Actual data dates describe the selected business day, not when this query ran.
+        for account in &mut response.accounts {
+            for resource in &mut account.resources {
+                resource.stale = (resource.kind == "SECURITY"
+                    && resource
+                        .valuation_date
+                        .is_some_and(|date| date < latest_snapshot_cutoff))
+                    || resource
+                        .fx_source_date
+                        .is_some_and(|date| date < latest_snapshot_cutoff);
+            }
+            account.stale = account.resources.iter().any(|r| r.stale);
+        }
+        response.stale = response.accounts.iter().any(|a| a.stale);
+        response
+            .accounts
+            .sort_by(|a, b| a.account_id.cmp(&b.account_id));
+        response.issues.sort();
+        response.issues.dedup();
+        Ok(response)
     }
 
     fn resolve_requested_accounts(&self, account_ids: &[String]) -> Result<Vec<Account>> {
@@ -202,8 +452,38 @@ pub fn calculate_current_valuation_response_from_snapshots<F, R>(
     base_currency: &str,
     calculated_at: DateTime<Utc>,
     include_accounts: bool,
-    mut latest_rate: F,
+    latest_rate: F,
 ) -> CurrentValuationResponse
+where
+    F: FnMut(&str, &str) -> R,
+    R: Into<CurrentValuationRate>,
+{
+    calculate_current_valuation_detailed_from_snapshots(
+        scope_id,
+        accounts,
+        snapshots,
+        assets_by_id,
+        latest_quote_pairs,
+        base_currency,
+        calculated_at,
+        include_accounts,
+        latest_rate,
+    )
+    .legacy
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_current_valuation_detailed_from_snapshots<F, R>(
+    scope_id: &str,
+    accounts: &[Account],
+    snapshots: &HashMap<String, AccountStateSnapshot>,
+    assets_by_id: &HashMap<String, Asset>,
+    latest_quote_pairs: &HashMap<String, LatestQuotePair>,
+    base_currency: &str,
+    calculated_at: DateTime<Utc>,
+    include_accounts: bool,
+    mut latest_rate: F,
+) -> DetailedCurrentValuationResponse
 where
     F: FnMut(&str, &str) -> R,
     R: Into<CurrentValuationRate>,
@@ -226,6 +506,7 @@ where
     let mut cash_base_totals: HashMap<String, Decimal> = HashMap::new();
     let mut cash_local_totals: HashMap<String, Decimal> = HashMap::new();
     let mut account_valuations = Vec::new();
+    let mut detailed_accounts = Vec::new();
 
     for account in accounts {
         let computation = match snapshots.get(&account.id) {
@@ -245,9 +526,53 @@ where
                 cash_base_totals: HashMap::new(),
                 cash_local_totals: HashMap::new(),
                 summary_warnings: Vec::new(),
+                resources: Vec::new(),
+                issues: vec![CurrentValuationIssue {
+                    code: CurrentValuationIssueCode::MissingSnapshot,
+                    component: ValuationComponent::All,
+                    account_id: account.id.clone(),
+                    asset_id: None,
+                    currency: None,
+                }],
+                source_date: None,
             },
         };
 
+        let mut computation = computation;
+        computation.resources.sort_by(|a, b| {
+            (&a.kind, &a.asset_id, &a.currency).cmp(&(&b.kind, &b.asset_id, &b.currency))
+        });
+        computation.issues.sort();
+        computation.issues.dedup();
+        let cash_ok = !computation.issues.iter().any(|i| {
+            matches!(
+                i.component,
+                ValuationComponent::Cash | ValuationComponent::All
+            )
+        });
+        let investments_ok = !computation.issues.iter().any(|i| {
+            matches!(
+                i.component,
+                ValuationComponent::Investments | ValuationComponent::All
+            )
+        });
+        let stale = computation.resources.iter().any(|r| r.stale);
+        detailed_accounts.push(DetailedCurrentAccountValuation {
+            account_id: account.id.clone(),
+            account_currency: account.currency.clone(),
+            base_currency: base_currency.into(),
+            cash_balance_base: cash_ok.then_some(computation.valuation.cash_balance_base),
+            investment_market_value_base: investments_ok
+                .then_some(computation.valuation.investment_market_value_base),
+            total_value_base: (cash_ok && investments_ok)
+                .then_some(computation.valuation.total_value_base),
+            source_data_as_of: computation.source_date,
+            calculated_at,
+            warnings: computation.valuation.warnings.clone(),
+            issues: computation.issues.clone(),
+            resources: computation.resources.clone(),
+            stale,
+        });
         summary.cash_balance_base += computation.valuation.cash_balance_base;
         summary.investment_market_value_base += computation.valuation.investment_market_value_base;
         summary.total_value_base += computation.valuation.total_value_base;
@@ -275,9 +600,41 @@ where
     summary.warnings.sort();
     summary.warnings.dedup();
 
-    CurrentValuationResponse {
-        summary,
-        accounts: account_valuations,
+    detailed_accounts.sort_by(|a, b| a.account_id.cmp(&b.account_id));
+    let mut issues: Vec<_> = detailed_accounts
+        .iter()
+        .flat_map(|a| a.issues.clone())
+        .collect();
+    issues.sort_by(|a, b| {
+        (&a.account_id, &a.asset_id, &a.currency).cmp(&(&b.account_id, &b.asset_id, &b.currency))
+    });
+    let cash_ok = detailed_accounts
+        .iter()
+        .all(|a| a.cash_balance_base.is_some());
+    let investments_ok = detailed_accounts
+        .iter()
+        .all(|a| a.investment_market_value_base.is_some());
+    let source_data_as_of = detailed_accounts
+        .iter()
+        .filter_map(|a| a.source_data_as_of)
+        .min();
+    let stale = detailed_accounts.iter().any(|a| a.stale);
+    DetailedCurrentValuationResponse {
+        scope_id: scope_id.into(),
+        base_currency: base_currency.into(),
+        cash_balance_base: cash_ok.then_some(summary.cash_balance_base),
+        investment_market_value_base: investments_ok
+            .then_some(summary.investment_market_value_base),
+        total_value_base: (cash_ok && investments_ok).then_some(summary.total_value_base),
+        source_data_as_of,
+        calculated_at,
+        accounts: detailed_accounts,
+        issues,
+        stale,
+        legacy: CurrentValuationResponse {
+            summary,
+            accounts: account_valuations,
+        },
     }
 }
 
@@ -325,6 +682,9 @@ struct AccountValuationComputation {
     cash_base_totals: HashMap<String, Decimal>,
     cash_local_totals: HashMap<String, Decimal>,
     summary_warnings: Vec<String>,
+    resources: Vec<CurrentResourceValuation>,
+    issues: Vec<CurrentValuationIssue>,
+    source_date: Option<NaiveDate>,
 }
 
 fn calculate_account_snapshot_valuation_with_contributions<F, R>(
@@ -348,6 +708,9 @@ where
     let mut cash_local_totals: HashMap<String, Decimal> = HashMap::new();
     let mut summary_warnings = Vec::new();
     let mut account_warnings = Vec::new();
+    let mut resources = Vec::new();
+    let mut issues = Vec::new();
+    let mut source_date = Some(snapshot.snapshot_date);
 
     let account_fx_rate = latest_rate(&account.currency, base_currency).into();
     valuation.fx_rate_to_base = account_fx_rate
@@ -369,13 +732,42 @@ where
                 normalized_cash_currency,
                 &account.currency,
             );
-        let base_value = normalized_amount
-            * rate_for(
-                &mut summary_warnings,
-                latest_rate,
-                normalized_cash_currency,
-                base_currency,
-            );
+        let (base_rate, base_reliable) = rate_for_checked(
+            &mut summary_warnings,
+            latest_rate,
+            normalized_cash_currency,
+            base_currency,
+        );
+        let base_reliable = base_reliable || normalized_amount.is_zero();
+        let base_value = normalized_amount * base_rate;
+        let resource_issues = if base_reliable {
+            Vec::new()
+        } else {
+            vec![CurrentValuationIssue {
+                code: CurrentValuationIssueCode::MissingFx,
+                component: ValuationComponent::Cash,
+                account_id: account.id.clone(),
+                asset_id: None,
+                currency: Some(normalized_cash_currency.into()),
+            }]
+        };
+        issues.extend(resource_issues.clone());
+        let (unit_value, _) = normalize_amount(Decimal::ONE, cash_currency);
+        resources.push(CurrentResourceValuation {
+            kind: "CASH".into(),
+            account_id: account.id.clone(),
+            asset_id: None,
+            currency: Some(cash_currency.clone()),
+            native_amount: Some(*amount),
+            valuation_currency: Some(normalized_cash_currency.into()),
+            unit_value: Some(unit_value),
+            local_value: Some(normalized_amount),
+            value_base: base_reliable.then_some(base_value),
+            valuation_date: Some(snapshot.snapshot_date),
+            fx_source_date: None,
+            stale: false,
+            issues: resource_issues,
+        });
         valuation.cash_balance += account_value;
         valuation.cash_balance_base += base_value;
 
@@ -407,6 +799,20 @@ where
             );
             summary_warnings.push(MISSING_ASSET_WARNING.to_string());
             account_warnings.push(MISSING_ASSET_WARNING.to_string());
+            let issue = CurrentValuationIssue {
+                code: CurrentValuationIssueCode::MissingAsset,
+                component: ValuationComponent::Investments,
+                account_id: account.id.clone(),
+                asset_id: Some(asset_id.clone()),
+                currency: None,
+            };
+            issues.push(issue.clone());
+            resources.push(unpriced_resource(
+                account,
+                asset_id,
+                position.quantity,
+                issue,
+            ));
             continue;
         };
         if asset.is_alternative() {
@@ -423,6 +829,20 @@ where
             );
             summary_warnings.push(MISSING_QUOTE_WARNING.to_string());
             account_warnings.push(MISSING_QUOTE_WARNING.to_string());
+            let issue = CurrentValuationIssue {
+                code: CurrentValuationIssueCode::MissingQuote,
+                component: ValuationComponent::Investments,
+                account_id: account.id.clone(),
+                asset_id: Some(asset_id.clone()),
+                currency: Some(asset.quote_ccy.clone()),
+            };
+            issues.push(issue.clone());
+            resources.push(unpriced_resource(
+                account,
+                asset_id,
+                position.quantity,
+                issue,
+            ));
             continue;
         };
         holdings_count += 1;
@@ -435,13 +855,42 @@ where
             normalize_amount(quote_pair.latest.close, &quote_pair.latest.currency);
         let market_value_quote =
             normalized_price * position.quantity * position.contract_multiplier;
-        let market_value_base = market_value_quote
-            * rate_for(
-                &mut summary_warnings,
-                latest_rate,
-                normalized_quote_currency,
-                base_currency,
-            );
+        let (base_rate, base_reliable) = rate_for_checked(
+            &mut summary_warnings,
+            latest_rate,
+            normalized_quote_currency,
+            base_currency,
+        );
+        let market_value_base = market_value_quote * base_rate;
+        let resource_issues = if base_reliable {
+            Vec::new()
+        } else {
+            vec![CurrentValuationIssue {
+                code: CurrentValuationIssueCode::MissingFx,
+                component: ValuationComponent::Investments,
+                account_id: account.id.clone(),
+                asset_id: Some(asset_id.clone()),
+                currency: Some(normalized_quote_currency.into()),
+            }]
+        };
+        issues.extend(resource_issues.clone());
+        let quote_date = quote_pair.latest.timestamp.date_naive();
+        source_date = source_date.map(|d| d.min(quote_date));
+        resources.push(CurrentResourceValuation {
+            kind: "SECURITY".into(),
+            account_id: account.id.clone(),
+            asset_id: Some(asset_id.clone()),
+            currency: None,
+            native_amount: Some(position.quantity),
+            valuation_currency: Some(normalized_quote_currency.into()),
+            unit_value: Some(normalized_price * position.contract_multiplier),
+            local_value: Some(market_value_quote),
+            value_base: base_reliable.then_some(market_value_base),
+            valuation_date: Some(quote_date),
+            fx_source_date: None,
+            stale: quote_date < calculated_at.date_naive(),
+            issues: resource_issues,
+        });
 
         valuation.investment_market_value += market_value_quote
             * rate_for(
@@ -474,7 +923,50 @@ where
         cash_base_totals,
         cash_local_totals,
         summary_warnings,
+        resources,
+        issues,
+        source_date,
     }
+}
+
+fn unpriced_resource(
+    account: &Account,
+    asset: &str,
+    quantity: Decimal,
+    issue: CurrentValuationIssue,
+) -> CurrentResourceValuation {
+    CurrentResourceValuation {
+        kind: "SECURITY".into(),
+        account_id: account.id.clone(),
+        asset_id: Some(asset.into()),
+        currency: None,
+        native_amount: Some(quantity),
+        valuation_currency: None,
+        unit_value: None,
+        local_value: None,
+        value_base: None,
+        valuation_date: None,
+        fx_source_date: None,
+        stale: false,
+        issues: vec![issue],
+    }
+}
+fn rate_for_checked<F, R>(
+    warnings: &mut Vec<String>,
+    latest_rate: &mut F,
+    from: &str,
+    to: &str,
+) -> (Decimal, bool)
+where
+    F: FnMut(&str, &str) -> R,
+    R: Into<CurrentValuationRate>,
+{
+    let lookup = latest_rate(from, to).into();
+    let reliable = lookup.warning.is_none() && lookup.rate > Decimal::ZERO;
+    if let Some(warning) = lookup.warning {
+        warnings.push(warning);
+    }
+    (lookup.rate, reliable)
 }
 
 fn rate_for<F, R>(warnings: &mut Vec<String>, latest_rate: &mut F, from: &str, to: &str) -> Decimal
@@ -543,30 +1035,6 @@ fn unique_asset_ids(asset_ids: impl IntoIterator<Item = String>) -> Vec<String> 
         .into_iter()
         .filter(|asset_id| seen.insert(asset_id.clone()))
         .collect()
-}
-
-fn empty_current_valuation_response(
-    scope_id: &str,
-    base_currency: &str,
-    calculated_at: DateTime<Utc>,
-) -> CurrentValuationResponse {
-    CurrentValuationResponse {
-        summary: CurrentValuationSummary {
-            scope_id: scope_id.to_string(),
-            base_currency: base_currency.to_string(),
-            cash_balance_base: Decimal::ZERO,
-            investment_market_value_base: Decimal::ZERO,
-            total_value_base: Decimal::ZERO,
-            holdings_count: 0,
-            account_count: 0,
-            currency_split: Vec::new(),
-            cash_currency_split: Vec::new(),
-            source_data_as_of: None,
-            calculated_at,
-            warnings: Vec::new(),
-        },
-        accounts: Vec::new(),
-    }
 }
 
 fn add_total(totals: &mut HashMap<String, Decimal>, currency: &str, value: Decimal) {
@@ -688,6 +1156,8 @@ fn is_expired_option_asset(asset: &Asset, today: NaiveDate) -> bool {
 struct FxRateCache<'a> {
     fx_service: &'a dyn FxServiceTrait,
     rates: HashMap<(String, String), CurrentValuationRate>,
+    verify_sources: bool,
+    source_dates: HashMap<(String, String), Option<NaiveDate>>,
 }
 
 impl<'a> FxRateCache<'a> {
@@ -695,6 +1165,8 @@ impl<'a> FxRateCache<'a> {
         Self {
             fx_service,
             rates: HashMap::new(),
+            verify_sources: false,
+            source_dates: HashMap::new(),
         }
     }
 
@@ -708,16 +1180,29 @@ impl<'a> FxRateCache<'a> {
             return rate.clone();
         }
 
-        let (rate, warning) = match self.fx_service.get_latest_exchange_rate(from, to) {
-            Ok(rate) => (rate, None),
+        let observed = if self.verify_sources {
+            self.fx_service
+                .get_exchange_rate_observation(from, to, None)
+                .map(|read| {
+                    (
+                        read.rate,
+                        (!read.verified).then(|| MISSING_FX_WARNING.to_string()),
+                        read.verified.then_some(read.source_date).flatten(),
+                    )
+                })
+        } else {
+            self.fx_service
+                .get_latest_exchange_rate(from, to)
+                .map(|rate| (rate, None, None))
+        };
+        let (rate, warning, source_date) = match observed {
+            Ok(read) => read,
             Err(error) => {
-                warn!(
-                    "Falling back to FX rate 1 while calculating current valuation from {} to {}: {}",
-                    from, to, error
-                );
-                (Decimal::ONE, Some(MISSING_FX_WARNING.to_string()))
+                warn!("Falling back to FX rate 1 while calculating current valuation from {} to {}: {}",from,to,error);
+                (Decimal::ONE, Some(MISSING_FX_WARNING.to_string()), None)
             }
         };
+        self.source_dates.insert(key.clone(), source_date);
         let latest_rate = CurrentValuationRate { rate, warning };
         self.rates.insert(key, latest_rate.clone());
         latest_rate

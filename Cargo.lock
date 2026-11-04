@@ -8155,12 +8155,14 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "uuid",
  "wealthfolio-business",
  "wealthfolio-core",
  "wealthfolio-spending",
+ "wealthfolio-storage-sqlite",
 ]
 
 [[package]]
@@ -8223,8 +8225,12 @@ dependencies = [
  "async-trait",
  "chrono",
  "diesel",
+ "futures",
  "hex",
+ "num-bigint",
+ "num-traits",
  "rust_decimal",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -8234,6 +8240,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "wealthfolio-core",
+ "wealthfolio-portfolio-engine",
  "wealthfolio-spending",
  "wealthfolio-storage-sqlite",
 ]

@@ -539,6 +539,8 @@ pub struct DailyAccountValuation {
     pub value_status: ValuationStatus,
     #[serde(default)]
     pub basis_status: BasisStatus,
+    #[serde(skip)]
+    pub quote_inputs: Option<Vec<wealthfolio_portfolio_engine::model::QuoteObservation>>,
     pub calculated_at: DateTime<Utc>,
 }
 

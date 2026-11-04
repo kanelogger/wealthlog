@@ -2464,6 +2464,7 @@ mod tests {
             performance_eligible_value_base: dec!(100),
             value_status: ValuationStatus::Complete,
             basis_status: BasisStatus::Complete,
+            quote_inputs: None,
             calculated_at: Utc::now(),
         }
     }

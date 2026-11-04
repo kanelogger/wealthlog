@@ -27,6 +27,22 @@ use wealthfolio_portfolio_engine as engine;
 
 #[async_trait]
 pub trait SnapshotServiceTrait: Send + Sync {
+    fn pending_projection_accounts(
+        &self,
+        _snapshots: &HashMap<String, AccountStateSnapshot>,
+        _day: NaiveDate,
+        _scope: crate::portfolio::projection::ProjectionReadScope,
+    ) -> Result<Option<BTreeSet<String>>> {
+        Ok(None)
+    }
+    /// Calculated snapshots whose cash omits a posted activity's final amount.
+    fn snapshots_missing_final_cash(
+        &self,
+        _snapshots: &HashMap<String, AccountStateSnapshot>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        Ok(std::collections::BTreeSet::new())
+    }
+
     /// Retrieves calculated **holdings** keyframe snapshots for a specific real account within a date range.
     /// Does NOT reconstruct daily snapshots; returns only the saved keyframes.
     fn get_holdings_keyframes(
@@ -336,7 +352,12 @@ impl SnapshotService {
                     ActivityEconomicsResolver::resolve_cash(&activity, Decimal::ONE)
                         .signed_cash_effect
                 {
-                    *snapshot.cash_balances.entry(activity.currency).or_default() += amount;
+                    let balance = snapshot.cash_balances.entry(activity.currency).or_default();
+                    *balance = balance.checked_add(amount).ok_or_else(|| {
+                        Error::Calculation(crate::errors::CalculatorError::Calculation(
+                            "cash transfer carry exceeds the supported decimal range".into(),
+                        ))
+                    })?;
                 }
             }
         }
@@ -452,6 +473,22 @@ impl SnapshotService {
 
 #[async_trait]
 impl SnapshotServiceTrait for SnapshotService {
+    fn pending_projection_accounts(
+        &self,
+        snapshots: &HashMap<String, AccountStateSnapshot>,
+        day: NaiveDate,
+        scope: crate::portfolio::projection::ProjectionReadScope,
+    ) -> Result<Option<BTreeSet<String>>> {
+        self.snapshot_repository
+            .pending_projection_accounts(snapshots, day, scope)
+    }
+    fn snapshots_missing_final_cash(
+        &self,
+        snapshots: &HashMap<String, AccountStateSnapshot>,
+    ) -> Result<BTreeSet<String>> {
+        self.snapshot_repository
+            .snapshots_missing_final_cash(snapshots)
+    }
     fn get_holdings_keyframes(
         &self,
         account_id: &str,

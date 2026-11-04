@@ -158,6 +158,21 @@ impl From<wealthfolio_business::OrdinaryActivityError> for AgentToolError {
     }
 }
 
+impl From<wealthfolio_business::investment_journal::JournalError> for AgentToolError {
+    fn from(error: wealthfolio_business::investment_journal::JournalError) -> Self {
+        Self::Business {
+            code: error.code().into(),
+            message: format!("{}: {error}", error.code()),
+            retryable: matches!(
+                error,
+                wealthfolio_business::investment_journal::JournalError::Storage(_)
+            ),
+            request_id: None,
+            data: serde_json::Value::Null,
+        }
+    }
+}
+
 impl From<wealthfolio_business::investments::InvestmentError> for AgentToolError {
     fn from(error: wealthfolio_business::investments::InvestmentError) -> Self {
         Self::Business {

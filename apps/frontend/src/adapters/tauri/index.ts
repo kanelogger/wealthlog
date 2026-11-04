@@ -56,6 +56,7 @@ export * from "../shared/activities";
 
 // Pending entries (待确认收支)
 export * from "../shared/pending-activities";
+export * from "../shared/investment-journal";
 
 // Portfolio Commands
 export * from "../shared/portfolio";
@@ -152,3 +153,5 @@ export {
   openUrlInBrowser,
   saveAppDataFileViaPicker,
 } from "./files";
+
+export { listenInvestmentIndexUpdate } from "./events";

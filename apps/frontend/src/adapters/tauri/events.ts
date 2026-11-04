@@ -14,7 +14,7 @@ import type { EventCallback, UnlistenFn } from "../types";
 // Helper to adapt Tauri's event callback to our unified type
 const adaptCallback = <T>(handler: EventCallback<T>): TauriEventCallback<T> => {
   return (event) => {
-    if (/^(portfolio:|market:|asset:)/.test(event.event)) {
+    if (/^(portfolio:|market:|asset:|investment:)/.test(event.event)) {
       const payload = event.payload as { scopeId?: string; data?: T };
       if (!payload?.scopeId || !matchesProfileScope(payload.scopeId)) return;
       handler({ event: event.event, payload: payload.data as T, id: event.id });
@@ -29,12 +29,13 @@ const adaptCallback = <T>(handler: EventCallback<T>): TauriEventCallback<T> => {
 // before the listen_js_script has executed in the webview (e.g. React strict mode
 // cleanup), causing "listeners[eventId].handlerId" to be undefined.
 const adaptUnlisten = (unlisten: TauriUnlistenFn): UnlistenFn => {
-  return async () => {
+  return () => {
     try {
       unlisten();
     } catch {
       // Listener was never fully registered or already removed — safe to ignore.
     }
+    return Promise.resolve();
   };
 };
 
@@ -61,6 +62,13 @@ export const listenPortfolioUpdateStart = async <T>(
   const unlisten = await listen<T>("portfolio:update-start", adaptCallback(handler));
   return adaptUnlisten(unlisten);
 };
+
+export async function listenInvestmentIndexUpdate<T>(
+  handler: EventCallback<T>,
+): Promise<UnlistenFn> {
+  const unlisten = await listen<T>("investment:index-updated", adaptCallback(handler));
+  return adaptUnlisten(unlisten);
+}
 
 export const listenPortfolioUpdateComplete = async <T>(
   handler: EventCallback<T>,

@@ -124,6 +124,19 @@ pub fn normalize_amount(amount: Decimal, currency: &str) -> (Decimal, &str) {
     }
 }
 
+/// Same native unit rule, with a lossless boundary for verified detailed values.
+/// Legacy callers retain `normalize_amount` and its rounding behavior.
+pub fn normalize_amount_exact(amount: Decimal, currency: &str) -> Option<(Decimal, &str)> {
+    let Some(rule) = get_normalization_rule(currency) else {
+        return Some((amount, currency));
+    };
+    let normalized = amount.checked_mul(rule.factor)?;
+    if normalized.checked_div(rule.factor) != Some(amount) {
+        return None;
+    }
+    Some((normalized, rule.major_code))
+}
+
 /// Returns the major currency code for FX lookups without mutating the amount.
 pub fn normalize_currency_code(currency: &str) -> &str {
     if let Some(rule) = get_normalization_rule(currency) {

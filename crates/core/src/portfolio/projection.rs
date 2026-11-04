@@ -18,6 +18,13 @@ use crate::portfolio::valuation::DailyAccountValuation;
 /// no date (account or asset facts, policy, the first run).
 pub const GENESIS: NaiveDate = wealthfolio_portfolio_engine::BEGINNING;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionReadScope {
+    Holdings,
+    CashValuation,
+    FullValuation,
+}
+
 /// What a marker says is stale.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MarkerScope {

@@ -66,7 +66,7 @@ class ServerEventBridge {
     this.listeners.set(eventName, listeners);
 
     if (!this.eventHandlers.has(eventName) && this.eventSource) {
-      const listener = (event: MessageEvent) => {
+      const listener = (event: MessageEvent<string>) => {
         const payload = this.parsePayload(event.data);
         this.emit(eventName, payload);
       };
@@ -175,6 +175,8 @@ export const listenAssetClassificationsChanged = <T>(
 
 // Desktop-only features - no-op in web
 const noopUnlisten: UnlistenFn = () => Promise.resolve();
+export const listenInvestmentIndexUpdate = <T>(_handler: EventCallback<T>): Promise<UnlistenFn> =>
+  Promise.resolve(noopUnlisten);
 
 export const listenFileDropHover = <T>(_handler: EventCallback<T>): Promise<UnlistenFn> => {
   return Promise.resolve(noopUnlisten);

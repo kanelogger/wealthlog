@@ -1061,6 +1061,10 @@ fn start_workers(
     event_receiver: tokio::sync::mpsc::UnboundedReceiver<DomainEvent>,
 ) -> Vec<JoinHandle<()>> {
     let mut workers = Vec::new();
+    workers.push(crate::investment_jobs::spawn_projection(
+        Arc::clone(context),
+        Some(handle.clone()),
+    ));
 
     workers.push(
         crate::domain_events::TauriDomainEventSink::start_queue_worker(

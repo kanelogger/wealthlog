@@ -45,6 +45,19 @@ use crate::errors::Result;
 /// - `*_batch` - Operate on multiple assets efficiently
 #[async_trait]
 pub trait QuoteStore: Send + Sync {
+    /// Exact asset, UTC day and provider keys, without latest-price selection.
+    fn get_quotes_by_source_keys(
+        &self,
+        _keys: &[(String, NaiveDate, String)],
+    ) -> Result<Vec<Quote>> {
+        Ok(Vec::new())
+    }
+
+    /// Check the original selected rows, before zero/clock compatibility fallbacks.
+    /// Stores that cannot verify originals must not claim the domain values verified.
+    fn verify_quote_sources(&self, quotes: &[Quote]) -> Result<super::QuoteSourceChecks> {
+        Ok(super::quality::unverified_quote_sources(quotes))
+    }
     fn provider_history_reset_context(
         &self,
         _asset_id: &str,

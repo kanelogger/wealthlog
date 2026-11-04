@@ -346,6 +346,17 @@ pub struct SparseAssetMarketFacts {
 /// Unified trait for all quote operations.
 #[async_trait]
 pub trait QuoteServiceTrait: Send + Sync {
+    /// Exact asset, UTC day and provider keys, without latest-price selection.
+    fn get_quotes_by_source_keys(
+        &self,
+        _keys: &[(String, NaiveDate, String)],
+    ) -> Result<Vec<Quote>> {
+        Ok(Vec::new())
+    }
+
+    fn verify_quote_sources(&self, quotes: &[Quote]) -> Result<super::QuoteSourceChecks> {
+        Ok(super::quality::unverified_quote_sources(quotes))
+    }
     async fn reset_provider_history(
         &self,
         _asset_id: &str,
@@ -980,6 +991,35 @@ where
             reconcile_quote_currency(&mut quote, &asset);
         }
         Ok(quote)
+    }
+
+    fn get_quotes_by_source_keys(
+        &self,
+        keys: &[(String, NaiveDate, String)],
+    ) -> Result<Vec<Quote>> {
+        let mut quotes = self.quote_store.get_quotes_by_source_keys(keys)?;
+        let asset_ids: Vec<_> = quotes
+            .iter()
+            .map(|quote| quote.asset_id.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let assets: HashMap<_, _> = self
+            .asset_repo
+            .list_by_asset_ids(&asset_ids)?
+            .into_iter()
+            .map(|asset| (asset.id.clone(), asset))
+            .collect();
+        for quote in &mut quotes {
+            if let Some(asset) = assets.get(&quote.asset_id) {
+                reconcile_quote_currency(quote, asset);
+            }
+        }
+        Ok(quotes)
+    }
+
+    fn verify_quote_sources(&self, quotes: &[Quote]) -> Result<super::QuoteSourceChecks> {
+        self.quote_store.verify_quote_sources(quotes)
     }
 
     fn get_latest_quotes(&self, symbols: &[String]) -> Result<HashMap<String, Quote>> {

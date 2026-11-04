@@ -427,6 +427,7 @@ pub fn valuation_rows(
             performance_eligible_value_base: r(day.performance_eligible_value_base),
             value_status: value_status(day.value_status),
             basis_status: basis_status(day.basis_status),
+            quote_inputs: day.quote_inputs.clone(),
             calculated_at: now,
         })
         .collect()

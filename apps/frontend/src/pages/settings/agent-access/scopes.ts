@@ -18,9 +18,12 @@ export type ScopeKey =
   | "transfers:write"
   | "holdings:write"
   | "classification:suggest"
-  | "classification:write";
+  | "classification:write"
+  | "investments:read"
+  | "investments:write"
+  | "investments:confirm";
 
-export type ScopeGroup = "read" | "write";
+export type ScopeGroup = "read" | "write" | "confirm";
 
 export interface ScopeMeta {
   key: ScopeKey;
@@ -37,6 +40,7 @@ export const SCOPES: ScopeMeta[] = [
   { key: "activities:read", i18n: "activities_read", group: "read" },
   { key: "health:read", i18n: "health_read", group: "read" },
   { key: "classification:read", i18n: "classification_read", group: "read" },
+  { key: "investments:read", i18n: "investments_read", group: "read" },
   { key: "activities:draft", i18n: "activities_draft", group: "write" },
   { key: "activities:write", i18n: "activities_write", group: "write" },
   { key: "ordinary:write", i18n: "ordinary_write", group: "write" },
@@ -44,6 +48,8 @@ export const SCOPES: ScopeMeta[] = [
   { key: "holdings:write", i18n: "holdings_write", group: "write" },
   { key: "classification:suggest", i18n: "classification_suggest", group: "write" },
   { key: "classification:write", i18n: "classification_write", group: "write" },
+  { key: "investments:write", i18n: "investments_write", group: "write" },
+  { key: "investments:confirm", i18n: "investments_confirm", group: "confirm" },
 ];
 
 /** Read scopes, in canonical order. */
@@ -59,8 +65,7 @@ export interface ScopePreset {
 }
 
 /** Named presets. Order matters for "summarize to preset name" matching. */
-// Formal writes are disabled for MCP this release, so no preset grants a
-// write scope: the write tools are filtered out and cannot execute.
+// Presets leave formal writes and investment confirmation as separate opt-ins.
 export const SCOPE_PRESETS: ScopePreset[] = [
   {
     key: "read-only",
@@ -95,12 +100,24 @@ export const UNAVAILABLE_SCOPES: ScopeKey[] = [
  * The web host never grants ordinary:write — its PAT endpoint rejects it —
  * while the desktop host offers it for direct CLI/MCP writes.
  */
+export const DESKTOP_ONLY_SCOPES: ScopeKey[] = [
+  "ordinary:write",
+  "transfers:write",
+  "holdings:write",
+  "investments:read",
+  "investments:write",
+  "investments:confirm",
+];
+
 export const WEB_UNAVAILABLE_SCOPES: ScopeKey[] = [
   "activities:write",
   "classification:write",
   "ordinary:write",
   "transfers:write",
   "holdings:write",
+  "investments:read",
+  "investments:write",
+  "investments:confirm",
 ];
 
 /** Scopes hidden from the create dialog for the current host. */
@@ -114,7 +131,12 @@ export function unavailableScopesForHost(isDesktop: boolean): ScopeKey[] {
 
 /** Whether a token that carries this scope can use it on the current host. */
 export function scopeAvailableOnHost(scope: string, isDesktop: boolean): boolean {
-  return !["ordinary:write", "transfers:write", "holdings:write"].includes(scope) || isDesktop;
+  return !DESKTOP_ONLY_SCOPES.includes(scope as ScopeKey) || isDesktop;
+}
+
+/** New grants follow host capabilities; stored token scopes are never expanded. */
+export function readScopesForHost(isDesktop: boolean): ScopeKey[] {
+  return READ_SCOPES.filter((scope) => scopeAvailableOnHost(scope, isDesktop));
 }
 
 const SCOPE_I18N = new Map(SCOPES.map((scope) => [scope.key, scope.i18n]));
@@ -141,6 +163,14 @@ export function presetLabel(t: TFunction, preset: ScopePreset): string {
  */
 export function applyScopeDependencies(scopes: Iterable<string>): ScopeKey[] {
   const set = new Set<string>(scopes);
+  if (set.has("investments:confirm")) set.add("investments:write");
+  if (set.has("investments:write")) set.add("investments:read");
+  if (set.has("investments:read")) {
+    set.add("accounts:read");
+    set.add("holdings:read");
+    set.add("activities:read");
+  }
+
   if (set.has("activities:write")) {
     set.add("activities:draft");
   }
@@ -158,7 +188,11 @@ export function applyScopeDependencies(scopes: Iterable<string>): ScopeKey[] {
 /** Returns the preset whose scope set exactly matches `scopes`, if any. */
 export function matchPreset(scopes: string[]): ScopePreset | undefined {
   const target = new Set(scopes);
-  return SCOPE_PRESETS.find(
+  // Old read presets retain their label and exact grants when a new module ships.
+  return SCOPE_PRESETS.flatMap((preset) => [
+    preset,
+    { ...preset, scopes: preset.scopes.filter((scope) => scope !== "investments:read") },
+  ]).find(
     (preset) =>
       preset.scopes.length === target.size && preset.scopes.every((scope) => target.has(scope)),
   );

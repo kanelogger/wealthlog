@@ -619,6 +619,49 @@ async fn build_context(
         timezone.clone(),
     ));
 
+    // Service initialization follows successful profile migrations. Reuse the
+    // same native services and profile settings as the existing bookkeeping path.
+    let investment_resources = Arc::new(
+        wealthfolio_business::investment_journal::AccountingResourceReader::new(
+            (*business_store).clone(),
+            fact_sources.clone(),
+            snapshot_service.clone(),
+            base_currency.clone(),
+            timezone.clone(),
+        ),
+    );
+    let investment_context = Arc::new(
+        wealthfolio_business::investment_journal::AccountingContextReader::new(
+            (*business_store).clone(),
+            investment_resources.clone(),
+            account_service.clone(),
+            snapshot_service.clone(),
+            asset_service.clone(),
+            quote_service.clone(),
+            fx_service.clone(),
+            net_worth_service.clone(),
+            base_currency.clone(),
+            timezone.clone(),
+        ),
+    );
+    let investment_journal = Arc::new(
+        wealthfolio_business::investment_journal::InvestmentJournalService::new(
+            (*business_store).clone(),
+            profile_id.to_string(),
+            investment_resources.clone(),
+            timezone.clone(),
+        )
+        .with_bookkeeping(investment_service.clone())
+        .with_context_reader(investment_context.clone())
+        .with_review_facts_reader(investment_context),
+    );
+    let investment_projection = Arc::new(
+        wealthfolio_business::investment_journal::InvestmentProjectionService::new(
+            (*business_store).clone(),
+            investment_resources,
+        ),
+    );
+
     // Expose local business services to external Agent tools.
     let agent_environment = Arc::new(
         TauriAgentEnvironment::new(
@@ -642,7 +685,8 @@ async fn build_context(
             business_service.clone(),
             pending_service.clone(),
         )
-        .with_investments(investment_service),
+        .with_investments(investment_service)
+        .with_investment_journal(investment_journal),
     );
     let agent_environment: Arc<dyn wealthfolio_agent_tools::AgentEnvironment> =
         agent_environment.clone();
@@ -655,6 +699,7 @@ async fn build_context(
 
     Ok(BuiltContext {
         context: ServiceContext {
+            investment_projection,
             business_service: business_service.clone(),
             pending_service: pending_service.clone(),
             portfolio_tasks: crate::listeners::PortfolioTasks::new(),

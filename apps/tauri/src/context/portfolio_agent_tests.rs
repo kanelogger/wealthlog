@@ -136,6 +136,83 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn investment_index_worker_is_runtime_owned_and_stops_without_enabling_the_module() {
+    use std::sync::atomic::Ordering;
+    let Fixture {
+        init,
+        access,
+        _dir,
+        day,
+    } = Fixture::new().await;
+    let ContextInitResult {
+        context,
+        writer,
+        writer_task,
+        ..
+    } = init;
+    let context = Arc::new(context);
+    let weak = Arc::downgrade(&context);
+    context
+        .investment_projection
+        .record_background_error(Some("synthetic_previous_error"))
+        .await
+        .unwrap();
+    let worker = crate::investment_jobs::spawn_projection(context.clone(), None);
+    let journal = context
+        .agent_environment
+        .investment_journal_service()
+        .unwrap();
+    let caller = wealthfolio_business::investment_journal::JournalCaller {
+        channel: wealthfolio_business::BusinessChannel::Gui,
+        actor_id: "synthetic-session".into(),
+        credential_id: None,
+        actor_kind: wealthfolio_business::investment_journal::JournalActorKind::GuiSession,
+        authenticated: true,
+        can_read: true,
+        can_write: false,
+        can_confirm: false,
+        fact_permissions: Default::default(),
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = journal.investment_journal_status(&caller).unwrap();
+            let done = status["projection"]["backfillComplete"]
+                .as_object()
+                .unwrap()
+                .values()
+                .all(|value| value == true);
+            if done
+                && status["projection"]["pendingSources"] == 0
+                && status["projection"]["error"].is_null()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    access.connect_rusqlite().unwrap().execute("INSERT INTO activities(id,account_id,activity_type,status,activity_date,amount,currency,created_at,updated_at) VALUES('worker-source','bank','DEPOSIT','POSTED',?1,'10','CNY',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",[day]).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5),async{
+        loop {let conn=access.connect_rusqlite().unwrap();let pending:i64=conn.query_row("SELECT COUNT(*) FROM investment_projection_state WHERE source_id='worker-source' AND processed_generation<generation",[],|r|r.get(0)).unwrap();if pending==0{break;}
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    assert!(journal.investment_journal_status(&caller).unwrap()["enabledAt"].is_null());
+    context.active.store(false, Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(3), worker)
+        .await
+        .unwrap()
+        .unwrap();
+    drop(journal);
+    drop(context);
+    assert!(weak.upgrade().is_none());
+    writer.shutdown().await;
+    writer_task.join().await;
+    drop(_dir);
+}
+
+#[tokio::test]
 async fn script_and_mcp_operations_cover_the_cash_transfer_manual_buy_and_reconciliation() {
     let f = Fixture::new().await;
     let t = f

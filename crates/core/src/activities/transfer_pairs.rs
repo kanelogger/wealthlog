@@ -20,6 +20,31 @@ pub struct TransferPair {
 }
 
 impl TransferPair {
+    /// The same marker contract the internal transfer editor requires.
+    pub fn is_internal(&self) -> bool {
+        if self.group_id.trim().is_empty() {
+            return false;
+        }
+        let marked = |activity: &Activity| {
+            activity
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("flow"))
+                .and_then(|v| v.get("is_external"))
+                .and_then(|v| v.as_bool())
+                == Some(false)
+                || activity
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("transfer"))
+                    .and_then(|v| v.get("source"))
+                    .and_then(|v| v.as_str())
+                    == Some("wealthfolio")
+                || self.group_id.starts_with("wf-transfer-")
+        };
+        marked(&self.transfer_in) && marked(&self.transfer_out)
+    }
+
     pub fn counterparty_account_id(&self, activity_id: &str) -> Option<&str> {
         if activity_id == self.transfer_in.id {
             Some(self.transfer_out.account_id.as_str())

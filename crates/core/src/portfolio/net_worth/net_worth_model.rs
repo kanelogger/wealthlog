@@ -173,3 +173,87 @@ pub enum AssetCategory {
     /// Cash holdings
     Cash,
 }
+
+/// Native diagnostics for consumers that must distinguish an estimate from a
+/// verified aggregate. The legacy response keeps its historical fallbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NetWorthIssueCode {
+    ProjectionNotCurrent,
+    MissingSnapshot,
+    MissingFinalCash,
+    MissingAsset,
+    MissingQuote,
+    InvalidQuoteSource,
+    ArithmeticOverflow,
+    MissingFx,
+    CostBasisFallback,
+    StoredValuationPartial,
+    StoredQuoteUnverified,
+    StoredCurrencyMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetWorthIssue {
+    pub code: NetWorthIssueCode,
+    pub item_id: String,
+    pub account_id: Option<String>,
+    pub asset_id: Option<String>,
+    pub name: Option<String>,
+    pub category: String,
+    pub currency: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DetailedValuationBasis {
+    Balance,
+    MarketQuote,
+    StoredValuation,
+    CostBasis,
+    CalculatedLoan,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailedNetWorthItem {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    /// Always the report currency. An unconverted legacy fallback is never put here.
+    pub currency: String,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub value: Option<Decimal>,
+    /// Visible evidence of an existing fallback, excluded from verified totals.
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub substitute_value: Option<Decimal>,
+    pub valuation_date: Option<NaiveDate>,
+    pub fx_source_date: Option<NaiveDate>,
+    pub stale: bool,
+    pub basis: DetailedValuationBasis,
+    pub issues: Vec<NetWorthIssue>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetailedNetWorthResponse {
+    /// Compatibility projection only. Excluded so serde-float cannot leak into the detailed API.
+    #[serde(skip)]
+    pub legacy: NetWorthResponse,
+    pub date: NaiveDate,
+    pub currency: String,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub total_assets: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub financial_assets: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub other_assets: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub total_liabilities: Option<Decimal>,
+    #[serde(with = "rust_decimal::serde::str_option")]
+    pub net_worth: Option<Decimal>,
+    pub items: Vec<DetailedNetWorthItem>,
+    pub issues: Vec<NetWorthIssue>,
+}

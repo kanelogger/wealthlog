@@ -39,6 +39,58 @@ pub struct FactSources {
 }
 
 impl FactSources {
+    /// Load the same accounting facts for a read-only investment preview.
+    /// Callers must guard repository reads against concurrent source changes.
+    pub fn load_for_investment_journal(
+        &self,
+        account_ids: &[String],
+        base_currency: &str,
+        timezone: &str,
+        as_of: NaiveDate,
+    ) -> Result<LoadedFacts> {
+        load(self, account_ids, base_currency, timezone, as_of)
+    }
+
+    /// The same source closure with proposed, already-prepared facts. Asset
+    /// resolution remains a read of existing IDs; no preview writes a quote,
+    /// activity, or derived snapshot.
+    pub fn load_for_investment_preview(
+        &self,
+        proposed: &[Activity],
+        base_currency: &str,
+        timezone: &str,
+        as_of: NaiveDate,
+    ) -> Result<LoadedFacts> {
+        let ids: Vec<_> = proposed
+            .iter()
+            .map(|a| a.account_id.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut loaded = load(self, &ids, base_currency, timezone, as_of)?;
+        let assets: Vec<_> = proposed
+            .iter()
+            .filter_map(|a| a.asset_id.clone())
+            .filter(|id| !loaded.raw.assets.iter().any(|a| a.id == *id))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        for asset in self.assets.list_by_asset_ids(&assets)? {
+            loaded.raw.assets.push(raw_asset(&asset));
+        }
+        for activity in proposed {
+            if loaded.raw.activities.iter().any(|a| a.id == activity.id) {
+                return Err(Error::Activity(
+                    crate::activities::ActivityError::DuplicateActivity {
+                        existing_activity_id: Some(activity.id.clone()),
+                    },
+                ));
+            }
+            loaded.raw.activities.push(raw_activity(activity));
+        }
+        Ok(loaded)
+    }
+
     /// The scope's transfer closure and its activities, loaded by account
     /// and by transfer group rather than as the whole table (architecture §4.8):
     /// every account sharing a transfer group with the scope, transitively,
@@ -286,7 +338,7 @@ pub(super) fn raw_asset(a: &crate::assets::Asset) -> RawAsset {
     }
 }
 
-pub(crate) fn raw_activity(a: &Activity) -> RawActivity {
+pub fn raw_activity(a: &Activity) -> RawActivity {
     RawActivity {
         id: a.id.clone(),
         account_id: a.account_id.clone(),

@@ -86,7 +86,11 @@ impl FxService {
                             id: inverse_rate.id,
                             from_currency: from.to_string(),
                             to_currency: to.to_string(),
-                            rate: Decimal::ONE / inverse_rate.rate,
+                            rate: Decimal::ONE.checked_div(inverse_rate.rate).ok_or_else(|| {
+                                FxError::RateNotFound(
+                                    "Inverse FX rate is outside the supported range".into(),
+                                )
+                            })?,
                             source: inverse_rate.source,
                             timestamp: inverse_rate.timestamp,
                         };
@@ -179,6 +183,191 @@ impl FxService {
 
 #[async_trait]
 impl FxServiceTrait for FxService {
+    fn is_exchange_rate_verified(&self, from: &str, to: &str, date: Option<NaiveDate>) -> bool {
+        self.get_exchange_rate_observation(from, to, date)
+            .is_ok_and(|read| read.verified)
+    }
+
+    fn get_exchange_rate_observation(
+        &self,
+        from: &str,
+        to: &str,
+        date: Option<NaiveDate>,
+    ) -> Result<super::ExchangeRateObservation> {
+        for currency in [from, to] {
+            if currency.len() != 3 || !currency.bytes().all(|c| c.is_ascii_alphabetic()) {
+                return Err(FxError::InvalidCurrencyCode(currency.into()).into());
+            }
+        }
+        let (from, to, source_multiplier, target_multiplier) =
+            Self::normalize_currency_pair(from, to);
+        let identity = || {
+            source_multiplier
+                .checked_mul(target_multiplier)
+                .ok_or_else(|| {
+                    FxError::RateNotFound(
+                        "FX unit conversion is outside the supported decimal range".into(),
+                    )
+                })
+        };
+        if from == to {
+            return Ok(super::ExchangeRateObservation {
+                rate: identity()?,
+                source_date: None,
+                verified: true,
+            });
+        }
+        let day = date.unwrap_or_else(|| crate::utils::clock::now().date_naive());
+        let cached = self.converter.read().ok().and_then(|lock| {
+            lock.as_ref().and_then(|converter| {
+                converter
+                    .convert_with_sources(Decimal::ONE, from, to, day)
+                    .ok()
+            })
+        });
+        let (base_rate, sources) = if let Some(observation) = cached {
+            observation
+        } else {
+            let (original, inverse) = match self.repository.get_latest_exchange_rate(from, to)? {
+                Some(rate) => (rate, false),
+                None => (
+                    self.repository
+                        .get_latest_exchange_rate_by_symbol(&ExchangeRate::make_instrument_key(
+                            to, from,
+                        ))?
+                        .ok_or_else(|| {
+                            FxError::RateNotFound(format!(
+                                "Exchange rate not found for {from}/{to}"
+                            ))
+                        })?,
+                    true,
+                ),
+            };
+            let rate = if inverse {
+                Decimal::ONE.checked_div(original.rate).ok_or_else(|| {
+                    FxError::RateNotFound("Inverse FX rate is outside the supported range".into())
+                })?
+            } else {
+                original.rate
+            };
+            (rate, vec![original])
+        };
+        let rate = source_multiplier
+            .checked_mul(base_rate)
+            .and_then(|value| value.checked_mul(target_multiplier))
+            .ok_or_else(|| {
+                FxError::RateNotFound(
+                    "FX unit conversion is outside the supported decimal range".into(),
+                )
+            })?;
+        let originals_verified = rate > Decimal::ZERO
+            && !sources.is_empty()
+            && self
+                .repository
+                .verify_exchange_rate_sources(&sources)
+                .unwrap_or(false);
+        let source_date = originals_verified
+            .then(|| {
+                sources
+                    .iter()
+                    .map(|source| source.timestamp.date_naive())
+                    .min()
+            })
+            .flatten();
+        let verified = originals_verified
+            && sources
+                .iter()
+                .all(|source| source.timestamp.date_naive() <= day);
+        Ok(super::ExchangeRateObservation {
+            rate,
+            source_date,
+            verified,
+        })
+    }
+
+    fn get_projection_exchange_rate_observation(
+        &self,
+        from: &str,
+        to: &str,
+        date: NaiveDate,
+    ) -> Result<super::ExchangeRateObservation> {
+        for currency in [from, to] {
+            if currency.len() != 3 || !currency.bytes().all(|c| c.is_ascii_alphabetic()) {
+                return Err(FxError::InvalidCurrencyCode(currency.into()).into());
+            }
+        }
+        use wealthfolio_portfolio_engine::{
+            self as engine,
+            model::{Currency, Policy, RawFxRate},
+        };
+        let rows = self.repository.get_historical_exchange_rates()?;
+        let raw = rows
+            .iter()
+            .map(|row| RawFxRate {
+                from: row.from_currency.clone(),
+                to: row.to_currency.clone(),
+                day: row.timestamp.date_naive(),
+                rate: row.rate,
+                source: row.source.clone(),
+            })
+            .collect();
+        let canonical = engine::normalize_fx_rates_with_sources(raw, &mut vec![]);
+        let observations: Vec<_> = canonical
+            .iter()
+            .map(|(observation, _)| observation.clone())
+            .collect();
+        let surface = engine::FxSurface::from_observations(&observations);
+        let base = Currency::parse(to).ok_or_else(|| FxError::InvalidCurrencyCode(to.into()))?;
+        let policy = Policy::new(base, chrono_tz::UTC, date);
+        let resolver = engine::FxResolver {
+            surface: &surface,
+            policy: &policy,
+        };
+        let (rate, used) = resolver.rate_with_sources(from, to, date).ok_or_else(|| {
+            FxError::RateNotFound(format!("No kernel FX path for {from}/{to} on {date}"))
+        })?;
+        if used.is_empty() {
+            return Ok(super::ExchangeRateObservation {
+                rate,
+                source_date: None,
+                verified: true,
+            });
+        }
+        let mut originals = vec![];
+        let mut complete = true;
+        for observation in &used {
+            let source = canonical
+                .iter()
+                .find(|(candidate, _)| candidate == observation)
+                .map(|(_, source)| source);
+            let matching: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    row.from_currency == observation.from.as_str()
+                        && row.to_currency == observation.to.as_str()
+                        && row.timestamp.date_naive() == observation.day
+                        && row.rate == observation.rate
+                        && Some(&row.source) == source
+                })
+                .cloned()
+                .collect();
+            complete &= !matching.is_empty();
+            originals.extend(matching);
+        }
+        let original_verified = complete
+            && self
+                .repository
+                .verify_exchange_rate_sources(&originals)
+                .unwrap_or(false);
+        Ok(super::ExchangeRateObservation {
+            rate,
+            source_date: original_verified
+                .then(|| used.iter().map(|observation| observation.day).min())
+                .flatten(),
+            verified: original_verified && used.iter().all(|observation| observation.day <= date),
+        })
+    }
+
     fn initialize(&self) -> Result<()> {
         self.initialize_converter()?;
         Ok(())

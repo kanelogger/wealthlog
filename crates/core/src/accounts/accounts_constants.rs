@@ -49,14 +49,11 @@ pub fn default_group_for_account_type(account_type: &str) -> &'static str {
     }
 }
 
+pub const SPENDING_ACCOUNT_TYPES: &[&str] = &[account_types::CASH, account_types::CREDIT_CARD];
+
 pub fn account_supports_purpose(account_type: &str, purpose: AccountPurpose) -> bool {
     match purpose {
-        AccountPurpose::Spending => {
-            matches!(
-                account_type,
-                account_types::CASH | account_types::CREDIT_CARD
-            )
-        }
+        AccountPurpose::Spending => SPENDING_ACCOUNT_TYPES.contains(&account_type),
         AccountPurpose::Performance | AccountPurpose::Holdings | AccountPurpose::Income => {
             matches!(
                 account_type,

@@ -40,6 +40,7 @@ pub mod custom_scraper_provider;
 pub mod errors;
 pub mod model;
 pub mod provider_settings;
+pub mod quality;
 pub mod service;
 pub mod store;
 pub mod sync;
@@ -55,6 +56,7 @@ pub use model::{
     ProviderHistoryResetSkipped, Quote, ResetAllProviderHistoryResult, ResetProviderHistoryResult,
     ResolvedQuote, SymbolSearchResult,
 };
+pub use quality::{QuoteSourceChecks, QuoteSourceQuality};
 pub use store::{ProviderSettingsStore, QuoteStore};
 
 // Re-export strong types

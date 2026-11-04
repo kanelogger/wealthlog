@@ -8,6 +8,7 @@ mod data_dir;
 mod database;
 mod domain_events;
 mod events;
+mod investment_jobs;
 mod listeners;
 mod mcp;
 mod portfolio_jobs;
@@ -206,6 +207,7 @@ pub fn run() {
             commands::pending::update_pending_activity,
             commands::pending::confirm_pending_activity,
             commands::pending::reject_pending_activity,
+            commands::investment_journal::execute_investment_journal,
             commands::ordinary::query_ordinary_activities,
             commands::ordinary::get_ordinary_activity,
             commands::ordinary::create_ordinary_activity,

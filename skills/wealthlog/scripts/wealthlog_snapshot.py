@@ -18,6 +18,21 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 STATUSES = ("pending", "unknown", "resolved", "abandoned")
+SNAPSHOT_OPERATIONS = (
+    "ordinary_create",
+    "ordinary_update",
+    "pending_create",
+    "transfer_create",
+    "manual_trade_record",
+    "holdings_snapshot_patch",
+    "save_investment_decision_draft",
+    "confirm_investment_decision",
+    "save_investment_review_draft",
+    "submit_investment_review",
+    "save_investment_principle_draft",
+    "publish_investment_principle",
+    "link_investment_execution",
+)
 MAX_TOKEN_BYTES = 4096
 
 
@@ -356,7 +371,7 @@ def build_parser() -> argparse.ArgumentParser:
     create_parser.add_argument(
         "--operation",
         required=True,
-        choices=("ordinary_create", "ordinary_update", "pending_create", "transfer_create", "manual_trade_record", "holdings_snapshot_patch"),
+        choices=SNAPSHOT_OPERATIONS,
     )
     create_parser.add_argument("--credential-file", required=True)
     create_parser.add_argument("--received-at", required=True)
@@ -369,7 +384,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument("--credential-file", help="credential actually selected for this run")
     verify_parser.add_argument("--app-id")
     verify_parser.add_argument("--ledger")
-    verify_parser.add_argument("--operation", choices=("ordinary_create", "ordinary_update", "pending_create", "transfer_create", "manual_trade_record", "holdings_snapshot_patch"))
+    verify_parser.add_argument("--operation", choices=SNAPSHOT_OPERATIONS)
 
     mark_parser = sub.add_parser("mark")
     mark_parser.add_argument("--request-dir", required=True)

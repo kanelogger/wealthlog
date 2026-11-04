@@ -778,6 +778,69 @@ const SOURCE_CALCULATED: &str = "CALCULATED";
 // Implement the trait methods for SnapshotRepository
 #[async_trait]
 impl SnapshotRepositoryTrait for SnapshotRepository {
+    fn pending_projection_accounts(
+        &self,
+        snapshots: &HashMap<String, AccountStateSnapshot>,
+        day: NaiveDate,
+        scope: wealthfolio_core::portfolio::projection::ProjectionReadScope,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        let mut conn = get_connection(&self.pool)?;
+        super::super::projection::pending_for_read(&mut conn, snapshots, day, scope).map(Some)
+    }
+    fn snapshots_missing_final_cash(
+        &self,
+        snapshots: &HashMap<String, AccountStateSnapshot>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let selected: Vec<_> = snapshots
+            .iter()
+            .filter(|(_, row)| {
+                row.source == wealthfolio_core::portfolio::snapshot::SnapshotSource::Calculated
+            })
+            .map(|(id, _)| id)
+            .collect();
+        if selected.is_empty() {
+            return Ok(Default::default());
+        }
+        #[derive(QueryableByName)]
+        struct MissingCash {
+            #[diesel(sql_type = Text)]
+            account_id: String,
+            #[diesel(sql_type = Text)]
+            activity_date: String,
+        }
+        use crate::schema::app_settings::dsl as settings;
+        let selected =
+            serde_json::to_string(&selected).map_err(|e| Error::Unexpected(e.to_string()))?;
+        let mut conn = get_connection(&self.pool)?;
+        let timezone: Option<String> = settings::app_settings
+            .find("timezone")
+            .select(settings::setting_value)
+            .first(&mut conn)
+            .optional()
+            .map_err(StorageError::from)?;
+        let timezone = wealthfolio_core::utils::time_utils::parse_user_timezone_or_default(
+            timezone.as_deref().unwrap_or_default(),
+        );
+        let rows: Vec<MissingCash> = sql_query(
+            "SELECT a.account_id, a.activity_date FROM projection_state p
+             JOIN json_each(CASE WHEN json_valid(p.activity_issues) THEN p.activity_issues ELSE '[]' END) issue
+             JOIN activities a ON a.id=json_extract(CASE WHEN issue.type='object' THEN issue.value ELSE '{}' END,'$.activityId') AND a.account_id=p.scope
+             WHERE p.scope IN (SELECT value FROM json_each(?1))
+             AND json_extract(CASE WHEN issue.type='object' THEN issue.value ELSE '{}' END,'$.kind')='MISSING_AMOUNT' AND a.status='POSTED' AND a.amount IS NULL",
+        ).bind::<Text,_>(selected).load(&mut conn).map_err(StorageError::from)?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                snapshots.get(&row.account_id).is_some_and(|snapshot| {
+                    crate::activities::parse_db_datetime(&row.activity_date).is_none_or(|stamp| {
+                        stamp.with_timezone(&timezone).date_naive() <= snapshot.snapshot_date
+                    })
+                })
+            })
+            .map(|row| row.account_id)
+            .collect())
+    }
+
     async fn save_snapshots(&self, snapshots: &[AccountStateSnapshot]) -> Result<()> {
         SnapshotRepository::save_snapshots(self, snapshots).await
     }

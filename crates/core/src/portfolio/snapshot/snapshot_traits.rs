@@ -10,6 +10,24 @@ use crate::errors::{DatabaseError, Error, Result};
 /// Repository trait for managing account state snapshots.
 #[async_trait]
 pub trait SnapshotRepositoryTrait: Send + Sync {
+    /// Dirty projection markers relevant to these exact selected snapshots.
+    /// None means this repository cannot establish projection freshness.
+    fn pending_projection_accounts(
+        &self,
+        _snapshots: &HashMap<String, AccountStateSnapshot>,
+        _day: NaiveDate,
+        _scope: crate::portfolio::projection::ProjectionReadScope,
+    ) -> Result<Option<std::collections::BTreeSet<String>>> {
+        Ok(None)
+    }
+    /// Calculated snapshots whose cash omits a posted activity's final amount.
+    fn snapshots_missing_final_cash(
+        &self,
+        _snapshots: &HashMap<String, AccountStateSnapshot>,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        Ok(std::collections::BTreeSet::new())
+    }
+
     /// Save multiple snapshots to the database.
     async fn save_snapshots(&self, snapshots: &[AccountStateSnapshot]) -> Result<()>;
 

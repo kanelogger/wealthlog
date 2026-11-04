@@ -1,14 +1,14 @@
 ---
 name: wealthlog
 description: >-
-  Use for Wealthlog bookkeeping through local scripts, CLI or MCP: ordinary income/expense, drafts, cash transfers, manual securities trades, holdings and per-currency cash reconciliation. Includes categorization, explicit dates, frozen requests, replay and concurrent-edit protection. Records completed events; never executes bank payments or brokerage orders.
+  Use for Wealthlog bookkeeping and investment journals through local scripts, CLI or desktop MCP: ordinary income/expense, cash transfers, completed securities trades, holdings reconciliation, investment decisions, reviews and principles. Supports drafts, versioned confirmation and frozen request recovery.
 ---
 
 # Wealthlog 操作
 
 Agent 通过脚本、CLI 或 MCP 操作用户的本地 Wealthlog。应用界面供人查看、解锁和管理授权；业务录入使用下面的接口，不通过 Computer Use 点击记账，不直接修改 SQLite。
 
-普通收支沿用本页流程。查询证券/现金、补录内部现金转账、记录手动证券账户已成交买卖、校准持仓或现金时，先读 [投资账户操作](references/portfolio.md)。当前不支持的操作明确说明缺失能力；贷款、删除、批量写入、自动确认草稿和交易模式证券买卖尚未在这些写入口中开放。
+普通收支沿用本页流程。查询证券／现金、补录内部现金转账、记录手动证券账户已成交买卖、校准持仓或现金时，先读 [投资账户操作](references/portfolio.md)。处理投资决策、成交证据关联、复盘或原则时，先读 [投资工作台](references/investment-journal.md)。本 Skill 记录已发生的事实和投资判断，银行付款及券商下单由用户在相应服务完成。
 
 ## 启动
 

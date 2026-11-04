@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   applyScopeDependencies,
+  readScopesForHost,
+  matchPreset,
   scopeAvailableOnHost,
   unavailableScopesForHost,
   WEB_UNAVAILABLE_SCOPES,
@@ -40,6 +42,46 @@ describe("agent-access scopes", () => {
       "activities:read",
       "transfers:write",
     ]);
+  });
+
+  it("keeps journal confirmation independent and desktop-only", () => {
+    expect(applyScopeDependencies(["investments:write"])).toEqual([
+      "accounts:read",
+      "holdings:read",
+      "activities:read",
+      "investments:read",
+      "investments:write",
+    ]);
+    expect(applyScopeDependencies(["investments:confirm"])).toEqual([
+      "accounts:read",
+      "holdings:read",
+      "activities:read",
+      "investments:read",
+      "investments:write",
+      "investments:confirm",
+    ]);
+    for (const scope of ["investments:read", "investments:write", "investments:confirm"]) {
+      expect(unavailableScopesForHost(true)).not.toContain(scope);
+      expect(unavailableScopesForHost(false)).toContain(scope);
+      expect(scopeAvailableOnHost(scope, false)).toBe(false);
+    }
+    expect(readScopesForHost(true)).toContain("investments:read");
+    expect(readScopesForHost(false)).not.toContain("investments:read");
+  });
+
+  it("recognizes old read presets without adding new token grants", () => {
+    const old = [
+      "accounts:read",
+      "holdings:read",
+      "performance:read",
+      "activities:read",
+      "health:read",
+      "classification:read",
+    ];
+    const preset = matchPreset(old);
+    expect(preset?.key).toBe("read-only");
+    expect(preset?.scopes).toEqual(old);
+    expect(old).not.toContain("investments:read");
   });
 
   it("keeps existing dependency rules", () => {

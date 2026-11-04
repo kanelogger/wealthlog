@@ -68,6 +68,8 @@ export {
 } from "../shared/activities";
 
 // Pending entries (待确认收支)
+// The shared adapter rejects locally on web and never creates an HTTP write route.
+export * from "../shared/investment-journal";
 export {
   confirmPendingActivity,
   createPendingActivity,
@@ -299,3 +301,5 @@ export {
 export type { DatabaseBackup, DatabaseEncryptionStatus } from "./settings";
 export * from "./agent-bundle";
 export type * from "../agent-bundle-types";
+
+export { listenInvestmentIndexUpdate } from "./events";

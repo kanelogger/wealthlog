@@ -157,6 +157,7 @@ fn stale_daily_valuation(account_id: &str) -> DailyAccountValuation {
         performance_eligible_value_base: dec!(100),
         value_status: ValuationStatus::Complete,
         basis_status: BasisStatus::Complete,
+        quote_inputs: None,
         calculated_at: DateTime::<Utc>::from_timestamp(0, 0).unwrap(),
     }
 }
@@ -733,4 +734,127 @@ fn current_valuation_response_summarizes_scope_and_optionally_returns_accounts()
         summary_only.summary.source_data_as_of,
         Some(DateTime::<Utc>::from_timestamp(1_776_480_000, 0).unwrap())
     );
+}
+
+#[test]
+fn detailed_current_valuation_retains_unknown_positions_and_exact_known_children() {
+    use super::{calculate_current_valuation_detailed_from_snapshots, CurrentValuationIssueCode};
+    let accounts = vec![account("a", "USD")];
+    let snapshots = HashMap::from([(
+        "a".into(),
+        snapshot(
+            "a",
+            "USD",
+            HashMap::from([
+                (
+                    "missing-quote".into(),
+                    position("a", "missing-quote", dec!(2), "USD", false),
+                ),
+                (
+                    "missing-asset".into(),
+                    position("a", "missing-asset", dec!(3), "USD", false),
+                ),
+            ]),
+            HashMap::from([("USD".into(), dec!(9007199254740993.01))]),
+        ),
+    )]);
+    let assets = HashMap::from([(
+        "missing-quote".into(),
+        asset("missing-quote", AssetKind::Investment),
+    )]);
+    let now = DateTime::parse_from_rfc3339("2026-07-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let result = calculate_current_valuation_detailed_from_snapshots(
+        "scope",
+        &accounts,
+        &snapshots,
+        &assets,
+        &HashMap::new(),
+        "USD",
+        now,
+        true,
+        |_, _| Decimal::ONE,
+    );
+    assert_eq!(result.cash_balance_base, Some(dec!(9007199254740993.01)));
+    assert_eq!(result.investment_market_value_base, None);
+    assert_eq!(result.total_value_base, None);
+    assert_eq!(result.accounts[0].resources.len(), 3);
+    assert!(result
+        .issues
+        .iter()
+        .any(|i| i.code == CurrentValuationIssueCode::MissingQuote));
+    assert!(result
+        .issues
+        .iter()
+        .any(|i| i.code == CurrentValuationIssueCode::MissingAsset));
+    assert_eq!(
+        result.source_data_as_of,
+        Some(NaiveDate::from_ymd_opt(2026, 3, 17).unwrap())
+    );
+    let value = serde_json::to_value(&result).unwrap();
+    assert!(value.get("legacy").is_none());
+    assert_eq!(value["cashBalanceBase"], "9007199254740993.01");
+    assert_eq!(
+        result.legacy.summary.total_value_base,
+        dec!(9007199254740993.01)
+    );
+}
+
+#[test]
+fn detailed_current_valuation_marks_fx_fallback_and_missing_snapshots_without_hiding_local_values()
+{
+    use super::{calculate_current_valuation_detailed_from_snapshots, CurrentValuationIssueCode};
+    let accounts = vec![account("a", "USD"), account("no-snapshot", "USD")];
+    let snapshots = HashMap::from([(
+        "a".into(),
+        snapshot(
+            "a",
+            "USD",
+            HashMap::new(),
+            HashMap::from([("USD".into(), dec!(10)), ("EUR".into(), dec!(20))]),
+        ),
+    )]);
+    let now = DateTime::parse_from_rfc3339("2026-07-01T10:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let result = calculate_current_valuation_detailed_from_snapshots(
+        "scope",
+        &accounts,
+        &snapshots,
+        &HashMap::new(),
+        &HashMap::new(),
+        "USD",
+        now,
+        true,
+        |from, to| CurrentValuationRate {
+            rate: Decimal::ONE,
+            warning: (from != to).then(|| "existing fallback".into()),
+        },
+    );
+    assert_eq!(result.total_value_base, None);
+    let known = &result.accounts[0];
+    assert_eq!(
+        known
+            .resources
+            .iter()
+            .find(|r| r.currency.as_deref() == Some("USD"))
+            .unwrap()
+            .value_base,
+        Some(dec!(10))
+    );
+    let eur = known
+        .resources
+        .iter()
+        .find(|r| r.currency.as_deref() == Some("EUR"))
+        .unwrap();
+    assert_eq!(eur.local_value, Some(dec!(20)));
+    assert_eq!(eur.value_base, None);
+    assert_eq!(eur.issues[0].code, CurrentValuationIssueCode::MissingFx);
+    assert_eq!(result.accounts[1].total_value_base, None);
+    assert_eq!(
+        result.accounts[1].issues[0].code,
+        CurrentValuationIssueCode::MissingSnapshot
+    );
+    assert_eq!(result.legacy.summary.total_value_base, dec!(30));
 }

@@ -1204,39 +1204,8 @@ impl ActivityService {
         currencies.insert(activity.currency.clone());
     }
 
-    fn transfer_group_is_legacy_wealthfolio(group_id: &str) -> bool {
-        group_id.starts_with("wf-transfer-")
-    }
-
-    fn activity_has_internal_transfer_marker(activity: &Activity, group_id: &str) -> bool {
-        let explicit_internal = activity
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("flow"))
-            .and_then(|flow| flow.get("is_external"))
-            .and_then(|value| value.as_bool())
-            == Some(false);
-
-        let wealthfolio_internal = activity
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("transfer"))
-            .and_then(|transfer| transfer.get("source"))
-            .and_then(|value| value.as_str())
-            == Some("wealthfolio");
-
-        explicit_internal
-            || wealthfolio_internal
-            || Self::transfer_group_is_legacy_wealthfolio(group_id)
-    }
-
     fn is_valid_internal_transfer_pair(pair: &TransferPair) -> bool {
-        if pair.group_id.trim().is_empty() {
-            return false;
-        }
-
-        Self::activity_has_internal_transfer_marker(&pair.transfer_in, &pair.group_id)
-            && Self::activity_has_internal_transfer_marker(&pair.transfer_out, &pair.group_id)
+        pair.is_internal()
     }
 
     fn is_cash_transfer_pair(pair: &TransferPair) -> bool {
@@ -2406,7 +2375,44 @@ impl ActivityService {
         None
     }
 
-    async fn prepare_new_activity(&self, mut activity: NewActivity) -> Result<NewActivity> {
+    async fn prepare_new_activity(&self, activity: NewActivity) -> Result<NewActivity> {
+        self.prepare_new_activity_inner(activity, true, false).await
+    }
+
+    async fn prepare_new_activity_inner(
+        &self,
+        mut activity: NewActivity,
+        side_effects: bool,
+        preserve_missing_final: bool,
+    ) -> Result<NewActivity> {
+        if preserve_missing_final
+            && (side_effects
+                || !Self::is_trade_type(&activity.activity_type)
+                || activity.amount.is_some()
+                || activity.needs_review != Some(true))
+        {
+            return Err(Self::invalid_activity_data(
+                "incomplete atomic preparation requires a flagged trade with missing final cash",
+            ));
+        }
+        if !side_effects
+            && activity.asset.as_ref().is_some_and(|a| {
+                a.id.as_deref().is_none_or(|id| id.trim().is_empty())
+                    || a.symbol.is_some()
+                    || a.exchange_mic.is_some()
+                    || a.kind.is_some()
+                    || a.name.is_some()
+                    || a.quote_mode.is_some()
+                    || a.quote_ccy.is_some()
+                    || a.instrument_type.is_some()
+                    || a.provider_id.is_some()
+                    || a.provider_symbol.is_some()
+            })
+        {
+            return Err(Self::invalid_activity_data(
+                "atomic preparation accepts an existing asset id only",
+            ));
+        }
         activity.activity_date =
             self.validate_and_normalize_activity_date(&activity.activity_date)?;
         activity.metadata = Self::without_loan_payment_tag(activity.metadata.take());
@@ -2738,7 +2744,8 @@ impl ActivityService {
             // shadow provider quotes.
             let is_manual_mode = asset.quote_mode == QuoteMode::Manual
                 || matches!(parsed_quote_mode, Some(QuoteMode::Manual));
-            if is_manual_mode
+            if side_effects
+                && is_manual_mode
                 && PRICE_BEARING_ACTIVITY_TYPES.contains(&activity.activity_type.as_str())
             {
                 if let Some(unit_price) = activity.unit_price {
@@ -2759,14 +2766,17 @@ impl ActivityService {
             }
 
             // Register FX pair for activity currency if different from account currency
-            if activity.currency != account_currency {
+            if side_effects && activity.currency != account_currency {
                 self.fx_service
                     .register_currency_pair(activity.currency.as_str(), account_currency.as_str())
                     .await?;
             }
 
             // Register FX pair for asset currency if different from account currency
-            if asset.quote_ccy != account_currency && asset.quote_ccy != activity.currency {
+            if side_effects
+                && asset.quote_ccy != account_currency
+                && asset.quote_ccy != activity.currency
+            {
                 self.fx_service
                     .register_currency_pair(asset.quote_ccy.as_str(), account_currency.as_str())
                     .await?;
@@ -2777,7 +2787,7 @@ impl ActivityService {
                 activity.currency = self.resolve_activity_currency("", None, &account_currency);
             }
 
-            if activity.currency != account_currency {
+            if side_effects && activity.currency != account_currency {
                 self.fx_service
                     .register_currency_pair(activity.currency.as_str(), account_currency.as_str())
                     .await?;
@@ -2824,13 +2834,15 @@ impl ActivityService {
         // that seed is already reflected here because the asset is resolved
         // or created before these facts are read.
         let unit_multiplier = resolved_asset_multiplier.unwrap_or(Decimal::ONE);
-        Self::ensure_new_activity_final_amount(
-            &mut activity,
-            resolved_asset_id.as_deref(),
-            unit_multiplier,
-            true,
-        );
-        Self::validate_new_activity_final_amount(&activity, resolved_asset_id.as_deref())?;
+        if !preserve_missing_final {
+            Self::ensure_new_activity_final_amount(
+                &mut activity,
+                resolved_asset_id.as_deref(),
+                unit_multiplier,
+                true,
+            );
+            Self::validate_new_activity_final_amount(&activity, resolved_asset_id.as_deref())?;
+        }
 
         // Preserve explicit idempotency key when provided (e.g., intentional manual duplicates).
         // Otherwise compute a stable content-based key for deduplication.
@@ -3721,6 +3733,21 @@ impl ActivityServiceTrait for ActivityService {
         self.prepare_new_activity(activity).await
     }
 
+    async fn prepare_activity_for_atomic_commit(
+        &self,
+        activity: NewActivity,
+    ) -> Result<NewActivity> {
+        self.prepare_new_activity_inner(activity, false, false)
+            .await
+    }
+
+    async fn prepare_incomplete_trade_for_atomic_commit(
+        &self,
+        activity: NewActivity,
+    ) -> Result<NewActivity> {
+        self.prepare_new_activity_inner(activity, false, true).await
+    }
+
     async fn prepare_activity_update_for_commit(
         &self,
         mut activity: ActivityUpdate,
@@ -4074,6 +4101,26 @@ impl ActivityServiceTrait for ActivityService {
         let mut prepared = Vec::new();
         for activity in Self::build_internal_pair_create_request(&request, &values) {
             prepared.push(self.prepare_new_activity(activity).await?);
+        }
+        Ok(prepared)
+    }
+
+    async fn prepare_internal_cash_transfer_for_atomic_commit(
+        &self,
+        request: InternalTransferPairRequest,
+    ) -> Result<Vec<NewActivity>> {
+        if request.transfer_out_id.is_some() || request.transfer_in_id.is_some() {
+            return Err(Self::invalid_activity_data(
+                "creation does not accept existing leg ids",
+            ));
+        }
+        let values = self.validate_internal_pair_request(&request)?;
+        let mut prepared = Vec::new();
+        for activity in Self::build_internal_pair_create_request(&request, &values) {
+            prepared.push(
+                self.prepare_new_activity_inner(activity, false, false)
+                    .await?,
+            );
         }
         Ok(prepared)
     }

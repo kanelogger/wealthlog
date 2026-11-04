@@ -363,6 +363,7 @@ pub fn aggregate_scope(
                 performance_eligible_value_base: Decimal::ZERO,
                 value_status: ValueStatus::Complete,
                 basis_status: BasisStatus::NotApplicable,
+                quote_inputs: None,
                 flow: DailyFlow::default(),
             });
             entry.cash_balance += day.cash_balance_base;
@@ -772,6 +773,7 @@ impl<'a> Valuer<'a> {
 
         // Investments.
         let mut investment = Decimal::ZERO;
+        let mut quote_inputs = Vec::new();
         let mut eligible = Decimal::ZERO;
         let mut priced = 0u32;
         let mut unpriced = 0u32;
@@ -847,6 +849,7 @@ impl<'a> Valuer<'a> {
                 continue;
             };
             investment += market_value;
+            quote_inputs.push(quote.clone());
             priced += 1;
             if position.basis_status() == BasisStatus::Complete {
                 eligible += market_value;
@@ -951,6 +954,7 @@ impl<'a> Valuer<'a> {
                 performance_eligible_value_base: Decimal::ZERO,
                 value_status: ValueStatus::Unavailable,
                 basis_status,
+                quote_inputs: Some(quote_inputs),
                 flow: DailyFlow::default(),
             };
         };
@@ -986,6 +990,7 @@ impl<'a> Valuer<'a> {
             performance_eligible_value_base: eligible_base,
             value_status,
             basis_status,
+            quote_inputs: Some(quote_inputs),
             flow: DailyFlow::default(),
         }
     }
