@@ -32,6 +32,8 @@ cargo check --locked -p wealthfolio-app -p wealthfolio-server
 开发应用标识为 `local.kanelogger.wealthlog.dev`。真实账本应保存在应用数据目录，
 验证时使用隔离合成数据；可参照 `.env.example` 设置 `WF_DATA_DIR`。
 
+[投资工作台开发复盘](tasks/investment-journal-retrospective.md)记录验收、数据质量、回归与收尾约定，并提供逐条验收清单模板。
+
 ## 手动持仓与可用现金
 
 手动持仓账户以最近一次快照为基准维护证券数量和现金余额。快照日期之后已入账的现金转入、转出会自动计入可用现金；待处理、未来日期和证券转账不调整这项现金余额。快照按日期视为当日最终余额，新增快照会重新定基，避免重复累计此前的转账。持仓页按币种展示可用现金，内部转账在总资产范围内抵消。
